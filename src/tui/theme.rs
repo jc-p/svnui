@@ -1,0 +1,109 @@
+//! 配色。
+//!
+//! 刻意和 yazi 的 `theme.toml` 保持同一套语义色，
+//! 这样在 yazi 和 TUI 之间来回切换时不会觉得"换了套皮肤"。
+
+use ratatui::style::{Color, Modifier, Style};
+
+/// 状态语义色。
+///
+/// 命名沿用 SVN porcelain 的符号，方便对照。
+pub struct Theme;
+
+impl Theme {
+    /// `?` 未版本化 —— 暗淡，它不是"问题"，只是还没纳入管理。
+    pub fn unversioned() -> Style {
+        Style::default().fg(Color::DarkGray)
+    }
+
+    /// `A` 新增 —— 绿。
+    pub fn added() -> Style {
+        Style::default().fg(Color::Green)
+    }
+
+    /// `M` 修改 —— 黄。
+    pub fn modified() -> Style {
+        Style::default().fg(Color::Yellow)
+    }
+
+    /// `D` / `!` 删除或缺失 —— 红。
+    pub fn deleted() -> Style {
+        Style::default().fg(Color::Red)
+    }
+
+    /// `C` / `T` 冲突 —— 红底加粗，这是唯一需要立刻处理的。
+    pub fn conflicted() -> Style {
+        Style::default().fg(Color::White).bg(Color::Red).add_modifier(Modifier::BOLD)
+    }
+
+    /// `R` 替换、`~` 阻碍等 —— 品红，表示"结构变了"。
+    pub fn structural() -> Style {
+        Style::default().fg(Color::Magenta)
+    }
+
+    /// `I` / `X` / `_M` 属性类 —— 青。
+    pub fn props() -> Style {
+        Style::default().fg(Color::Cyan)
+    }
+
+    /// 干净 / 无改动。
+    pub fn clean() -> Style {
+        Style::default().fg(Color::Green)
+    }
+
+    /// 边框（普通面板）。
+    pub fn border() -> Style {
+        Style::default().fg(Color::DarkGray)
+    }
+
+    /// 边框（当前聚焦面板） —— 用亮色区分焦点。
+    pub fn border_active() -> Style {
+        Style::default().fg(Color::Cyan)
+    }
+
+    /// 标题。
+    pub fn title() -> Style {
+        Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+    }
+
+    /// 选中行（列表光标）。
+    pub fn selected() -> Style {
+        Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD)
+    }
+
+    /// 已勾选（提交面板里的 [x]）。
+    pub fn checked() -> Style {
+        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+    }
+
+    /// 未勾选。
+    pub fn unchecked() -> Style {
+        Style::default().fg(Color::DarkGray)
+    }
+
+    /// 帮助行 / 次要信息。
+    pub fn dim() -> Style {
+        Style::default().fg(Color::DarkGray)
+    }
+
+    /// 顶部状态栏。
+    pub fn status_bar() -> Style {
+        Style::default().fg(Color::Black).bg(Color::Cyan)
+    }
+}
+
+/// 按状态符号取颜色。
+///
+/// 输入是 porcelain 的第一列字符（或冒泡后的最严重符号）。
+pub fn for_sign(sign: char) -> Style {
+    match sign {
+        '?' => Theme::unversioned(),
+        'A' => Theme::added(),
+        'M' => Theme::modified(),
+        'D' | '!' => Theme::deleted(),
+        'C' | 'T' => Theme::conflicted(),
+        'R' | '~' => Theme::structural(),
+        'I' | 'X' | '_' => Theme::props(),
+        _ => Style::default(),
+    }
+}

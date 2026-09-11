@@ -1,0 +1,21 @@
+# svnui.yazi 配色。
+#
+# 把这段合并进你的 ~/.config/yazi/theme.toml。
+#
+# ⚠️ init.lua 里已经硬编码了一份同样的配色（不依赖本文件），
+#    这一份的作用是**让你能覆盖它**。两边的语义必须保持一致。
+
+[svn]
+added   = { fg = "green" }
+modified = { fg = "yellow" }
+deleted = { fg = "red" }
+conflict = { fg = "red", bold = true }
+tree_conflict = { fg = "red", bold = true }
+replaced = { fg = "magenta" }
+switched = { fg = "magenta" }
+external = { fg = "blue" }
+locked = { fg = "blue" }
+unversioned = { fg = "darkgray" }
+ignored = { fg = "darkgray" }
+obstructed = { fg = "lightred" }
+branch = { fg = "cyan" }

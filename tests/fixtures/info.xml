@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<info>
+<entry
+   kind="dir"
+   path="/repo"
+   revision="1234">
+<url>svn://example.com/repo/branches/feature-x</url>
+<relative-url>^/branches/feature-x</relative-url>
+<repository>
+<root>svn://example.com/repo</root>
+<uuid>12345678-1234-1234-1234-123456789012</uuid>
+</repository>
+<wc-info>
+<wcroot-abspath>/repo</wcroot-abspath>
+<schedule>normal</schedule>
+<depth>infinity</depth>
+</wc-info>
+</entry>
+</info>

@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<log>
+<logentry
+   revision="1234">
+<author>alice</author>
+<date>2026-09-09T10:11:12.345678Z</date>
+<msg>fix: 修掉中文路径问题</msg>
+<paths>
+<path
+   action="M"
+   kind="file">/trunk/src/main.rs</path>
+<path
+   action="A"
+   kind="file"
+   copyfrom-path="/trunk/src/old.rs"
+   copyfrom-rev="1230">/trunk/src/new.rs</path>
+<path
+   action="D"
+   kind="dir">/trunk/src/tmp</path>
+</paths>
+</logentry>
+<logentry
+   revision="1233">
+<author>bob</author>
+<date>2026-09-08T09:00:00.000000Z</date>
+<msg>chore: 清理无用文件
+
+这里是正文第二行，不该出现在 oneline 里。</msg>
+</logentry>
+</log>

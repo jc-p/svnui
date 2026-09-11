@@ -1,0 +1,54 @@
+[package]
+name = "svnui"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+description = "Subversion with a real TUI: status, diff, commit, conflicts"
+license = "MIT"
+
+[[bin]]
+name = "svnui"
+path = "src/main.rs"
+
+[lib]
+name = "svnui"
+path = "src/lib.rs"
+
+[features]
+# TUI 是主形态，但用 feature 隔离：不要 TUI 的场景（CI、最小化构建）
+# 可以 --no-default-features 关掉，省掉 crossterm 那堆依赖。
+default = ["tui"]
+tui = ["dep:ratatui", "dep:crossterm", "dep:tui-textarea"]
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+quick-xml = { version = "0.36", features = ["serde", "serialize"] }
+thiserror = "1"
+camino = { version = "1", features = ["serde1"] }
+
+# ── TUI（feature = "tui"）─────────────────────────────────────
+# 版本对齐很重要：ratatui 0.30 默认用 crossterm 0.29，
+# 如果 tui-textarea 拖进另一个 crossterm 主版本，两者类型不互通
+# （官方 backends 文档明确警告过：不同主版本各自维护事件队列和 raw mode）。
+# 所以这里显式钉 0.29，并用 tui-textarea-2（支持 ratatui 0.30+ 的维护分支）。
+ratatui = { version = "0.30", optional = true }
+crossterm = { version = "0.29", optional = true }
+tui-textarea = { package = "tui-textarea-2", version = "0.13", optional = true }
+
+# M9 daemon 的文件监听。
+# 没有引入 tokio：svn 调用必须串行（见 daemon/server.rs），
+# 用 std 线程 + 一把 Mutex 比 async 更容易推理，也少一个重依赖。
+notify = "6"
+
+[dev-dependencies]
+# 集成测试（tests/*.rs）是独立的 crate，只能链接 [dependencies] + [dev-dependencies]。
+# 测试里要构造 Utf8PathBuf / 解析 JSON，所以这两个必须在这里再列一次。
+camino = { version = "1", features = ["serde1"] }
+serde_json = "1"
+# 集成测试造临时工作副本用
+tempfile = "3"
+
+[profile.release]
+strip = true

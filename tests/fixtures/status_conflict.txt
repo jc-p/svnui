@@ -1,0 +1,8 @@
+C       src/text_conflict.rs
+!     C src/tree_conflict.rs
+      >   local delete, incoming edit upon update
+ M    C src/prop_conflict.rs
+Summary of conflicts:
+  Text conflicts: 1
+  Property conflicts: 1
+  Tree conflicts: 1

@@ -1,0 +1,14 @@
+M       src/main.rs
+ M      src/lib.rs
+A       src/new.rs
+A  +    src/copied.rs
+R       src/replaced.rs
+D       src/old.rs
+?       src/untracked.rs
+!       src/missing.rs
+~       src/obstructed
+I       target
+X       vendor/ext
+C       src/conflicted.rs
+MM      src/both.rs
+M       src/中文 文件.rs

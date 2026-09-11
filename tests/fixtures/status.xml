@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<status>
+<target
+   path=".">
+<entry
+   path="src/main.rs">
+<wc-status
+   props="none"
+   item="modified"
+   revision="12">
+<commit
+   revision="11">
+<author>alice</author>
+<date>2026-09-01T02:00:00.000000Z</date>
+</commit>
+</wc-status>
+</entry>
+<entry
+   path="src/new.rs">
+<wc-status
+   props="none"
+   item="added"
+   revision="-1">
+</wc-status>
+</entry>
+<entry
+   path="src/props_only.rs">
+<wc-status
+   props="modified"
+   item="normal"
+   revision="12">
+</wc-status>
+</entry>
+<entry
+   path="src/tree_conflict.rs">
+<wc-status
+   props="none"
+   item="conflicted"
+   revision="12"
+   tree-conflicted="true">
+</wc-status>
+</entry>
+<entry
+   path="src/deleted.rs">
+<wc-status
+   props="none"
+   item="deleted"
+   revision="12">
+</wc-status>
+</entry>
+</target>
+</status>
