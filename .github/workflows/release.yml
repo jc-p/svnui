@@ -1,0 +1,183 @@
+name: Release
+
+# 打 tag 就发布：
+#   git tag v0.2.0 && git push origin v0.2.0
+# 也可以在 Actions 页面手动触发（workflow_dispatch），输入已存在的 tag 重跑。
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要发布的 tag（如 v0.2.0）"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  # 降低最低系统版本要求。
+  # GitHub 的 macos-13 runner 是 macOS 13，不设这个构建出的二进制
+  # 会要求 macOS 13+，老机器装了直接报 "incompatible architecture" 那类错。
+  # 设 11.0 能覆盖 Big Sur 及以上，对 TUI 工具足够。
+  MACOSX_DEPLOYMENT_TARGET: "11.0"
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 原生构建，不做交叉编译：
+          # macOS 上交叉编译 x86_64→arm64 能出二进制，但链接器和 SDK 路径
+          # 容易出问题。两个 runner 各编各的，最稳。
+          - os: macos-14 # Apple Silicon
+            target: aarch64-apple-darwin
+          - os: macos-13 # Intel
+            target: x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      # 发布前先自检：二进制能跑、--version 正常。
+      # 免得坏包进了 release，用户 brew install 完才发现问题。
+      - name: Smoke test
+        run: |
+          ./target/${{ matrix.target }}/release/svnui --version
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          TAG="${{ github.ref_name }}"
+          if [ -n "${{ inputs.tag }}" ]; then TAG="${{ inputs.tag }}"; fi
+          VER="${TAG#v}"
+          NAME="svnui-${VER}-${{ matrix.target }}"
+
+          # tar 里直接放二进制（不套子目录）。
+          # 套子目录的话目录名带版本号，formula 里 bin.install 的路径
+          # 每次都得跟着改 —— 平铺能让它永远是 bin.install "svnui"。
+          mkdir -p stage
+          cp "target/${{ matrix.target }}/release/svnui" stage/
+          tar -czf "${NAME}.tar.gz" -C stage svnui
+          shasum -a 256 "${NAME}.tar.gz" | tee "${NAME}.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: "*.tar.gz"
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ github.ref_name }}"
+          if [ -n "${{ inputs.tag }}" ]; then TAG="${{ inputs.tag }}"; fi
+          ls -la dist/
+          # --generate-notes 自动按 commit 生成更新日志，省得手写
+          gh release create "$TAG" --generate-notes dist/*.tar.gz
+
+  update-tap:
+    name: Update Homebrew tap
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4 # 为了拿 packaging/homebrew/svnui.rb.tpl
+
+      - name: Compute checksums
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ github.ref_name }}"
+          if [ -n "${{ inputs.tag }}" ]; then TAG="${{ inputs.tag }}"; fi
+          VER="${TAG#v}"
+          echo "VERSION=${VER}" >> "$GITHUB_ENV"
+
+          mkdir -p assets
+          gh release download "$TAG" --pattern '*.tar.gz' -D assets
+          ls -la assets/
+
+          # 从实际文件算 sha256，不用 build job 传过来的值 ——
+          # 以 release 上传后的产物为准，避免"算的和传的不是一个文件"。
+          echo "SHA_ARM=$(shasum -a 256 "assets/svnui-${VER}-aarch64-apple-darwin.tar.gz" | cut -d' ' -f1)" >> "$GITHUB_ENV"
+          echo "SHA_X86=$(shasum -a 256 "assets/svnui-${VER}-x86_64-apple-darwin.tar.gz" | cut -d' ' -f1)" >> "$GITHUB_ENV"
+
+      - name: Render formula
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, sys
+
+          tpl = pathlib.Path("packaging/homebrew/svnui.rb.tpl").read_text(encoding="utf-8")
+          out = (tpl
+              .replace("@@OWNER@@",   os.environ["OWNER"])
+              .replace("@@VERSION@@", os.environ["VERSION"])
+              .replace("@@SHA_ARM@@", os.environ["SHA_ARM"])
+              .replace("@@SHA_X86@@", os.environ["SHA_X86"]))
+
+          # 兜底：还有 @@ 残留说明某个 token 没替换上。
+          # 不检查的话会静默生成一个错的 formula 推上去，
+          # 用户 brew install 时才炸，排查成本极高。
+          if "@@" in out:
+              sys.exit(f"模板仍有未替换的占位符:\n{out}")
+
+          pathlib.Path("svnui.rb").write_text(out, encoding="utf-8")
+          print(out)
+          PY
+
+      - name: Push to tap
+        env:
+          TAP_REPO: ${{ vars.HOMEBREW_TAP_REPO }}
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TAP_REPO}" ] || [ -z "${TAP_TOKEN}" ]; then
+            echo "::warning::未配置 HOMEBREW_TAP_REPO / HOMEBREW_TAP_TOKEN，跳过 tap 更新"
+            exit 0
+          fi
+
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/${TAP_REPO}.git" tap
+          cd tap
+          mkdir -p Formula
+          cp ../svnui.rb Formula/svnui.rb
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/svnui.rb
+
+          # 没变化就不提交（避免重复 tag 导致空 commit 失败）
+          if git diff --cached --quiet; then
+            echo "formula 无变化，跳过提交"
+            exit 0
+          fi
+
+          git commit -m "svnui ${VERSION}"
+          git push origin HEAD
