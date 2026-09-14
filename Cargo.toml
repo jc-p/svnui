@@ -5,6 +5,11 @@ edition = "2021"
 rust-version = "1.74"
 description = "Subversion with a real TUI: status, diff, commit, conflicts"
 license = "MIT"
+repository = "https://github.com/jc-p/svnui"
+homepage   = "https://github.com/jc-p/svnui"
+readme     = "README.md"
+keywords   = ["svn", "subversion", "tui"]
+categories = ["command-line-utilities"]
 
 [[bin]]
 name = "svnui"
