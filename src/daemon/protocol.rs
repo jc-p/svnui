@@ -41,12 +41,7 @@ pub struct Reply {
 impl Reply {
     /// 无变化时的极简响应（几十字节）。
     pub fn unchanged(v: u64, ready: bool) -> Self {
-        Self {
-            v,
-            changed: false,
-            ready,
-            ..Default::default()
-        }
+        Self { v, changed: false, ready, ..Default::default() }
     }
 }
 
@@ -132,10 +127,7 @@ mod tests {
 
     #[test]
     fn query_reply_roundtrip() {
-        let q = Query {
-            dir: "/repo/src".into(),
-            since: Some(42),
-        };
+        let q = Query { dir: "/repo/src".into(), since: Some(42) };
         let s = serde_json::to_string(&q).unwrap();
         let back: Query = serde_json::from_str(&s).unwrap();
         assert_eq!(back.dir, "/repo/src");

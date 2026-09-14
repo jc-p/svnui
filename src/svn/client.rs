@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::domain::{Error, LogEntry, NodeKind, RepoInfo, Result, Snapshot, StatusEntry, StatusKind};
-use crate::svn::command::{run, RawOutput, RunOpts};
+use crate::svn::command::{run, run_with_stdin, RawOutput, RunOpts};
 
 use super::locator::{relative_to, svn_exe, wc_root};
 use super::version::SvnVersion;
@@ -21,6 +21,13 @@ pub struct Svn {
     pub version: SvnVersion,
     timeout: Duration,
     global: Vec<String>,
+    /// 是否放行 SSL 证书校验失败。
+    ///
+    /// 存下来是为了"再 discover 一次"的场景能继承：
+    /// TUI 启动时可能拿着 discover_bare 的 Svn（root 不是真工作副本根），
+    /// 之后要重新 discover，如果不继承这个标记，
+    /// 用户配了信任也会被悄悄丢掉 —— 表现为"命令行为什么行、TUI 不行"。
+    pub trust_cert: bool,
 }
 
 /// `status` 的查询选项。
@@ -43,9 +50,94 @@ impl Default for StatusOpts {
     }
 }
 
+/// 认证参数（`--username` / `--password` / `--no-auth-cache`）。
+///
+/// ## 关于 login
+///
+/// svn 没有独立的"登录"命令 —— 凭据是在**第一次需要认证的操作**里
+/// 顺带缓存的（存到 `~/.subversion/auth/`）。所以 `login` 的实现就是
+/// 拿这组参数对远端跑一次 `svn info`：成功即代表凭据有效且已被缓存，
+/// 之后所有操作都不用再输。
+#[derive(Debug, Clone, Default)]
+pub struct AuthOpts {
+    pub username: Option<String>,
+    pub password: Option<String>,
+    /// 不给 svn 缓存。默认 false —— 缓存正是 login 的目的。
+    pub no_auth_cache: bool,
+}
+
+impl AuthOpts {
+    /// 拼成 svn 全局参数。
+    ///
+    /// 注意：密码走命令行参数，同主机的其他用户能从 `ps` 看到。
+    /// svn 官方也这样（`--password` 只有这一种传法），
+    /// 所以这里额外提供从 stdin 读的入口，见 `Svn::login`。
+    fn global_args(&self, base: &[String]) -> Vec<String> {
+        let mut g = base.to_vec();
+        if let Some(u) = &self.username {
+            g.push("--username".to_string());
+            g.push(u.clone());
+        }
+        if let Some(p) = &self.password {
+            g.push("--password".to_string());
+            g.push(p.clone());
+        }
+        if self.no_auth_cache {
+            g.push("--no-auth-cache".to_string());
+        }
+        g
+    }
+}
+
+/// 放行所有 SSL 证书校验失败类型。
+///
+/// 对应 svn 的 `--trust-server-cert-failures`：
+/// - `unknown-ca`  未知 CA（自签名 / 内网 CA）
+/// - `cn-mismatch` 证书签给了别的主机名 ← 最常见，公司网关 SSL 中间人
+/// - `expired`     已过期
+/// - `not-yet-valid` 还没生效
+/// - `other`       其他（svn 归类不了的一律进这）
+///
+/// ⚠️ 必须**全给**：很多服务器同时触发多个失败类型。
+/// 比如 `certificate issued for a different hostname, and other reason(s)`
+/// 是 `cn-mismatch` + `other` 两个，只给 cn-mismatch 仍然失败。
+pub const TRUST_CERT_ARG: &str =
+    "--trust-server-cert-failures=unknown-ca,cn-mismatch,expired,not-yet-valid,other";
+
+/// 是否启用证书信任。
+///
+/// 优先级：环境变量 `SVNR_TRUST_CERT` > 参数 > 默认 false。
+/// 环境变量是为了不用每次敲 —— 内网仓库配一次即可。
+pub fn trust_cert_enabled(explicit: bool) -> bool {
+    if explicit {
+        return true;
+    }
+    matches!(
+        std::env::var("SVNR_TRUST_CERT").as_deref(),
+        Ok("1") | Ok("true") | Ok("yes") | Ok("on")
+    )
+}
+
+/// 构造全局参数。
+///
+/// `--non-interactive` 是必须的：否则 svn 会停在
+/// `(R)eject / accept (t)emporarily / accept (p)ermanently?` 提示上，
+/// 而我们没法在 TUI 里回答这个提示。
+/// 更麻烦的是，对于归类为 `other` 的证书失败，svn **根本不提供 (p)**，
+/// 所以永久接受这条路对这些服务器无效，只能靠 --trust-server-cert-failures。
+fn global_args(trust_cert: bool) -> Vec<String> {
+    let mut g = vec!["--non-interactive".to_string()];
+    if trust_cert {
+        g.push(TRUST_CERT_ARG.to_string());
+    }
+    g
+}
+
 impl Svn {
     /// 从任意子目录发现工作副本。
-    pub fn discover(start: &Path, timeout: Duration) -> Result<Self> {
+    ///
+    /// `trust_cert`：是否放行 SSL 证书校验失败（内网自签名/网关中间人）。
+    pub fn discover(start: &Path, timeout: Duration, trust_cert: bool) -> Result<Self> {
         let exe = svn_exe().cloned().ok_or(Error::SvnNotFound)?;
         let root = wc_root(start).ok_or_else(|| Error::NotWorkingCopy(start.to_path_buf()))?;
 
@@ -64,7 +156,8 @@ impl Svn {
             cwd,
             version,
             timeout,
-            global: vec!["--non-interactive".to_string()],
+            global: global_args(trust_cert_enabled(trust_cert)),
+            trust_cert: trust_cert_enabled(trust_cert),
         })
     }
 
@@ -76,7 +169,7 @@ impl Svn {
     ///
     /// 此时 `root` 被设为 `start`（不是真正的工作副本根），
     /// 调用方不应依赖它的值。
-    pub fn discover_bare(start: &Path, timeout: Duration) -> Result<Self> {
+    pub fn discover_bare(start: &Path, timeout: Duration, trust_cert: bool) -> Result<Self> {
         let exe = svn_exe().cloned().ok_or(Error::SvnNotFound)?;
         let version = Self::probe_version(&exe, start)?;
         Ok(Self {
@@ -85,7 +178,8 @@ impl Svn {
             cwd: start.to_path_buf(),
             version,
             timeout,
-            global: vec!["--non-interactive".to_string()],
+            global: global_args(trust_cert_enabled(trust_cert)),
+            trust_cert: trust_cert_enabled(trust_cert),
         })
     }
 
@@ -162,6 +256,70 @@ impl Svn {
         Ok(self.status(o)?.into_iter().filter(|e| e.is_changed()).collect())
     }
 
+    /// `svn status -u`：远端有更新的文件（本地绝对路径, 远端最新版本号）。
+    ///
+    /// ⚠️ **慢**：要连服务器，大仓库上可能几秒到几十秒。
+    ///    只在用户显式要求时调用（update 前的冲突预警），
+    ///    绝不进自动刷新路径。
+    ///
+    /// 返回的路径是绝对的（`self.root` + 相对路径），方便直接喂给别的命令。
+    pub fn outdated(&self) -> Result<Vec<(PathBuf, u64)>> {
+        let out = run(&self.exe, &["status", "-u"], &self.root, &self.opts(true))?;
+        Ok(super::porcelain::parse_outdated(&out.stdout)
+            .into_iter()
+            // self.root 是 std PathBuf，join 直接就是 PathBuf，不用再转
+            .map(|(p, rev)| (self.root.join(p), rev))
+            .collect())
+    }
+
+    /// 冲突文件的三份内容。
+    ///
+    /// SVN 冲突后在工作副本里生成：
+    /// - `f.mine` —— 我本地改动后的版本
+    /// - `f.r<OLD>` —— 更新前的 BASE
+    /// - `f.r<NEW>` —— 服务器最新版本（theirs）
+    /// - `f` 本身 —— 带 `<<<<<<<` 冲突标记的合并结果
+    ///
+    /// 优先读这些副产品文件：它们就是 svn 自己生成的，比 `svn cat` 再算一遍
+    /// 更准确（尤其是 `svn cat -r BASE` 在属性冲突时行为诡异）。
+    /// 读不到才回落到 `svn cat`。
+    pub fn conflict_versions(&self, abs: &Path) -> Result<ConflictVersions> {
+        let dir = abs.parent().unwrap_or(Path::new("."));
+        let name = abs
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        // 找 name.mine / name.r<N>
+        let mut mine_path = None;
+        let mut theirs_path = None;
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            let mut revs: Vec<(u64, std::path::PathBuf)> = Vec::new();
+            for e in rd.flatten() {
+                let fname = e.file_name().to_string_lossy().to_string();
+                if fname == format!("{name}.mine") {
+                    mine_path = Some(e.path());
+                } else if let Some(rest) = fname.strip_prefix(&format!("{name}.r")) {
+                    if let Ok(r) = rest.parse::<u64>() {
+                        revs.push((r, e.path()));
+                    }
+                }
+            }
+            // .rNEW 是版本号最大的那个
+            revs.sort_by_key(|(r, _)| *r);
+            theirs_path = revs.pop().map(|(_, p)| p);
+        }
+
+        let rel = self.rel(abs);
+        let rel_s = rel.to_string_lossy();
+
+        Ok(ConflictVersions {
+            mine: read_or_cat(mine_path.as_deref(), || self.cat(&rel_s, Some("BASE"))),
+            theirs: read_or_cat(theirs_path.as_deref(), || self.cat(&rel_s, Some("HEAD"))),
+            working: std::fs::read_to_string(abs).unwrap_or_default(),
+        })
+    }
+
     /// 所有冲突（文本 + 属性 + 树冲突）。
     pub fn conflicts(&self) -> Result<Vec<StatusEntry>> {
         Ok(self.status(&StatusOpts::default())?.into_iter().filter(|e| e.is_conflicted()).collect())
@@ -188,15 +346,58 @@ impl Svn {
     }
 
     /// `svn log --xml -v`。
+    /// `svn diff -c REV`：看某个版本改了什么（完整 diff 文本）。
+    ///
+    /// 和 `diff()` 的区别：那个是"工作副本 vs BASE"（本地未提交的改动），
+    /// 这个是"历史上某个版本 vs 它的上一版"（已提交的改动）。
+    ///
+    /// 输出里的路径是仓库相对路径，不需要 shorten 处理。
+    pub fn rev_diff(&self, rev: u64) -> Result<RawOutput> {
+        let r = rev.to_string();
+        self.op_no_targets(&["diff".to_string(), "-c".to_string(), r])
+    }
+
     pub fn log(&self, limit: usize, paths: &[PathBuf]) -> Result<Vec<LogEntry>> {
+        self.log_search(limit, paths, None)
+    }
+
+    /// `svn log`，可选服务端搜索。
+    ///
+    /// `search` 非空时加 `--search`（svn 1.8+，**在服务器端过滤**）。
+    /// 这一条很关键：默认只加载 100 条，靠翻页永远够不到更早的提交；
+    /// 而 `--search` 让服务器在**全部历史**里找，真正解决"找不到了"。
+    ///
+    /// 旧版本 svn 不认识 `--search`，会直接报错；
+    /// 调用方负责探测版本并决定是否传入（见 `Svn::supports_log_search`）。
+    ///
+    /// 另外 `-v` 只在**不搜索**时加：搜索结果通常很多，
+    /// 全量带 `-v` 会让服务端返回体积翻好几倍，拖慢首屏。
+    /// 需要改动文件时再按版本单独查（`log_rev(rev, true)`）。
+    pub fn log_search(
+        &self,
+        limit: usize,
+        paths: &[PathBuf],
+        search: Option<&str>,
+    ) -> Result<Vec<LogEntry>> {
         let owned = self.guard_paths(paths)?;
         let lim = limit.to_string();
-        let mut args: Vec<&str> = vec!["log", "--xml", "-v", "-l", &lim];
+        let mut args: Vec<&str> = vec!["log", "--xml", "-l", &lim];
+        if let Some(kw) = search.filter(|s| !s.trim().is_empty()) {
+            args.push("--search");
+            args.push(kw);
+        } else {
+            args.push("-v");
+        }
         for p in &owned {
             args.push(p.as_str());
         }
         let out = run(&self.exe, &args, &self.root, &self.opts(true))?;
         super::parser::parse_log_xml(&out.stdout)
+    }
+
+    /// 是否支持 `svn log --search`（1.8+）。
+    pub fn supports_log_search(&self) -> bool {
+        (self.version.major, self.version.minor) >= (1, 8)
     }
 
     /// `svn info --xml`。
@@ -207,7 +408,11 @@ impl Svn {
     /// `-r N` 显示该版本的日志条目。svn 没有 git 那种 cherry-pick 语义，
     /// 用 `-r` 更接近用户按版本号查日志的预期。
     pub fn log_rev(&self, rev: &str, verbose: bool) -> Result<Vec<LogEntry>> {
-        let mut args: Vec<String> = vec!["log".into()];
+        let mut args: Vec<String> = vec!["log".into(), "--xml".into()];
+        // ⚠️ --xml 必须加：下面用 parse_log_xml 解析。
+        //    不加的话 svn 输出纯文本（------ 分隔线那种），
+        //    quick_xml 必然解析失败 → "failed to parse svn output"。
+        //    `log()` 有这个参数，这里之前漏了。
         if verbose {
             args.push("-v".into());
         }
@@ -365,6 +570,107 @@ impl Svn {
         self.paths_op(sub, paths, false)
     }
 
+// ---------------------------------------------------- 检出 / 认证
+
+    /// `svn checkout`。
+    ///
+    /// ⚠️ 这是**唯一不需要工作副本**的操作 —— 它的目的就是创建工作副本。
+    /// 所以不能依赖 `self.root`（`self` 是 discover 出来的，discover 要求
+    /// 已经在工作副本里）。这里只在 PATH 的父目录执行，`self.root` 不参与。
+    pub fn checkout(
+        &self,
+        url: &str,
+        path: &Path,
+        auth: &AuthOpts,
+        depth: &str,
+    ) -> Result<RawOutput> {
+        // 绝对路径：svn 会在 cwd 下创建它，相对路径容易搞错位置。
+        let abs = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join(path)
+        };
+
+        // cwd 取父目录，父目录不存在就退到当前目录
+        let cwd = abs
+            .parent()
+            .filter(|p| p.exists())
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+
+        let opts = RunOpts {
+            // 大仓库检出可能几十分钟。这里给足，超时机制仍会 kill 掉。
+            timeout: Duration::from_secs(30 * 60),
+            allow_fail: false,
+            global: auth.global_args(&self.global),
+        };
+
+        let abs_s = abs.to_string_lossy().to_string();
+        run(&self.exe, &["checkout", "--depth", depth, url, &abs_s], &cwd, &opts)
+    }
+
+    /// 对远端跑一次 `svn info`，让 svn 缓存凭据。
+    ///
+    /// 密码优先从 stdin 给（`--password-from-stdin`，svn 1.12+），
+    /// 退而求其次才走命令行参数 —— 后者会被 `ps` 看到。
+    pub fn login(&self, url: &str, auth: &AuthOpts) -> Result<RawOutput> {
+        let global = auth.global_args(&self.global);
+        let opts = RunOpts { timeout: self.timeout * 4, allow_fail: false, global: global.clone() };
+
+        if let (Some(pwd), true) = (&auth.password, self.version.supports_password_from_stdin()) {
+            // 注意：不能同时给 --password 和 --password-from-stdin
+            let mut g = opts.global.clone();
+            g.retain(|a| a != "--password");
+            let stdin_opts = RunOpts { global: g, ..opts.clone() };
+            let args = vec!["info".to_string(), url.to_string(), "--password-from-stdin".to_string()];
+            return run_with_stdin(&self.exe, &args, &self.root, pwd, &stdin_opts);
+        }
+
+        run(&self.exe, &["info", url], &self.root, &opts)
+    }
+
+    /// 注销：清掉 svn 缓存的凭据。
+    ///
+    /// 不走 `svn auth --remove` —— 它接受的是缓存**文件路径**，
+    /// 得先列一遍再逐个删，而这里要的就是"全清"。直接删
+    /// `~/.subversion/auth/` 更直接，也是 svn 官方认可的清缓存方式。
+    ///
+    /// ⚠️ 会清掉**所有仓库**的凭据（svn 的缓存是按 realm 分目录，
+    /// 不是按仓库）。要只删一个，用 `svn auth --remove <路径>`。
+    pub fn logout(&self) -> Result<RawOutput> {
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .map_err(|_| Error::Parse("找不到 HOME，无法定位凭据缓存目录".to_string()))?;
+
+        let auth_dir = PathBuf::from(home).join(".subversion").join("auth");
+        let existed = auth_dir.exists();
+        if existed {
+            std::fs::remove_dir_all(&auth_dir)?;
+        }
+
+        Ok(RawOutput {
+            stdout: if existed {
+                "已清除 svn 凭据缓存".to_string()
+            } else {
+                "本来就没有缓存的凭据".to_string()
+            },
+            stderr: String::new(),
+            code: Some(0),
+        })
+    }
+
+    /// 列出已缓存的凭据（`svn auth`，1.9+）。
+    pub fn auth_list(&self) -> Result<RawOutput> {
+        if !self.version.supports_show_item() {
+            return Err(Error::Parse(format!(
+                "svn {} 不支持 svn auth（需要 1.9+）",
+                self.version
+            )));
+        }
+        let opts = RunOpts { timeout: self.timeout, allow_fail: true, global: self.global.clone() };
+        run(&self.exe, &["auth"], &self.root, &opts)
+    }
+
     // ------------------------------------------------------------- 环境
 
     pub fn svn_path(&self) -> &Path {
@@ -454,3 +760,32 @@ impl Svn {
         run(&self.exe, &refs, &self.root, &self.opts(true))
     }
 }
+
+// ---------------------------------------------------- 冲突三路内容
+
+/// 冲突文件的三份内容。任何一份都可能为空（文件不存在或读取失败）。
+#[derive(Debug, Clone, Default)]
+pub struct ConflictVersions {
+/// 我本地改动后的版本。
+pub mine: String,
+/// 服务器最新版本。
+pub theirs: String,
+/// 当前工作副本里带冲突标记的内容。
+pub working: String,
+}
+
+/// 优先读文件，读不到就执行 `f()`；`f()` 失败也给空串而不是报错。
+///
+/// 冲突三路里任何一路缺失都不该让整个面板挂掉 —— 少看一路用户也能做决定。
+fn read_or_cat<F>(path: Option<&Path>, f: F) -> String
+where
+F: FnOnce() -> Result<String>,
+{
+if let Some(p) = path {
+    if let Ok(s) = std::fs::read_to_string(p) {
+        return s;
+    }
+}
+f().unwrap_or_default()
+}
+

@@ -30,6 +30,13 @@ impl SvnVersion {
         (self.major, self.minor) >= (1, 9)
     }
 
+    /// `--password-from-stdin`（svn 1.12+）。
+    ///
+    /// 有了它就能避免把密码暴露在 `ps` 输出里。
+    pub fn supports_password_from_stdin(&self) -> bool {
+        (self.major, self.minor) >= (1, 12)
+    }
+
     /// `svn patch`（1.7+）。
     pub fn supports_patch(&self) -> bool {
         (self.major, self.minor) >= (1, 7)

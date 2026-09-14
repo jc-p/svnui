@@ -103,9 +103,87 @@ pub fn parse_line(line: &str) -> Option<StatusEntry> {
     })
 }
 
+/// 解析 `svn status -u` 的输出，只挑出**远端有更新**的条目。
+///
+/// ## 为什么单独一个函数，而不是在 `parse_status` 里加字段
+///
+/// `StatusEntry` 是**序列化到 yazi 插件的 JSON** 的结构，加字段会改变
+/// 协议形状。而且 `-u` 要连服务器，**慢且可能超时**，不能进热路径
+/// （`parse_status` 每秒可能被调很多次）。
+///
+/// 所以这里单独解析，返回 (路径, 远端最新版本号)。
+///
+/// ## 格式
+///
+/// `svn status -u` 比普通 status 多两列（第 8 列 `*`、第 9 起是版本号）：
+///
+/// ```text
+/// M                4521   src/main.rs     ← 第8列空格：只有本地改动
+///         *        4521   src/lib.rs      ← 第8列 `*`：远端有更新
+/// Status against revision:   4521
+/// ```
+///
+/// 路径可含空格，所以取路径时必须用"跳过后导数字再 trim"，
+/// 不能用 split_whitespace。
+pub fn parse_outdated(out: &str) -> Vec<(String, u64)> {
+    let mut v = Vec::new();
+    for line in out.lines() {
+        // -u 独有的收尾行，不是状态行
+        if line.starts_with("Status against revision") {
+            continue;
+        }
+        let mut chars = line.chars();
+        // 第 8 列（下标 7）是 `*` 才表示远端有更新
+        match chars.nth(7) {
+            Some('*') => {}
+            _ => continue,
+        }
+        let rest: String = chars.collect();
+        let rest = rest.trim_start();
+
+        // 版本号是行首连续数字
+        let digits_end = rest
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len());
+        if digits_end == 0 {
+            continue; // 没有版本号，格式不符，跳过而不是塞垃圾
+        }
+        let rev = rest[..digits_end].parse::<u64>().unwrap_or(0);
+        let path = rest[digits_end..].trim_start().to_string();
+        if path.is_empty() {
+            continue;
+        }
+        v.push((path, rev));
+    }
+    v
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn outdated_only_picks_star_column() {
+        let out = "M                4521   src/main.rs\n        *        4521   src/lib.rs\nStatus against revision:   4521\n";
+        let v = parse_outdated(out);
+        assert_eq!(v.len(), 1, "只有带 * 的那行算远端有更新");
+        assert_eq!(v[0].0, "src/lib.rs");
+        assert_eq!(v[0].1, 4521);
+    }
+
+    #[test]
+    fn outdated_keeps_spaces_in_path() {
+        let out = "        *        100   a b/c d.txt\n";
+        let v = parse_outdated(out);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].0, "a b/c d.txt", "路径含空格不能被 split 掉");
+    }
+
+    #[test]
+    fn outdated_ignores_malformed_line() {
+        let out = "        *   notanum   x.txt\n";
+        assert!(parse_outdated(out).is_empty());
+    }
 
     fn one(line: &str) -> StatusEntry {
         parse_line(line).unwrap_or_else(|| panic!("应当解析成功: {line:?}"))

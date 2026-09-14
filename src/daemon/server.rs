@@ -125,24 +125,14 @@ impl Shared {
         };
         let layer = snap.layer(dir);
 
-        let base: PathBuf = if dir.is_empty() {
-            self.root.clone()
-        } else {
-            self.root.join(dir)
-        };
+        let base: PathBuf = if dir.is_empty() { self.root.clone() } else { self.root.join(dir) };
 
         let mut map = HashMap::new();
         for (name, mark) in layer.files {
-            map.insert(
-                base.join(&name).to_string_lossy().to_string(),
-                xy(mark.sign),
-            );
+            map.insert(base.join(&name).to_string_lossy().to_string(), xy(mark.sign));
         }
         for (name, mark) in layer.dirs {
-            map.insert(
-                base.join(&name).to_string_lossy().to_string(),
-                xy(mark.sign),
-            );
+            map.insert(base.join(&name).to_string_lossy().to_string(), xy(mark.sign));
         }
         (map, self.ready.load(Ordering::SeqCst))
     }
@@ -161,15 +151,13 @@ fn xy(sign: char) -> String {
 
 /// 绝对路径 → 相对工作副本根的字符串。
 fn relative_of(root: &Path, abs: &Path) -> Option<String> {
-    abs.strip_prefix(root)
-        .ok()
-        .map(|p| p.to_string_lossy().to_string())
+    abs.strip_prefix(root).ok().map(|p| p.to_string_lossy().to_string())
 }
 
 /// 运行 daemon（阻塞）。`svnui daemon run` 的实现。
 #[cfg(unix)]
 pub fn serve(root: &Path, timeout: Duration) -> Result<()> {
-    let svn = Svn::discover(root, timeout)?;
+    let svn = Svn::discover(root, timeout, false)?;
     let shared = Arc::new(Shared::new(svn.root.clone()));
 
     let sock = socket_path(&svn.root);
@@ -311,15 +299,16 @@ fn accept_loop(
 
 /// 处理单个连接：读一行请求，回一行响应。
 #[cfg(unix)]
-fn handle(stream: UnixStream, shared: &Shared, svn: &Svn, branch: Option<String>) -> Result<()> {
+fn handle(
+    stream: UnixStream,
+    shared: &Shared,
+    svn: &Svn,
+    branch: Option<String>,
+) -> Result<()> {
     let reader = BufReader::new(&stream);
     let mut line = String::new();
     // 限制单行帧大小：防止写坏的客户端（或恶意进程）用超长行把 daemon 内存打爆
-    if reader
-        .take(crate::daemon::protocol::MAX_FRAME)
-        .read_line(&mut line)?
-        == 0
-    {
+    if reader.take(crate::daemon::protocol::MAX_FRAME).read_line(&mut line)? == 0 {
         return Ok(());
     }
     let trimmed = line.trim();
@@ -355,10 +344,7 @@ fn handle(stream: UnixStream, shared: &Shared, svn: &Svn, branch: Option<String>
 
     // 版本戳一致 → 回极简响应（几十字节），客户端直接用本地缓存
     if q.since == Some(stamp) {
-        return write_reply(
-            &stream,
-            &Reply::unchanged(stamp, shared.ready.load(Ordering::SeqCst)),
-        );
+        return write_reply(&stream, &Reply::unchanged(stamp, shared.ready.load(Ordering::SeqCst)));
     }
 
     let rel = relative_dir(&shared.root, Path::new(&q.dir));
@@ -422,14 +408,8 @@ mod tests {
     #[test]
     fn relative_dir_handles_root_and_nested() {
         assert_eq!(relative_dir(Path::new("/repo"), Path::new("/repo")), "");
-        assert_eq!(
-            relative_dir(Path::new("/repo"), Path::new("/repo/src")),
-            "src"
-        );
-        assert_eq!(
-            relative_dir(Path::new("/repo"), Path::new("/repo/src/ui")),
-            "src/ui"
-        );
+        assert_eq!(relative_dir(Path::new("/repo"), Path::new("/repo/src")), "src");
+        assert_eq!(relative_dir(Path::new("/repo"), Path::new("/repo/src/ui")), "src/ui");
     }
 
     #[test]

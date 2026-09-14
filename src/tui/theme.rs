@@ -81,6 +81,14 @@ impl Theme {
         Style::default().fg(Color::DarkGray)
     }
 
+    /// 正文文本（diff 的上下文行等）。
+    ///
+    /// 和 `status_bar()` 区分开：那个是"黑字青底"的条状样式，
+    /// 用在正文上会变成一整片蓝。
+    pub fn text() -> Style {
+        Style::default().fg(Color::Gray)
+    }
+
     /// 帮助行 / 次要信息。
     pub fn dim() -> Style {
         Style::default().fg(Color::DarkGray)

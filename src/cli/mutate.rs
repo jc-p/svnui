@@ -186,3 +186,84 @@ pub fn update(
     }
     Ok(s)
 }
+
+// ------------------------------------------------------------ 检出 / 认证
+
+/// 检出一份工作副本。
+pub fn checkout(
+    svn: &Svn,
+    url: &str,
+    path: Option<&std::path::Path>,
+    username: Option<&str>,
+    password: Option<&str>,
+    depth: &str,
+    no_auth_cache: bool,
+) -> Result<String, Error> {
+    // 没给路径就用 URL 最后一段当目录名（和 svn 自己的行为一致）
+    let default_name = url
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("wc")
+        .to_string();
+    let target = path
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from(&default_name));
+
+    let auth = crate::svn::client::AuthOpts {
+        username: username.map(|s| s.to_string()),
+        password: password.map(|s| s.to_string()),
+        no_auth_cache,
+    };
+
+    let out = svn.checkout(url, &target, &auth, depth)?;
+
+    let mut s = format!("已检出到 {}\n", target.display());
+    s.push_str(&out.stdout);
+    Ok(s)
+}
+
+/// 登录 / 注销。
+pub fn login(
+    svn: &Svn,
+    url: Option<&str>,
+    username: Option<&str>,
+    password: Option<&str>,
+    no_auth_cache: bool,
+    logout: bool,
+) -> Result<String, Error> {
+    if logout {
+        svn.logout()?;
+        return Ok("已清除凭据缓存（所有仓库）".to_string());
+    }
+
+    // 没给 URL 就用当前工作副本的地址
+    let target = match url {
+        Some(u) => u.to_string(),
+        None => svn.info()?.url,
+    };
+
+    let auth = crate::svn::client::AuthOpts {
+        username: username.map(|s| s.to_string()),
+        password: password.map(|s| s.to_string()),
+        no_auth_cache,
+    };
+
+    svn.login(&target, &auth)?;
+
+    Ok(if no_auth_cache {
+        format!("✓ 凭据有效（未缓存）：{}", target)
+    } else {
+        format!("✓ 已登录并缓存凭据：{}\n   之后的操作不再需要输入密码。", target)
+    })
+}
+
+/// 列出已缓存的凭据。
+pub fn auth_list(svn: &Svn) -> Result<String, Error> {
+    let out = svn.auth_list()?;
+    if out.stdout.trim().is_empty() {
+        return Ok("（没有缓存的凭据）".to_string());
+    }
+    Ok(out.stdout)
+}

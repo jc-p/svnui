@@ -27,6 +27,18 @@ pub struct Cli {
     #[arg(long, global = true, default_value_t = 30)]
     pub timeout: u64,
 
+    /// 放行 SSL 证书校验失败（内网自签名 CA、网关 SSL 中间人、
+    /// 证书签给了别的主机名）。
+    ///
+    /// 对应 svn 的
+    /// `--trust-server-cert-failures=unknown-ca,cn-mismatch,expired,not-yet-valid,other`。
+    ///
+    /// ⚠️ 这会跳过证书校验，等于放弃了对中间人攻击的防护。
+    /// 只在确认是**自己的内网服务器**时启用。
+    /// 也可以用环境变量 SVNR_TRUST_CERT=1，省得每次敲。
+    #[arg(long, global = true)]
+    pub trust_cert: bool,
+
     /// 禁用状态缓存（每次都真跑 svn status）。
     #[arg(long, global = true)]
     pub no_cache: bool,
@@ -48,6 +60,50 @@ pub struct Cli {
 pub enum Cmd {
     /// 环境自检：svn 路径、版本、工作副本根、能力开关。
     Probe,
+
+    /// 检出一份工作副本。
+    ///
+    /// 唯一不需要先有工作副本的命令 —— 它的用途就是创建工作副本。
+    Checkout {
+        /// 仓库地址（`svn://` / `http://` / `file://`）。
+        url: String,
+        /// 本地路径，默认当前目录下的仓库名。
+        path: Option<PathBuf>,
+        #[arg(long)]
+        username: Option<String>,
+        /// 不安全：会短暂出现在 `ps` 输出里。svn 1.12+ 优先走 stdin。
+        #[arg(long)]
+        password: Option<String>,
+        /// 目录深度。`infinity`（默认，全量）/ `empty` / `files` / `immediates`。
+        #[arg(long, default_value = "infinity")]
+        depth: String,
+        /// 不让 svn 记住凭据。
+        #[arg(long)]
+        no_auth_cache: bool,
+    },
+
+    /// 登录：验证凭据并交给 svn 缓存。
+    ///
+    /// svn 没有独立的登录命令，凭据是在第一次需要认证的操作里顺带缓存的。
+    /// 所以这里对远端跑一次 `svn info` —— 成功即代表凭据有效且已记住，
+    /// 之后所有操作都不用再输。
+    Login {
+        /// 要登录的仓库地址。省略则用当前工作副本的 URL。
+        url: Option<String>,
+        #[arg(long, short = 'u')]
+        username: Option<String>,
+        #[arg(long, short = 'p')]
+        password: Option<String>,
+        /// 不让 svn 记住凭据（只验证这一次）。
+        #[arg(long)]
+        no_auth_cache: bool,
+        /// 注销：清掉已缓存的凭据。
+        #[arg(long, conflicts_with_all = ["username", "password"])]
+        logout: bool,
+    },
+
+    /// 列出 svn 已缓存的凭据（需要 svn 1.9+）。
+    Auth,
 
     /// 交互式 TUI：浏览变更、看 diff、勾选提交。
     ///
@@ -267,9 +323,24 @@ pub fn run(cli: Cli) -> i32 {
     //   · install-yazi —— 装插件时人可能在任何目录，甚至还没装 svn
     //   · probe        —— 它就是用来回答"为什么找不到仓库"的，
     //                     进了非工作副本直接退出等于自废武功
-    let needs_wc = !matches!(cli.cmd, Cmd::InstallYazi { .. } | Cmd::Probe);
+    // 这些命令不需要工作副本：
+    //   · install-yazi —— 装插件时人可能在任何目录，甚至还没装 svn
+    //   · probe        —— 它就是用来回答"为什么找不到仓库"的，
+    //                     进了非工作副本直接退出等于自废武功
+    //   · checkout     —— 它的用途就是**创建**工作副本，要求先有工作副本是循环依赖
+    //   · login / auth —— 凭据是全局的（~/.subversion/auth），不隶属于某个副本
+    let mut needs_wc = !matches!(
+        cli.cmd,
+        Cmd::InstallYazi { .. } | Cmd::Probe | Cmd::Checkout { .. } | Cmd::Login { .. } | Cmd::Auth
+    );
+    // TUI 自己能处理"不在工作副本"的情况（进去给检出界面），
+    // 所以在这一层放行，别先把它拦下来。
+    #[cfg(feature = "tui")]
+    if matches!(cli.cmd, Cmd::Tui) {
+        needs_wc = false;
+    }
 
-    let svn = match crate::svn::Svn::discover(&start, cli.timeout()) {
+    let svn = match crate::svn::Svn::discover(&start, cli.timeout(), cli.trust_cert) {
         Ok(s) => s,
         Err(e) => {
             if needs_wc {
@@ -277,7 +348,7 @@ pub fn run(cli: Cli) -> i32 {
                 return e.exit_code();
             }
             // 降级：只要能找到 svn 本体就继续（报出路径+版本也是有用的诊断）
-            match crate::svn::Svn::discover_bare(&start, cli.timeout()) {
+            match crate::svn::Svn::discover_bare(&start, cli.timeout(), cli.trust_cert) {
                 Ok(s) => s,
                 Err(bare_err) => {
                     emit_err(&cli, &bare_err);
@@ -307,10 +378,7 @@ pub fn run(cli: Cli) -> i32 {
 /// 统一错误出口：JSON 走信封，人类走可读提示。
 fn emit_err(cli: &Cli, e: &crate::domain::Error) {
     if cli.json {
-        println!(
-            "{}",
-            crate::output::err(crate::output::kind_of(e), &e.to_string())
-        );
+        println!("{}", crate::output::err(crate::output::kind_of(e), &e.to_string()));
     } else {
         eprintln!("{}", crate::cli::hint::human_hint(e));
     }
@@ -328,103 +396,62 @@ fn dispatch(cli: &Cli, svn: &crate::svn::Svn, tty: bool) -> Result<String, crate
         }
 
         Cmd::Probe => query::probe(cli, svn),
-        // 反转成"包含"语义：默认 true，与 StatusOpts::default() 一致。
-        Cmd::Status {
-            ignored,
-            no_unversioned,
-            updates,
-            changed,
-            conflicts,
-        } => query::status(
-            cli,
+        Cmd::Checkout { url, path, username, password, depth, no_auth_cache } => mutate::checkout(
             svn,
-            *ignored,
-            !*no_unversioned,
-            *updates,
-            *changed,
-            *conflicts,
-            tty,
+            url,
+            path.as_deref(),
+            username.as_deref(),
+            password.as_deref(),
+            depth,
+            *no_auth_cache,
         ),
-        Cmd::Log {
-            limit,
-            rev,
-            oneline,
-            paths,
-        } => query::log(cli, svn, *limit, rev.as_deref(), *oneline, paths),
+        Cmd::Login { url, username, password, no_auth_cache, logout } => mutate::login(
+            svn,
+            url.as_deref(),
+            username.as_deref(),
+            password.as_deref(),
+            *no_auth_cache,
+            *logout,
+        ),
+        Cmd::Auth => mutate::auth_list(svn),
+        // 反转成"包含"语义：默认 true，与 StatusOpts::default() 一致。
+        Cmd::Status { ignored, no_unversioned, updates, changed, conflicts } => {
+            query::status(cli, svn, *ignored, !*no_unversioned, *updates, *changed, *conflicts, tty)
+        }
+        Cmd::Log { limit, rev, oneline, paths } => {
+            query::log(cli, svn, *limit, rev.as_deref(), *oneline, paths)
+        }
         Cmd::Blame { path } => query::blame(svn, path),
         Cmd::Info => query::info(cli, svn),
-        Cmd::Diff {
-            stat,
-            rev,
-            page,
-            paths,
-        } => query::diff(cli, svn, *stat, rev.as_deref(), *page, paths),
+        Cmd::Diff { stat, rev, page, paths } => query::diff(cli, svn, *stat, rev.as_deref(), *page, paths),
         Cmd::Conflicts => rescue::conflicts(cli, svn, tty),
 
         Cmd::Add { paths } => mutate::add(svn, paths),
-        Cmd::Remove {
-            keep_local,
-            yes,
-            paths,
-        } => mutate::remove(svn, *keep_local, *yes, paths, tty),
-        Cmd::Revert {
-            paths,
-            dry_run,
-            yes,
-        } => mutate::revert(svn, paths, *dry_run, *yes, tty),
-        Cmd::Commit {
-            message,
-            paths,
-            dry_run,
-            yes,
-        } => mutate::commit(svn, message.as_deref(), paths, *dry_run, *yes, tty),
+        Cmd::Remove { keep_local, yes, paths } => {
+            mutate::remove(svn, *keep_local, *yes, paths, tty)
+        }
+        Cmd::Revert { paths, dry_run, yes } => mutate::revert(svn, paths, *dry_run, *yes, tty),
+        Cmd::Commit { message, paths, dry_run, yes } => {
+            mutate::commit(svn, message.as_deref(), paths, *dry_run, *yes, tty)
+        }
         Cmd::Update { rev, paths, yes } => mutate::update(svn, rev.as_deref(), paths, *yes, tty),
-        Cmd::Resolve {
-            accept,
-            paths,
-            dry_run,
-            yes,
-        } => rescue::resolve(svn, accept, paths, *dry_run, *yes, tty),
-        Cmd::Cleanup {
-            remove_unversioned,
-            remove_ignored,
-            vacuum_pristines,
-            dry_run,
-            yes,
-        } => rescue::cleanup(
-            svn,
-            *remove_unversioned,
-            *remove_ignored,
-            *vacuum_pristines,
-            *dry_run,
-            *yes,
-            tty,
-        ),
+        Cmd::Resolve { accept, paths, dry_run, yes } => {
+            rescue::resolve(svn, accept, paths, *dry_run, *yes, tty)
+        }
+        Cmd::Cleanup { remove_unversioned, remove_ignored, vacuum_pristines, dry_run, yes } => {
+            rescue::cleanup(svn, *remove_unversioned, *remove_ignored, *vacuum_pristines, *dry_run, *yes, tty)
+        }
         Cmd::Doctor => rescue::doctor(cli, svn, tty),
 
         // 注意：这里匹配的是 `&cli.cmd`，字段都是引用，必须 clone 成 owned 值。
-        Cmd::Daemon { action } => daemon_cmd::run(
-            daemon_cmd::Cmd::Daemon {
-                action: action.clone(),
-            },
-            cli,
-            svn,
-        ),
-        Cmd::Q { dir, since } => daemon_cmd::run(
-            daemon_cmd::Cmd::Q {
-                dir: dir.clone(),
-                since: *since,
-            },
-            cli,
-            svn,
-        ),
+        Cmd::Daemon { action } => {
+            daemon_cmd::run(daemon_cmd::Cmd::Daemon { action: action.clone() }, cli, svn)
+        }
+        Cmd::Q { dir, since } => {
+            daemon_cmd::run(daemon_cmd::Cmd::Q { dir: dir.clone(), since: *since }, cli, svn)
+        }
 
-        Cmd::InstallYazi {
-            check,
-            force,
-            patch_init,
-            print_keymap,
-        } => {
+        Cmd::InstallYazi { check, force, patch_init, print_keymap } => {
             if *print_keymap {
                 return Ok(crate::install::keymap_snippet().to_string());
             }
@@ -441,8 +468,7 @@ fn dispatch(cli: &Cli, svn: &crate::svn::Svn, tty: bool) -> Result<String, crate
                 Some(c) => c,
                 None => {
                     return Err(crate::domain::Error::Parse(
-                        "该工作副本不支持缓存（缺少 .svn/wc.db，可能是 SVN 1.6 及更早）"
-                            .to_string(),
+                        "该工作副本不支持缓存（缺少 .svn/wc.db，可能是 SVN 1.6 及更早）".to_string(),
                     ))
                 }
             };
@@ -463,10 +489,7 @@ fn dispatch(cli: &Cli, svn: &crate::svn::Svn, tty: bool) -> Result<String, crate
                 })));
             }
             if !st.exists {
-                return Ok(format!(
-                    "缓存文件不存在：{}\n（跑一次 svnui status 会生成）",
-                    st.path.display()
-                ));
+                return Ok(format!("缓存文件不存在：{}\n（跑一次 svnui status 会生成）", st.path.display()));
             }
             Ok(format!(
                 "缓存文件  {}\n大小      {} 字节\n年龄      {} 秒\n状态条目  {}\n跟踪节点  {}\n工作副本  {}",

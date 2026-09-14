@@ -17,8 +17,13 @@ path = "src/lib.rs"
 [features]
 # TUI 是主形态，但用 feature 隔离：不要 TUI 的场景（CI、最小化构建）
 # 可以 --no-default-features 关掉，省掉 crossterm 那堆依赖。
-default = ["tui"]
+default = ["tui", "docs"]
 tui = ["dep:ratatui", "dep:crossterm", "dep:tui-textarea"]
+
+# 办公文档预览（CSV / Excel / Word）。
+# 关掉能省掉 calamine + csv + docx-lite 的编译时间；
+# 关掉后这类文件会显示"请开启 docs feature"，而不是乱码。
+docs = ["dep:csv", "dep:calamine", "dep:docx-lite"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
@@ -36,6 +41,17 @@ camino = { version = "1", features = ["serde1"] }
 ratatui = { version = "0.30", optional = true }
 crossterm = { version = "0.29", optional = true }
 tui-textarea = { package = "tui-textarea-2", version = "0.13", optional = true }
+
+# ── 办公文档预览（feature = "docs"）─────────────────────────
+# .xlsx/.docx 本质是 zip 包里装 XML，直接读会是二进制乱码，
+# 所以必须解压 + 解析。三个库都是纯 Rust，不需要系统依赖。
+#
+# calamine：Excel/OpenDocument 读取的事实标准（xls/xlsx/xlsm/xlsb/ods 全覆盖）
+# csv：分隔符转义、引号内换行、BOM 这些坑它都处理好了
+# docx-lite：只依赖 zip + quick-xml，比 office_oxide / dotext 轻得多
+csv = { version = "1.3", optional = true }
+calamine = { version = "0.36", optional = true }
+docx-lite = { version = "0.2", optional = true }
 
 # M9 daemon 的文件监听。
 # 没有引入 tokio：svn 调用必须串行（见 daemon/server.rs），

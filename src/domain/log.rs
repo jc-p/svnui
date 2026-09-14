@@ -52,9 +52,17 @@ impl LogEntry {
         format!("r{:<7} {:<12} {}  {}", self.revision, self.author, day, subject)
     }
 
-    /// 提交信息首行。
+    /// 只取提交信息的**首行**（subject）。
+    ///
+    /// 列表里只放这个 —— TUI 的日志面板里 author/date 各自占一列，
+    /// 不像 `oneline()` 那样把版本号和日期都拼进去。
     pub fn subject(&self) -> &str {
-        self.msg.lines().next().unwrap_or("").trim()
+        let s = self.msg.lines().next().unwrap_or("").trim();
+        if s.is_empty() {
+            "(no message)"
+        } else {
+            s
+        }
     }
 
     /// 影响的文件数（`-v` 才有意义）。

@@ -1,11 +1,11 @@
-//! 主状态列表。
+//! 变更列表（左栏）。
 //!
-//! TUI 的默认视图：一个可滚动的变更清单，右侧是选中项的 diff 预览。
+//! 只负责列表本身 —— 顶部信息栏和底部帮助由 `App` 画，
+//! 这样布局调整集中在一个地方，不用每个面板各算一次。
 
 use ratatui::{
-    layout::{Alignment, Constraint, Direction, Layout},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, List, ListItem, ListState, Scrollbar, ScrollbarOrientation, ScrollbarState},
     Frame,
 };
 
@@ -30,71 +30,40 @@ impl StatusPanel {
         self.state.selected()
     }
 
-    pub fn move_up(&mut self) {
-        let i = match self.state.selected() {
-            Some(i) => i.saturating_sub(1),
+    /// 移动光标，返回是否真的动了（没动就不用重新加载 diff）。
+    pub fn move_up(&mut self) -> bool {
+        let next = match self.state.selected() {
+            Some(i) if i > 0 => i - 1,
+            Some(_) => return false,
             None => 0,
         };
-        self.state.select(Some(i));
+        self.state.select(Some(next));
+        true
     }
 
-    pub fn move_down(&mut self, len: usize) {
+    pub fn move_down(&mut self, len: usize) -> bool {
         if len == 0 {
-            return;
+            return false;
         }
-        let i = match self.state.selected() {
-            Some(i) => (i + 1).min(len - 1),
+        let next = match self.state.selected() {
+            Some(i) if i + 1 < len => i + 1,
+            Some(_) => return false,
             None => 0,
         };
-        self.state.select(Some(i));
+        self.state.select(Some(next));
+        true
     }
 
+    /// 渲染到给定区域（整个区域都属于列表）。
     pub fn render(&mut self, f: &mut Frame, area: ratatui::layout::Rect, items: &[Item]) {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1), // 顶部信息
-                Constraint::Min(3),    // 列表
-                Constraint::Length(1), // 底部帮助
-            ])
-            .split(area);
-
-        // ── 顶部：分支 / 版本 / 统计
-        let mut counts: Vec<(char, usize)> = Vec::new();
-        for sign in ['C', 'T', '!', 'D', 'R', 'A', 'M', '?'] {
-            let n = items.iter().filter(|i| i.sign == sign).count();
-            if n > 0 {
-                counts.push((sign, n));
-            }
-        }
-
-        let mut spans = vec![Span::styled(" SVN ", theme::Theme::status_bar())];
-        if counts.is_empty() {
-            spans.push(Span::styled("✓ 工作副本干净", theme::Theme::clean()));
-        } else {
-            for (sign, n) in counts {
-                spans.push(Span::styled(
-                    format!(" {}{} ", sign, n),
-                    theme::for_sign(sign),
-                ));
-            }
-        }
-        f.render_widget(
-            Paragraph::new(Line::from(spans)).alignment(Alignment::Left),
-            chunks[0],
-        );
-
-        // ── 列表
         let list_items: Vec<ListItem> = items
             .iter()
             .map(|item| {
+                let style = theme::for_sign(item.sign);
                 ListItem::new(Line::from(vec![
-                    Span::styled(format!(" {} ", item.sign), theme::for_sign(item.sign)),
-                    Span::styled(item.display(), theme::for_sign(item.sign)),
-                    Span::styled(
-                        format!("  {}", item.xy.trim_end()),
-                        theme::Theme::dim(),
-                    ),
+                    Span::styled(format!(" {} ", item.sign), style),
+                    Span::styled(item.display(), style),
+                    Span::styled(format!(" {}", item.xy.trim_end()), theme::Theme::dim()),
                 ]))
             })
             .collect();
@@ -108,15 +77,18 @@ impl StatusPanel {
             )
             .highlight_style(theme::Theme::selected());
 
-        f.render_stateful_widget(list, chunks[1], &mut self.state);
+        f.render_stateful_widget(list, area, &mut self.state);
 
-        // ── 底部帮助
-        f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                " j/k 移动 | Enter 看 diff | c 提交 | a add | r revert | u update | h 体检 | R 刷新 | q 退出",
-                theme::Theme::dim(),
-            ))),
-            chunks[2],
-        );
+        // 滚动条：变更条目超过一屏时，没有它看不出后面还有多少
+        let visible_h = area.height.saturating_sub(2) as usize;
+        if items.len() > visible_h {
+            let mut sb =
+                ScrollbarState::new(items.len()).position(self.state.selected().unwrap_or(0));
+            f.render_stateful_widget(
+                Scrollbar::new(ScrollbarOrientation::VerticalRight),
+                area,
+                &mut sb,
+            );
+        }
     }
 }

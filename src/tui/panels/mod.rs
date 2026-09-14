@@ -3,9 +3,17 @@
 //! 每个面板一个文件，各自管自己的状态和渲染。
 //! 共享的条目模型放这里。
 
+pub mod checkout;
 pub mod commit;
-pub mod diff;
+pub mod confirm;
+pub mod conflict;
+#[cfg(feature = "docs")]
+pub mod document;
+pub mod help;
+pub mod log;
+pub mod preview;
 pub mod status;
+pub mod tree;
 
 use crate::domain::StatusEntry;
 

@@ -79,7 +79,13 @@ pub fn run(exe: &Path, args: &[&str], cwd: &Path, opts: &RunOpts) -> Result<RawO
         if Error::is_lock_error(&out.stderr) {
             return Err(Error::Locked(cwd.to_path_buf()));
         }
-        return Err(Error::SvnFailed { code: out.code.unwrap_or(-1), stderr: out.stderr });
+        // 用 with_explanation 而不是直接 SvnFailed：
+        // 让"E170013 连不上服务器"这类常见错误能显示成人话 + 下一步建议。
+        // 识别不出来的仍走 SvnFailed（保留原始 stderr）。
+        return Err(crate::domain::with_explanation(
+            out.code.unwrap_or(-1),
+            out.stderr,
+        ));
     }
 
     Ok(out)
@@ -175,7 +181,13 @@ pub fn run_with_stdin(
         if Error::is_lock_error(&out.stderr) {
             return Err(Error::Locked(cwd.to_path_buf()));
         }
-        return Err(Error::SvnFailed { code: out.code.unwrap_or(-1), stderr: out.stderr });
+        // 用 with_explanation 而不是直接 SvnFailed：
+        // 让"E170013 连不上服务器"这类常见错误能显示成人话 + 下一步建议。
+        // 识别不出来的仍走 SvnFailed（保留原始 stderr）。
+        return Err(crate::domain::with_explanation(
+            out.code.unwrap_or(-1),
+            out.stderr,
+        ));
     }
     Ok(out)
 }

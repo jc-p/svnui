@@ -28,6 +28,9 @@ pub fn kind_of(e: &crate::domain::Error) -> &'static str {
         Error::Timeout(_) => "timeout",
         Error::Cancelled => "cancelled",
         Error::SvnFailed { .. } => "svn-failed",
+        // 带人话解释的 svn 失败：对外仍归类为 svn-failed，
+        // 只是 summary/detail 已经是翻译过的。
+        Error::Explained { .. } => "svn-failed",
         Error::Parse(_) => "parse",
         Error::Io(_) => "io",
     }
