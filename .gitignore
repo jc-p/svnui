@@ -3,3 +3,4 @@
 *.sock
 *.swp
 .DS_Store
+/dist

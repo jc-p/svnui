@@ -86,13 +86,13 @@ cargo check --quiet 2>/dev/null || cargo metadata --format-version 1 >/dev/null
 
 git add Cargo.toml Cargo.lock
 git commit -m "chore: bump version to $NEW"
-git tag "v$NEW"
+git tag "$NEW"
 
 echo ""
-echo "✓ 已提交并打好 tag v$NEW"
+echo "✓ 已提交并打好 tag $NEW"
 echo ""
 echo "接下来（这一步会触发发布，确认无误再执行）："
-echo "  git push origin main && git push origin v$NEW"
+echo "  git push origin main && git push origin $NEW"
 echo ""
 echo "反悔："
-echo "  git tag -d v$NEW && git reset --hard HEAD~1"
+echo "  git tag -d $NEW && git reset --hard HEAD~1"

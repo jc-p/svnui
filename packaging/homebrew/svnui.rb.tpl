@@ -2,7 +2,6 @@ class Svnui < Formula
   desc "Subversion with a real TUI: status, diff, commit, conflicts"
   homepage "https://github.com/@@OWNER@@/svnui"
   license "MIT"
-  version "@@VERSION@@"
 
   # 预编译二进制，不从源码构建。
   #
@@ -12,11 +11,11 @@ class Svnui < Formula
   # 3. 用户装个 5MB 的二进制不该先装整个 Rust 工具链
   on_macos do
     on_arm do
-      url "https://github.com/@@OWNER@@/svnui/releases/download/v@@VERSION@@/svnui-@@VERSION@@-aarch64-apple-darwin.tar.gz"
+      url "https://github.com/@@OWNER@@/svnui/releases/download/@@VERSION@@/svnui-@@VERSION@@-aarch64-apple-darwin.tar.gz"
       sha256 "@@SHA_ARM@@"
     end
     on_intel do
-      url "https://github.com/@@OWNER@@/svnui/releases/download/v@@VERSION@@/svnui-@@VERSION@@-x86_64-apple-darwin.tar.gz"
+      url "https://github.com/@@OWNER@@/svnui/releases/download/@@VERSION@@/svnui-@@VERSION@@-x86_64-apple-darwin.tar.gz"
       sha256 "@@SHA_X86@@"
     end
   end
