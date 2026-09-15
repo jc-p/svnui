@@ -6,6 +6,7 @@
 #   ./scripts/dist.sh --no-publish     # 只打包，不碰任何远端
 #   ./scripts/dist.sh --no-push        # 发 Release，但 tap 仓库只 commit 不 push
 #   ./scripts/dist.sh --tap-dir <dir>  # 手动指定 homebrew-svnui 仓库路径
+#   ./scripts/dist.sh --brew-update    # 收尾跑 brew update（要拉全部 tap，慢，默认跳过）
 #
 # 环境变量：
 #   TAP_OWNER   覆盖 owner（默认从 git remote 解析）
@@ -22,6 +23,7 @@ cd "$(dirname "$0")/.."
 HOST_ONLY=0
 NO_PUBLISH=0
 NO_PUSH=0
+BREW_UPDATE=0
 TAP_DIR_ARG=""
 
 while [ $# -gt 0 ]; do
@@ -30,6 +32,7 @@ while [ $# -gt 0 ]; do
     --no-publish) NO_PUBLISH=1; shift ;;
     --no-push)    NO_PUSH=1; shift ;;
     --tap-dir)    TAP_DIR_ARG="${2:-}"; shift 2 ;;
+    --brew-update) BREW_UPDATE=1; shift ;;
     -h|--help)
       sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
       exit 0 ;;
@@ -453,12 +456,21 @@ elif [ "$SYNCED" != "$OTHERS" ]; then
   echo "  ⚠️ 有 ${OTHERS} 份其他克隆，只同步了 ${SYNCED} 份 —— 看上面的警告"
 fi
 
+# brew update 会拉全部 tap（homebrew-core 几十万文件），国内网络常要几分钟，
+# 期间一句输出都没有 —— 这是整个脚本唯一"看着像卡死"的地方。
+# tap 的 formula 前面已经 git pull 过，brew install 直接读本地文件，
+# 所以这步非必需：默认跳过，加 --brew-update 才真跑（带 120s 超时保护）。
 if [ "$NO_PUBLISH" = "0" ] && [ "$NO_PUSH" = "0" ]; then
-  # brew 自己也会缓存 formula 解析结果，这一步让 brew 立刻看到新版本
-  if command -v brew >/dev/null 2>&1; then
-    brew update --force >/dev/null 2>&1 \
-      && echo "  ✓ brew update 已刷新" \
-      || echo "  ⚠️ brew update 失败，手动跑一次：brew update --force"
+  if [ "$BREW_UPDATE" = "1" ] && command -v brew >/dev/null 2>&1; then
+    echo "  brew update --force（拉全部 tap，可能 1-2 分钟）…"
+    if brew update --force >/dev/null 2>&1; then
+      echo "  ✓ brew update 已刷新"
+    else
+      echo "  ⚠️ brew update 失败或被中断，手动跑一次：brew update --force"
+    fi
+  else
+    echo "  跳过 brew update（要拉全部 tap、很慢；tap 已 pull，直接装即可）"
+    echo "  需要时手动跑：brew update --force"
   fi
 fi
 
