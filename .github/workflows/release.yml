@@ -1,16 +1,17 @@
 name: Release
 
 # 打 tag 就发布：
-#   git tag v0.2.0 && git push origin v0.2.0
+#   git tag 0.2.0 && git push origin 0.2.0
+# tag 不带 v 前缀（跟 dist.sh 保持一致）
 # 也可以在 Actions 页面手动触发（workflow_dispatch），输入已存在的 tag 重跑。
 on:
   push:
     tags:
-      - "v*"
+      - "[0-9]*"
   workflow_dispatch:
     inputs:
       tag:
-        description: "要发布的 tag（如 v0.2.0）"
+        description: "要发布的 tag（如 0.2.0）"
         required: true
 
 permissions:

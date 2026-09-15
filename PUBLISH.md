@@ -1,366 +1,306 @@
-# 发布 svnui 到 Homebrew
+# 发布 svnui 到 Homebrew（含自动升级）
 
-> 本文档已合并原 `PUBLISH_MANUAL.md`。两份文档讲同一件事，是之前反复出错的根源
-> （一份说 tag 带 `v`，另一份不带，改的时候只改了一边）。**只保留这一份。**
+## 先说结论：走自建 Tap，别投 homebrew-core
 
----
+Homebrew 官方仓库（`homebrew-core`）对新 formula 有硬性门槛 —— 要求项目"有足够知名度"（看 GitHub 的 star / fork / watch 数），并且不接受公司内部或个人自用工具。个人 TUI 工具投上去基本是等几天然后被拒。
 
-## 结论：走自建 Tap，别投 homebrew-core
-
-`homebrew-core` 对新 formula 有硬性知名度门槛（看 star / fork / watch），
-不接受公司内部或个人自用工具。投上去基本是等几天然后被拒。
-
-**自建 Tap** 体验几乎一样，代价只是用户多一条 `brew tap`：
+**自建 Tap** 是正解，而且体验几乎一样好：
 
 ```bash
 brew tap jc-p/svnui
-brew trust jc-p/svnui      # 第三方 tap 需要显式信任
 brew install svnui
-brew upgrade svnui         # 后续升级就这一条
+brew upgrade svnui      # 后续升级就这一条
 ```
 
-> **命名规则容易踩**：Tap 仓库名**必须**叫 `homebrew-svnui`（带前缀），
-> 但 `brew tap` 命令里**不带**前缀——Homebrew 会自动去找 `homebrew-<名字>`。
+代价只是用户多了第一条 `brew tap`。
+
+> Tap 仓库的命名规则容易踩：仓库名**必须**叫 `homebrew-svnui`（带前缀），
+> 但 `brew tap` 命令里**不带**前缀 —— Homebrew 会自动去找 `homebrew-<名字>`。
 
 ---
 
-## 术语对照
+## 一、一次性准备
 
-| 仓库 | 地址 | 作用 |
-|---|---|---|
-| 主仓库 | `jc-p/svnui` | 源码、Release、二进制产物 |
-| Tap 仓库 | `jc-p/homebrew-svnui` | 只有一个 `Formula/svnui.rb` |
+### 1. 补齐项目里的缺失项
 
-两者是不同的 git 仓库，改完 formula **必须 push 到 Tap 仓库**才算生效。
+```bash
+cd ~/learn/Lazy/svnui
+```
 
----
+把包里的 `LICENSE` 放到项目根目录（`Cargo.toml` 声明了 `license = "MIT"`，但缺 LICENSE 文件，这在发布时是硬伤）。
 
-## 一次性准备
+给 `Cargo.toml` 的 `[package]` 段补几个字段（发布到 crates.io 需要，对 brew 也有用）：
 
-### 1. 建 Tap 仓库
+```toml
+repository = "https://github.com/jc-p/svnui"
+homepage   = "https://github.com/jc-p/svnui"
+readme     = "README.md"
+keywords   = ["svn", "subversion", "tui"]
+categories = ["command-line-utilities"]
+```
 
-GitHub 新建空仓库 `homebrew-svnui`，然后：
+### 2. 建 GitHub 仓库并推上去
+
+```bash
+git init
+git add .
+git commit -m "init"
+git branch -M main
+git remote add origin https://github.com/jc-p/svnui.git
+git push -u origin main
+```
+
+### 3. 建 Tap 仓库
+
+在 GitHub 上新建一个**空仓库**，名字必须是 `homebrew-svnui`。
+
+本地把它准备好：
 
 ```bash
 git clone https://github.com/jc-p/homebrew-svnui.git
 cd homebrew-svnui
 mkdir -p Formula
-# 先放一份占位的 formula（sha256 随便填），保证文件存在且语法合法
+cp ~/Downloads/svnui-release/Formula/svnui.rb Formula/
+# 把 @@VERSION@@ / @@SHA_ARM@@ / @@SHA_X86@@ / @@OWNER@@ 先填成占位值
 git add . && git commit -m "init tap" && git push
 ```
 
-### 2. 解除 tag 创建限制（**必做，否则发布必失败**）
-
-主仓库 → **Settings → Rules → Rulesets**。
-
-如果有规则作用范围覆盖了 tag，会报：
-
-```
-Cannot create ref due to creations being restricted.
-```
-
-二选一：
-
-- **Delete ruleset**（自己的仓库，最省事）
-- 或 **Bypass list** → 把 `jc-p` 加进去
-
-> ⚠️ **Rulesets 不自动豁免 owner**。你是仓库 owner 也照样被拦——
-> 这跟老版 Branch Protection 不一样。必须显式加 bypass 或删规则。
-
-### 3. 确认用的是 rustup 的 cargo
-
-```bash
-which -a cargo
-```
-
-只应有 `~/.cargo/bin/cargo`。如果 `/opt/homebrew/bin/cargo` 排在前面，
-`rustup target add` 装的 target 它用不到，交叉编译会报 `can't find crate for core`。
-
-```bash
-brew uninstall rust       # 或用下面这条只调 PATH
-echo 'export PATH="$HOME/.cargo/bin:$PATH"' >> ~/.zshrc
-```
+> 第一次的 formula 内容不重要，CI 会在第一次 release 时整体覆盖它。
+> 但要保证文件存在且语法合法，否则 `brew tap` 会报错。
 
 ### 4. 生成 PAT（跨仓库推送用）
 
-默认的 `GITHUB_TOKEN` 只能操作当前仓库，推不了 Tap 仓库。
+默认的 `GITHUB_TOKEN` **只能操作当前仓库**，推不了 tap 仓库，所以要用 PAT。
 
-- Settings → Developer settings → Personal access tokens → **Fine-grained tokens**
+- GitHub → Settings → Developer settings → Personal access tokens → **Fine-grained tokens**
 - Repository access：只选 `homebrew-svnui`
 - Permissions → Contents：**Read and write**
+- 生成后复制（只显示一次）
 
-主仓库 → Settings → Secrets and variables → Actions：
+### 5. 配置 Secrets / Variables
+
+在 `svnui` 仓库 → Settings → Secrets and variables → Actions：
 
 | 类型 | 名字 | 值 |
 |---|---|---|
-| Secret | `HOMEBREW_TAP_TOKEN` | 上面的 PAT |
+| Secret | `HOMEBREW_TAP_TOKEN` | 上面生成的 PAT |
 | Variable | `HOMEBREW_TAP_REPO` | `jc-p/homebrew-svnui` |
 
-### 5. 把发布脚本放进项目
+没配这两个的话 CI 会跳过 tap 更新并打 warning，其他步骤照常 —— 可以先跑通 release，再回来补。
 
-```
-scripts/dist.sh                    本地打包
-scripts/bump.sh                    改版本号 + 打 tag
-packaging/homebrew/svnui.rb.tpl    formula 模板（带 @@VERSION@@ 占位符）
-.github/workflows/release.yml      CI（可选，走通手动流程后再加）
-```
-
-```bash
-chmod +x scripts/*.sh
-echo "/dist" >> .gitignore        # 构建产物别进仓库
-```
-
----
-
-## 日常发布（手动，6 步）
-
-### 第 1 步：改版本号
+### 6. 放进 workflow 和模板
 
 ```bash
 cd ~/learn/Lazy/svnui
-./scripts/bump.sh 0.1.2
-git push origin main
+mkdir -p .github/workflows packaging/homebrew scripts
+cp ~/Downloads/svnui-release-v4/github-workflows/release.yml .github/workflows/
+cp -r ~/Downloads/svnui-release-v4/packaging/homebrew/svnui.rb.tpl packaging/homebrew/
+cp ~/Downloads/svnui-release-v4/scripts/*.sh scripts/
+chmod +x scripts/*.sh
+git add . && git commit -m "ci: add homebrew release workflow" && git push
 ```
 
-> **版本号用过就不能再用。** GitHub 的 immutable release 会永久占用 tag 名，
-> 即使删掉 release 也不释放。打错了只能升版本号，不能重来。
+> 包里刻意用 `github-workflows/` 而不是 `.github/` —— 点开头的目录在
+> Finder 里看不见，放项目里时记得改回 `.github/workflows/`。
 
-### 第 2 步：本地打包
+### 7. 验证 formula 语法（本地）
 
 ```bash
-./scripts/dist.sh
-```
-
-产出：
-
-```
-dist/svnui-0.1.2-aarch64-apple-darwin.tar.gz
-dist/svnui-0.1.2-x86_64-apple-darwin.tar.gz
-dist/svnui.rb          ← 填好真实 sha256 的成品 formula
-```
-
-> 交叉编译 x86_64 不需要 Rosetta 就能编，但编出来的二进制**在本机跑不了**
-> （`Bad CPU type`），所以脚本跳过它的冒烟测试——那不是编译失败。
-
-### 第 3 步：创建 Release 并上传
-
-```bash
-gh release create 0.1.2 --generate-notes dist/svnui-0.1.2-*.tar.gz
-```
-
-**⚠️ tag 名必须是不带 `v` 的 `0.1.2`。**
-
-这是本文档最需要记住的一条。`gh release create` 用什么 tag，
-`releases/download/<tag>/` 就是什么。而模板里如果写死 `v` 前缀，
-URL 就会变成 `download/v0.1.2/` → **404**。这个坑已经踩过两次。
-
-核对一下：
-
-```bash
-gh release view 0.1.2 --json tagName,isDraft,assets \
-  --jq '{tagName, isDraft, assets:[.assets[].name]}'
-```
-
-必须是 `"tagName": "0.1.2"` 且 `"isDraft": false`。
-
-> 如果是 `isDraft: true`，匿名下载一律 404（Draft 的 assets 不对外公开）。
-> 发布它：`gh release edit 0.1.2 --draft=false`
-
-### 第 4 步：更新 Tap 仓库
-
-```bash
-cd ~/path/to/homebrew-svnui
-cp ~/learn/Lazy/svnui/dist/svnui.rb Formula/
-git add Formula/svnui.rb
-git commit -m "svnui 0.1.2"
-git push                 # ← 忘了这步等于没改
-```
-
-**顺序不能反**：必须先有 Release 和 assets，再推 formula。
-反过来的空档里用户 `brew upgrade` 会拿到指向 404 的 url。
-
-### 第 5 步：验证
-
-```bash
-brew update --force
-brew upgrade svnui
-
-svnui --version                    # 应输出 0.1.2
-brew audit --formula jc-p/svnui/svnui
+brew tap jc-p/svnui
+brew install svnui
+svnui --version
 brew test svnui
+brew audit --formula svnui
 ```
 
-### 第 6 步：通知用户
-
-```bash
-brew upgrade svnui
-```
+`brew audit` 可能会提示 `version` 是冗余的（因为 url 里已含版本号）。这是**警告不是错误** —— 显式写 version 是为了让 CI 替换模板时更可控，忽略即可。用 `brew audit --strict` 才会拦截，日常别加这个参数。
 
 ---
 
-## 上 CI（可选）
+## 二、日常发布
 
-手动流程跑通之后，放上 `.github/workflows/release.yml`，
-之后推 tag 就自动完成第 2~4 步：
+### 本地一条命令（推荐）
 
 ```bash
-git push origin 0.1.2
+cd ~/learn/Lazy/svnui
+./scripts/release.sh 0.2.0
 ```
+
+等价于下面三步，`release.sh` 把它们串起来了：
+
+```bash
+./scripts/bump.sh 0.2.0     # 改 Cargo.toml + commit + 打 tag（不带 v）
+git push origin main        # 先推提交，否则 tag 会指到上一个 commit
+./scripts/dist.sh           # 剩下的全自动
+```
+
+> 想分步执行也行（`--no-publish` 先只打包看结果，确认后去掉参数再跑一次）。
+
+`dist.sh` 一次跑完：
+
+```
+编译 arm64 + x86_64 → 冒烟测试 → 打 tar.gz → 算 sha256
+   ├─ 就地更新 tap 仓库的 Formula/svnui.rb
+   ├─ gh release create（已存在则改用 upload --clobber 覆盖）
+   ├─ tap 仓库 commit + push
+   ├─ 同步本机其余 tap 克隆（见下）
+   └─ brew update --force
+```
+
+常用参数：
+
+| 参数 | 用途 |
+|---|---|
+| `--host-only` | 只编本机架构，交叉编译出问题时先出包 |
+| `--no-publish` | 只打包，不碰任何远端 |
+| `--no-push` | 发 Release，但 tap 只 commit 不 push |
+| `--tap-dir <路径>` | 手动指定 homebrew-svnui 仓库位置 |
+
+tap 目录会自动探测以下几个位置，**并且会全部同步**（不是只改第一份）：
+
+```
+~/Library/Taps/<owner>/homebrew-svnui          ← 你自己 clone 的那份
+/opt/homebrew/Library/Taps/<owner>/homebrew-svnui   ← brew 实际读的那份
+/usr/local/Homebrew/Library/Taps/<owner>/homebrew-svnui
+$(brew --repository)/Library/Taps/<owner>/homebrew-svnui
+```
+
+探测不到才需要 `--tap-dir`。
+
+owner 从 git remote 解析（`TAP_OWNER` 可覆盖）。万一解析不出来（SSH 别名、
+自建 git 服务器、remote 改过名），脚本会在上面几个前缀目录下直接 glob
+`*/homebrew-svnui` 兜底，不会静默跳过。
+
+### 为什么要有「同步本地 tap 克隆」这一步
+
+`brew tap` 是把 GitHub 上的 tap 仓库 **clone 到本地**。你 push 更新后，
+本地这份**不会自动跟着变** —— brew 只在 `brew update` 时才 pull。
+
+所以发完版立刻 `brew upgrade svnui`，拿到的可能还是旧 formula
+（旧 url + 旧 sha256），表现为 404 或 checksum mismatch。
+你以为没发成功，其实只是本地那份没刷新。
+
+`dist.sh` 因此会在 push 之后额外做两件事：
+
+1. 对其余每一份本地克隆执行 `git pull --ff-only`
+2. 跑一次 `brew update --force`（清掉 brew 的 formula 解析缓存）
+
+`--ff-only` 是刻意的：只允许快进。如果那份克隆有本地未提交改动或提交分叉，
+脚本**不会**硬拉 —— 它打印警告让你自己处理，绝不静默覆盖你的改动。
+
+### 关于「就地更新」
+
+`dist.sh` **只改** Formula 里的三样：url 的版本号、两个 sha256、test 的版本断言。
+注释、`depends_on`、块结构这些手工调整全部原样保留 —— 不会把你调好的
+formula 覆盖回模板的样子。
+
+需要一份全新的就渲染 `dist/svnui.rb`（从 `packaging/homebrew/svnui.rb.tpl`
+整体生成），自己 `cp` 过去覆盖。
+
+### 或者走 GitHub Actions
+
+```bash
+./scripts/bump.sh 0.2.0
+git push origin main && git push origin 0.2.0
+```
+
+push tag 之后 Actions 自动跑完三步：
 
 ```
 build (macos-14 arm64 + macos-13 x86_64)
    └─ 编译 → 冒烟测试 --version → 打 tar.gz
 release
-   └─ 创建 Release，上传两个 tar.gz
+   └─ 创建 GitHub Release，上传两个 tar.gz，自动生成更新日志
 update-tap
-   └─ 下载产物 → 算 sha256 → 渲染 formula → 推到 homebrew-svnui
+   └─ 下载 release 产物 → 算 sha256 → 渲染 formula → 推到 homebrew-svnui
 ```
 
-约 3-5 分钟。workflow 用 `github.repository_owner` 自动取 owner，不用改。
+全程约 3-5 分钟。推完用户那边 `brew upgrade svnui` 就能拿到新版。
 
-⚠️ **上 CI 前先确认没有第二个会响应 tag 的 workflow**——两个都跑会互相覆盖 assets。
+想重跑某次发布：Actions 页面 → Release → Run workflow → 填 tag（比如 `0.2.0`）。
+
+> 两条路都走也不冲突：dist.sh 发现 release 已存在会改用 upload 覆盖，
+> Actions 的 update-tap 也会重算 sha256。但别同时跑，容易互相覆盖产物。
 
 ---
 
-## 坑（按实际踩过的顺序）
-
-### 1. tag 带不带 `v` —— 全链路必须统一
-
-统一用**不带 `v`** 的 `0.1.2`。需要对齐四处：
-
-| 位置 | 内容 |
-|---|---|
-| `Cargo.toml` | `version = "0.1.2"` |
-| git tag / Release | `0.1.2`（无 v） |
-| `svnui.rb.tpl` | `releases/download/@@VERSION@@/...` |
-| `scripts/bump.sh` | 打的 tag 无 v |
-
-`bump.sh` 和模板如果还带着 `v`，改掉：
+## 三、用户侧的安装与升级
 
 ```bash
-sed -i '' 's|download/v@@VERSION@@|download/@@VERSION@@|g' packaging/homebrew/svnui.rb.tpl
+# 首次
+brew tap jc-p/svnui
+brew install svnui
+
+# 升级（brew 会先自动 update tap 仓库）
+brew upgrade svnui
+
+# 看看有没有新版
+brew outdated svnui
 ```
 
-**症状**：`brew install` 报 `curl: (56) ... 404`。
-**排查**：`gh release view <版本> --json tagName` 看实际 tag 是什么。
+---
 
-### 2. Draft Release 导致 404
+## 四、可能会遇到的坑
 
-Release 建了但没发布，assets 不对外公开，匿名下载 404。
+### 1. Gatekeeper 拦截（最常见）
 
-```bash
-gh release edit <版本> --draft=false
-```
+从网上下载的二进制带 quarantine 属性，首次运行 macOS 会弹「无法打开，因为来自身份不明的开发者」。
 
-### 3. `brew audit` 报 version 冗余
-
-```
-* Stable: `version 0.1.1` is redundant with version scanned from URL
-* line 5, col 3: `version` (line 5) should be put before `license` (line 4)
-```
-
-url 里已有版本号，brew 能自动解析。删掉显式的 `version` 那行，两个问题一起消失：
-
-```bash
-sed -i '' '/^  version "/d' Formula/svnui.rb
-```
-
-模板里也删，否则下次渲染又带回去。
-`test do` 里用 `assert_match version.to_s, ...`（引用而非硬编码），删了也没影响。
-
-### 4. 第三方 tap 需要显式信任
-
-```
-Refusing to load formula ... from untrusted tap jc-p/svnui
-```
-
-```bash
-brew trust jc-p/svnui
-```
-
-这是设计如此：tap 里的 `.rb` 是 Ruby 代码，会在用户机器上执行。
-建议写进 Tap 仓库 README，让同事别卡在这：
-
-```bash
-brew tap jc-p/svnui && brew trust jc-p/svnui && brew install svnui
-```
-
-### 5. immutable release 占住版本号
-
-```
-tag_name was used by an immutable release
-```
-
-删 release 也没用，tag 名永久占用。**升版本号，别想着重来。**
-
-### 6. `brew test` 要求版本严格对齐
-
-```
-Error: Testing requires the latest version of jc-p/svnui/svnui
-```
-
-按 `push formula → brew update → brew upgrade → brew test` 的顺序来。
-
-### 7. Gatekeeper（用户侧最常见）
-
-从网上下载二进制带 quarantine，首次运行弹「来自身份不明的开发者」：
+用户侧解决：
 
 ```bash
 sudo xattr -d com.apple.quarantine $(which svnui)
 ```
 
-彻底解决要 Apple Developer 账号（$99/年）做签名 + 公证，内部工具不值当。
-写进 Tap 仓库 README 即可。
+或者：系统设置 → 隐私与安全性 → 点「仍要打开」。
 
-> 本地 `cargo build` 出来的没这问题，所以自己可能从来没遇到过——但同事会。
+彻底消除需要 Apple Developer 账号（$99/年）做签名 + 公证。**对内部工具不值得**，在 tap 仓库 README 里写一句 `xattr -d` 就行。
 
-### 8. tar 包必须平铺
+> 顺带一提：本地 `cargo build` 出来的二进制没有这个问题，所以你自己可能从来没遇到过，
+> 但通过 brew 装的同事会 —— 值得在 README 里提前说明。
 
-tar 里直接是 `svnui` 文件，不套子目录。
-套了 `svnui-0.1.2-aarch64-apple-darwin/svnui` 的话，
-`bin.install "svnui"` 就得改成带版本号的路径，每次发版都得跟着改。
+### 2. `MACOSX_DEPLOYMENT_TARGET`
 
-### 9. sha256 别手改
+workflow 里设成了 `11.0`。不设的话 GitHub 的 macos-13 runner 编出的二进制会要求 macOS 13+，老机器装了跑不起来。设了之后覆盖 Big Sur 及以上。
 
-脚本从实际文件算好直接写进 formula。手动复制少一位，
-用户装的时候才报 checksum mismatch，排查很费劲。
+如果要支持更老的系统（10.15 Catalina），改成 `10.15`，但要注意依赖库是否还支持。
 
-重传同名文件要加 `--clobber`：
+### 3. 版本号别带 `v`
 
-```bash
-gh release upload 0.1.2 dist/svnui-0.1.2-*.tar.gz --clobber
-```
+`Cargo.toml` 里写 `0.2.0`，git tag 写 `v0.2.0`。`bump.sh` 已经处理了这个转换（两种写法都接受）。
 
-### 10. `.gitignore` 漏掉 `dist`
+### 4. tar 包结构
 
-不然 `git add .` 会把几 MB 的 tar.gz 提交进仓库，后面很难清理。
+工作流里是**平铺**的（tar 里直接是 `svnui` 文件，不带子目录）。
+
+如果改成套子目录 `svnui-0.2.0-aarch64-apple-darwin/svnui`，那 formula 里的 `bin.install "svnui"` 就得改成带版本号的路径 —— CI 每次都要跟着改。平铺能让它永远是 `bin.install "svnui"`。
 
 ---
 
-## 可选：同时发布到 crates.io
-
-```bash
-cargo login
-cargo publish
-```
-
-之后 `cargo install svnui` 也能装（从源码编译，慢但不需要 tap）。
-发布前确认 `Cargo.toml` 有 `repository` / `homepage` / `keywords`。
-
----
-
-## 文件对照表
+## 五、包里文件放哪
 
 | 文件 | 放到 |
 |---|---|
-| `LICENSE` | 主仓库根目录 |
-| `scripts/dist.sh` `scripts/bump.sh` | 主仓库 `scripts/`（记得 `chmod +x`） |
-| `packaging/homebrew/svnui.rb.tpl` | 主仓库 `packaging/homebrew/` |
-| `.github/workflows/release.yml` | 主仓库 `.github/workflows/` |
-| `Formula/svnui.rb` | **Tap 仓库**的 `Formula/` |
+| `LICENSE` | 项目根目录 |
+| `.github/workflows/release.yml` | 项目 `.github/workflows/` |
+| `packaging/homebrew/svnui.rb.tpl` | 项目 `packaging/homebrew/` |
+| `scripts/bump.sh` | 项目 `scripts/`（记得 `chmod +x`） |
+| `Formula/svnui.rb` | **tap 仓库**（`homebrew-svnui`）的 `Formula/` |
 
-`svnui.rb.tpl` 是模板（带 `@@VERSION@@` 占位符，给脚本/CI 用），
-`Formula/svnui.rb` 是填好值的成品（给 Tap 仓库用）。别放混。
+`svnui.rb.tpl` 是模板（带 `@@VERSION@@` 这类占位符，给 CI 用），
+`Formula/svnui.rb` 是填好值的成品（给 tap 仓库首次初始化用）。两者别放混了。
 
-> `.github` 是隐藏目录，macOS Finder 默认不显示。
-> 看不到不代表没给——按 `Cmd + Shift + .` 可切换显示，或在终端用 `ls -a`。
+---
+
+## 六、可选：同时发布到 crates.io
+
+Homebrew 之外多一条安装途径，Rust 用户会更习惯：
+
+```bash
+cargo login          # 拿 https://crates.io/me 的 token
+cargo publish
+```
+
+之后用户 `cargo install svnui` 也能装（会从源码编译，慢一些但不需要 tap）。
+
+注意：发布前确认 `Cargo.toml` 的 `repository` / `homepage` / `keywords` 都填了，否则 crates.io 会警告。

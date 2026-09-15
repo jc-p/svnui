@@ -3,11 +3,15 @@
 #
 #   ./scripts/bump.sh 0.2.0
 #
-# 打完 tag 后手动 push（脚本不自动 push，留一步给你反悔）：
-#   git push origin main && git push origin v0.2.0
+# tag 统一不带 v 前缀，跟 dist.sh、formula 里的 download 路径保持一致。
+# 差一个 v 就是 404，这个坑踩过三次。
+#
+# 打完 tag 后手动 push（留一步给你反悔）：
+#   git push origin main && git push origin 0.2.0
 #
 # push 之后 GitHub Actions 会自动：
 #   构建两个架构 → 创建 Release → 更新 homebrew tap
+# 本地发布则跑：./scripts/dist.sh
 
 set -euo pipefail
 
@@ -84,7 +88,10 @@ PY
 # 让 Cargo.lock 跟着更新（version 变了不刷新 lock 会有警告）
 cargo check --quiet 2>/dev/null || cargo metadata --format-version 1 >/dev/null
 
-git add Cargo.toml Cargo.lock
+git add Cargo.toml
+# Cargo.lock 未必存在（库项目、或被 .gitignore 忽略），
+# 直接 git add 会 fatal: pathspec 不匹配，整个脚本挂掉
+[ -f Cargo.lock ] && git add Cargo.lock
 git commit -m "chore: bump version to $NEW"
 git tag "$NEW"
 
