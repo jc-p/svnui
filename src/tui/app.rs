@@ -27,7 +27,7 @@
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
@@ -37,7 +37,7 @@ use ratatui::Frame;
 use crate::svn::{StatusOpts, Svn};
 use crate::tui::panels::checkout::CheckoutPanel;
 use crate::tui::panels::commit::CommitPanel;
-use crate::tui::panels::preview::{read_file, Kind as PreviewKind, PreviewPanel};
+use crate::tui::panels::preview::{read_file, BarHit, Kind as PreviewKind, PreviewPanel};
 use crate::tui::panels::help::HelpPanel;
 use crate::tui::panels::log::LogPanel;
 use crate::tui::panels::confirm::{ConfirmAction, ConfirmPanel, Danger};
@@ -100,6 +100,16 @@ impl SortMode {
 }
 
 /// 搜索输入用在哪。
+/// 正在拖拽哪个面板的哪根滚动条。
+///
+/// 要区分 preview / diff 两块面板：全屏 diff 打开时两块同时存在，
+/// 但只有 diff 是可见的，拖错一块等于"拖了看不见的东西"。
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum DragBar {
+    Preview(BarHit),
+    Diff(BarHit),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum SearchFor {
     /// 过滤文件树
@@ -174,6 +184,15 @@ pub struct App {
     /// 用户需要看到**下一步该干什么**，值得占一整个面板。
     log_error: Option<(String, String)>,
     show_help: bool,
+    /// 鼠标滚轮是否接管（对应 crossterm 的 EnableMouseCapture）。
+    mouse_on: bool,
+    /// 待生效的鼠标捕获开关。
+    ///
+    /// App 拿不到终端 backend，改不了捕获状态，所以只记一笔"想改成什么"，
+    /// 由事件循环取走后真正 enable/disable —— 和 `editor_req` 一个套路。
+    mouse_pending: Option<bool>,
+    /// 正在拖拽的滚动条（按下左键命中后记住，拖动时跟随，松开清空）。
+    drag: Option<DragBar>,
 
     /// 搜索状态。
     searching: Option<SearchFor>,
@@ -222,6 +241,9 @@ impl App {
             commit_inflight: false,
             log_error: None,
             show_help: false,
+            mouse_on: true,
+            mouse_pending: None,
+            drag: None,
             searching: None,
             query: String::new(),
             preview_gen: 0,
@@ -394,7 +416,21 @@ impl App {
     }
 
     /// 滚动右栏预览。正数向下，负数向上。
+    /// 纵向滚动。正数向下，负数向上。
+    ///
+    /// 全屏模式下滚 diff，否则滚右栏预览 —— **不两个都滚**：
+    /// 全屏时背景预览根本看不见，跟着滚没意义，
+    /// 退出全屏后位置却变了，反而莫名其妙。
+    ///（鼠标滚轮也走这里，所以这一步是"全屏里滚轮能用"的前提。）
     fn scroll_preview(&mut self, delta: i32) {
+        if let Some(p) = self.diff.as_mut() {
+            if delta > 0 {
+                p.scroll_down(delta as u16);
+            } else {
+                p.scroll_up((-delta) as u16);
+            }
+            return;
+        }
         if let Some(p) = self.preview.as_mut() {
             if delta > 0 {
                 p.scroll_down(delta as u16);
@@ -405,7 +441,17 @@ impl App {
     }
 
     /// 横向滚动右栏预览。正数向右，负数向左。
+    ///
+    /// 同 `scroll_preview`：全屏时只滚 diff，不连带滚背景。
     fn scroll_preview_h(&mut self, delta: i32) {
+        if let Some(p) = self.diff.as_mut() {
+            if delta > 0 {
+                p.scroll_right(delta as u16);
+            } else {
+                p.scroll_left((-delta) as u16);
+            }
+            return;
+        }
         if let Some(p) = self.preview.as_mut() {
             if delta > 0 {
                 p.scroll_right(delta as u16);
@@ -413,12 +459,125 @@ impl App {
                 p.scroll_left((-delta) as u16);
             }
         }
-        // 全屏模式下也要能横滚
+    }
+
+    /// 横向翻页。dir > 0 向右，< 0 向左。
+    ///
+    /// 步长取当前预览的 3/4 屏宽（见 `PreviewPanel::page_step`）：
+    /// 两块面板宽度通常不同，各自按自己的算才对得上。
+    fn page_preview_h(&mut self, dir: i32) {
         if let Some(p) = self.diff.as_mut() {
-            if delta > 0 {
-                p.scroll_right(delta as u16);
+            let step = p.page_step();
+            if dir > 0 {
+                p.scroll_right(step);
             } else {
-                p.scroll_left((-delta) as u16);
+                p.scroll_left(step);
+            }
+            return;
+        }
+        if let Some(p) = self.preview.as_mut() {
+            let step = p.page_step();
+            if dir > 0 {
+                p.scroll_right(step);
+            } else {
+                p.scroll_left(step);
+            }
+        }
+    }
+
+    /// 回到最左（列 0）。
+    fn preview_home(&mut self) {
+        if let Some(p) = self.preview.as_mut() {
+            p.scroll_home();
+        }
+        if let Some(p) = self.diff.as_mut() {
+            p.scroll_home();
+        }
+    }
+
+    /// 切换鼠标滚轮接管。
+    fn toggle_mouse(&mut self) {
+        self.mouse_on = !self.mouse_on;
+        self.mouse_pending = Some(self.mouse_on);
+        self.notice = Some(if self.mouse_on {
+            "鼠标：已开启（可拖拽滚动条；要选中文本复制按 M 关闭，或按住 Option 拖选）".into()
+        } else {
+            "鼠标：已关闭（可以正常选中文本复制了；滚动条拖拽也不可用）".into()
+        });
+    }
+
+    /// 取走待生效的鼠标开关（由事件循环执行真正的 enable/disable）。
+    pub fn take_mouse_toggle(&mut self) -> Option<bool> {
+        self.mouse_pending.take()
+    }
+
+    pub fn mouse_on(&self) -> bool {
+        self.mouse_on
+    }
+
+    /// 鼠标事件处理：**只做滚动条拖拽，不接管滚轮**。
+    ///
+    /// 不做滚轮是刻意的 —— 滚轮一动就滚，很容易在看 diff 时误触把位置冲掉，
+    /// 而拖拽是"明确指着滚动条拖"的主动动作，不会误触。
+    /// 需要滚轮的话按 M 打开（连带影响见 `toggle_mouse`）。
+    ///
+    /// 点击选中树节点不做：要维护坐标→节点的命中测试，
+    /// 树在滚动/折叠后换算容易错位，收益不抵风险。
+    pub fn handle_mouse(&mut self, ev: MouseEvent) {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        // 只在这两种模式下响应。
+        // 提交框 / 确认框 / 冲突面板里滚预览是错的行为
+        // （用户在看的是那块面板，不是背后的预览）。
+        if !matches!(self.mode, Mode::Browse | Mode::Diff) {
+            // 顺手清掉拖拽：例如拖到一半按 Esc 退了全屏，
+            // 残留状态会让之后的鼠标移动继续滚一块已经不可见的面板。
+            self.drag = None;
+            return;
+        }
+        match ev.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.drag = self.hit_bar(ev.column, ev.row);
+            }
+            // Drag 是按下后的移动；Moved 是未按键的移动。
+            // 两个都接：macOS 上按住左键拖动，iTerm2 报的是 Moved 而不是 Drag。
+            // 只在 drag 非 None 时处理，所以 Moved 不会造成误滚。
+            MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Moved => {
+                if let Some(bar) = self.drag {
+                    self.drag_to(bar, ev.column, ev.row);
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => self.drag = None,
+            _ => {}
+        }
+    }
+
+    /// 坐标命中了哪块面板的滚动条。
+    ///
+    /// 全屏 diff 优先：它盖在右栏预览上面，用户看得见的是它。
+    fn hit_bar(&self, x: u16, y: u16) -> Option<DragBar> {
+        if let Some(p) = self.diff.as_ref() {
+            return p.hit_bar(x, y).map(DragBar::Diff);
+        }
+        if let Some(p) = self.preview.as_ref() {
+            return p.hit_bar(x, y).map(DragBar::Preview);
+        }
+        None
+    }
+
+    /// 跟着鼠标更新滚动位置。
+    fn drag_to(&mut self, bar: DragBar, x: u16, y: u16) {
+        let target = match bar {
+            DragBar::Diff(_) => self.diff.as_mut(),
+            DragBar::Preview(_) => self.preview.as_mut(),
+        };
+        if let Some(p) = target {
+            match bar {
+                DragBar::Diff(BarHit::Vertical) | DragBar::Preview(BarHit::Vertical) => {
+                    p.drag_v(y)
+                }
+                DragBar::Diff(BarHit::Horizontal) | DragBar::Preview(BarHit::Horizontal) => {
+                    p.drag_h(x)
+                }
             }
         }
     }
@@ -887,15 +1046,22 @@ impl App {
             }
 
             // 横向滚动：长行超出右边界时用。
-            // Shift+方向键是直觉操作，但部分终端不投递，所以再给 < > 一套。
-            KeyCode::Right if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                self.scroll_preview_h(4)
-            }
-            KeyCode::Left if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                self.scroll_preview_h(-4)
-            }
-            KeyCode::Char('>') | KeyCode::Char('.') => self.scroll_preview_h(8),
-            KeyCode::Char('<') | KeyCode::Char(',') => self.scroll_preview_h(-8),
+            //
+            // 只留两套：← → 慢移（2 列，看长行末尾时精调），
+            // < > 翻页（约 3/4 屏宽，跨大段时一步到位）。
+            //
+            // 之前还有 Shift+←/→ 一套，砍掉了 —— 三套按键做同一件事，
+            // 而且 Shift+方向键在很多终端里根本投不进来（被终端自己吃掉），
+            // 结果就是"按了没反应"，比没有更让人困惑。
+            KeyCode::Left => self.scroll_preview_h(-2),
+            KeyCode::Right => self.scroll_preview_h(2),
+            KeyCode::Char('>') | KeyCode::Char('.') => self.page_preview_h(1),
+            KeyCode::Char('<') | KeyCode::Char(',') => self.page_preview_h(-1),
+            KeyCode::Char('0') => self.preview_home(),
+
+            // M 切换鼠标滚轮。开了鼠标捕获后**终端的文本选中复制会失效**
+            // （所有鼠标事件都被本程序接管），所以要能随时关掉。
+            KeyCode::Char('M') => self.toggle_mouse(),
 
             // S 切换排序
             KeyCode::Char('s') | KeyCode::Char('S') => {
@@ -1089,8 +1255,21 @@ impl App {
             KeyCode::Char('d') | KeyCode::PageDown => panel.scroll_down(10),
             KeyCode::Char('u') | KeyCode::PageUp => panel.scroll_up(10),
             KeyCode::Char('g') => panel.scroll_top(),
-            KeyCode::Char('h') | KeyCode::Left => panel.scroll_left(4),
-            KeyCode::Char('l') | KeyCode::Right => panel.scroll_right(4),
+            // 和主界面保持一致：h/l 与 ←/→ 慢移，< > 翻页。
+            // 这里 h/l 是从 less/vim 沿用的，比方向键顺手，所以两套都留。
+            KeyCode::Char('h') | KeyCode::Left => panel.scroll_left(2),
+            KeyCode::Char('l') | KeyCode::Right => panel.scroll_right(2),
+            // ⚠️ 这里不能调 self.page_preview_h()：
+            // `panel` 还借着 self.diff，再借一次会冲突。
+            // 直接在本面板上取步长再滚，效果一样。
+            KeyCode::Char('>') | KeyCode::Char('.') => {
+                let step = panel.page_step();
+                panel.scroll_right(step);
+            }
+            KeyCode::Char('<') | KeyCode::Char(',') => {
+                let step = panel.page_step();
+                panel.scroll_left(step);
+            }
             KeyCode::Char('0') => panel.scroll_home(),
             _ => {}
         }
@@ -2095,7 +2274,7 @@ impl App {
                     Some(PreviewKind::File) => " 内容 ",
                     _ => " 改动 ",
                 };
-                (what, "↑↓ 滚动   H/L 左右   Ctrl+d/u 翻页   G 回顶部   Esc 返回")
+                (what, "↑↓ 滚动   H/L 左右   < > 翻页   0 回最左   Esc 返回")
             }
             Mode::Log => (" 历史 ", "↑↓ 选版本   / 搜索   Esc 返回"),
             // 必须和确认面板内部的 Y/N 一致。

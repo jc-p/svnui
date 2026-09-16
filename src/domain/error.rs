@@ -95,7 +95,7 @@ pub fn explain(stderr: &str) -> Option<(String, String)> {
             concat!(
                 "服务器证书的域名对不上，或用的是自签名/内网 CA。\n",
                 "确认是自己的内网服务器后：加 --trust-cert 重跑，\n",
-                "或设环境变量 SVNR_TRUST_CERT=1（省得每次敲）。"
+                "或设环境变量 SVNUI_TRUST_CERT=1（省得每次敲）。"
             ),
         ),
         // 连不上服务器 —— 最常见的"日志读不出来"原因

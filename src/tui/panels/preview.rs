@@ -32,6 +32,16 @@ pub enum Kind {
     Notice,
 }
 
+/// 滚动条命中结果。拖拽滚动条时用。
+///
+/// 竖向条（最右一列）和横向条（最底一行）分开：
+/// 两者映射的目标不同（行 vs 列），混在一起没法算。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BarHit {
+    Vertical,
+    Horizontal,
+}
+
 /// 预览面板。
 pub struct PreviewPanel {
     kind: Kind,
@@ -42,6 +52,20 @@ pub struct PreviewPanel {
     scroll: u16,
     /// 横向滚动偏移（列）。长行超出右边界时用。
     h_scroll: u16,
+    /// 上一次渲染时的可视宽度（列）。
+    ///
+    /// 「横向翻页」要按屏宽算步长 —— 写死 8 列的话，
+    /// 宽屏上要按十几次才能翻完一屏，跟"翻页"这个名字不符。
+    /// 面板自己最清楚画出来有多宽，所以在 paint 里记一笔，
+    /// 外部（键盘/鼠标）翻页时直接问它要步长。
+    vis_w: u16,
+    /// 上一次渲染时的可视高度（行）。竖向滚动位置的最大值要用。
+    vis_h: u16,
+    /// 上一次渲染时的内容区矩形。
+    ///
+    /// 拖拽滚动条要做命中测试（点在不在条上、点在条的什么位置），
+    /// 而"条画在哪"只有 paint 知道，所以画的时候记一笔。
+    body_area: Rect,
 }
 
 /// 单个预览最多显示多少行。
@@ -119,6 +143,9 @@ impl PreviewPanel {
             banner,
             scroll: 0,
             h_scroll: 0,
+            vis_w: 0,
+            vis_h: 0,
+            body_area: Rect::default(),
         }
     }
 
@@ -158,6 +185,15 @@ impl PreviewPanel {
         self.h_scroll = 0;
     }
 
+    /// 横向翻页步长：约 3/4 屏宽，至少 8 列。
+    ///
+    /// 不到整屏是为了留一点重叠 —— 翻过去还能看到上一页末尾两三个词，
+    /// 不然接缝处上下文直接断掉，读 diff 时很别扭。
+    pub fn page_step(&self) -> u16 {
+        let w = self.vis_w.saturating_sub(2);
+        std::cmp::max(8, w * 3 / 4)
+    }
+
     /// 最长行的显示宽度。横向滚动条和 clamp 都要用。
     ///
     /// 按字符数算而不是字节数 —— 中文一个字占 2 列但 3 字节。
@@ -181,6 +217,76 @@ impl PreviewPanel {
         if self.scroll > max {
             self.scroll = max;
         }
+    }
+
+    // ── 滚动条拖拽 ────────────────────────────────────────
+
+    /// 竖向最大滚动位置（行）。
+    pub fn max_scroll_v(&self) -> u16 {
+        self.lines.len().saturating_sub(self.vis_h as usize) as u16
+    }
+
+    /// 横向最大滚动位置（列）。
+    fn max_scroll_h(&self) -> u16 {
+        (self.max_line_width() as u16).saturating_sub(self.vis_w)
+    }
+
+    fn has_bar_v(&self) -> bool {
+        self.lines.len() as u16 > self.vis_h
+    }
+
+    fn has_bar_h(&self) -> bool {
+        self.max_line_width() as u16 > self.vis_w
+    }
+
+    /// 坐标是否落在滚动条上。
+    ///
+    /// 竖向条占内容区最右一列，横向条占最底一行。
+    /// 右下角那个格子归竖向 —— 横向条本来就画不到那一列（被竖条占着），
+    /// 先判竖条不会挡住横条的可用区域。
+    ///
+    /// 没画出来的条（内容没超长）即使坐标对得上也不算命中，
+    /// 否则点空白区会被当成拖拽，视图乱跳。
+    pub fn hit_bar(&self, x: u16, y: u16) -> Option<BarHit> {
+        let a = self.body_area;
+        if a.width == 0 || a.height == 0 {
+            return None;
+        }
+        let (x0, y0, x1, y1) = (a.x, a.y, a.x + a.width, a.y + a.height);
+        if self.has_bar_v() && x + 1 == x1 && y >= y0 && y < y1 {
+            return Some(BarHit::Vertical);
+        }
+        if self.has_bar_h() && y + 1 == y1 && x >= x0 && x < x1 {
+            return Some(BarHit::Horizontal);
+        }
+        None
+    }
+
+    /// 把竖向条上的 y 坐标映射成滚动位置。
+    ///
+    /// 按比例映射而不是"移动了多少就滚多少"：
+    /// 后者在长文件里拖到底都滚不完，滑块和鼠标会越离越远。
+    pub fn drag_v(&mut self, y: u16) {
+        let a = self.body_area;
+        let max = self.max_scroll_v();
+        if a.height == 0 || max == 0 {
+            return;
+        }
+        let span = (a.height - 1).max(1) as u64;
+        let rel = y.saturating_sub(a.y) as u64;
+        self.scroll = ((rel * max as u64) / span).min(max as u64) as u16;
+    }
+
+    /// 把横向条上的 x 坐标映射成滚动位置。
+    pub fn drag_h(&mut self, x: u16) {
+        let a = self.body_area;
+        let max = self.max_scroll_h();
+        if a.width == 0 || max == 0 {
+            return;
+        }
+        let span = (a.width - 1).max(1) as u64;
+        let rel = x.saturating_sub(a.x) as u64;
+        self.h_scroll = ((rel * max as u64) / span).min(max as u64) as u16;
     }
 
     // ── 渲染 ──────────────────────────────────────────────
@@ -210,7 +316,7 @@ impl PreviewPanel {
                 Line::from(" （无内容）").alignment(Alignment::Center)
             } else {
                 Line::from(format!(
-                    " {} 行 | j/k 滚动 | d/u 翻页 | g 回顶部 ",
+                    " {} 行 | j/k 滚动 | d/u 翻页 | ← → 慢移 | < > 翻页 | g 回顶部 | 拖滚动条 ",
                     self.lines.len()
                 ))
                 .alignment(Alignment::Right)
@@ -241,12 +347,15 @@ impl PreviewPanel {
             _ => (inner, inner.height),
         };
 
+        self.vis_h = visible_h;
         self.clamp_scroll(visible_h);
 
         // 横向也要 clamp：内容变短（切到别的文件）后，
         // 旧的 h_scroll 会让画面停在一片空白上。
         let max_w = self.max_line_width() as u16;
         let visible_w = body_area.width.saturating_sub(1); // 留出竖向滚动条的列
+        self.vis_w = visible_w; // 供 page_step() 算横向翻页步长
+        self.body_area = body_area; // 供 hit_bar() 做拖拽命中测试
         if self.h_scroll > max_w.saturating_sub(visible_w) {
             self.h_scroll = max_w.saturating_sub(visible_w);
         }

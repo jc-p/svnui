@@ -25,6 +25,12 @@ use crossterm::terminal::{
 use crossterm::event::{
     DisableBracketedPaste, EnableBracketedPaste,
 };
+// 鼠标滚轮。开着它，滚轮才能滚预览（触控板横滑也能横向滚）。
+//
+// ⚠️ 代价：终端不再处理鼠标，文本选中复制会失效。
+//    所以给了 M 键随时关掉，关掉后终端恢复正常选择行为。
+//    （iTerm2 / Apple Terminal 里按住 Option 拖拽可以临时绕过，不用切。）
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
@@ -51,6 +57,7 @@ impl TerminalGuard {
         let mut stdout = io::stdout();
         execute!(stdout, EnterAlternateScreen)?;
         execute!(stdout, EnableBracketedPaste)?;
+        execute!(stdout, EnableMouseCapture)?;
         let backend = CrosstermBackend::new(stdout);
         let term = Terminal::new(backend)?;
         Ok(Self { term })
@@ -61,6 +68,8 @@ impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
         let _ = execute!(self.term.backend_mut(), DisableBracketedPaste);
+        // 必须关：不退出的编辑器（vim）会读到一串鼠标转义序列。
+        let _ = execute!(self.term.backend_mut(), DisableMouseCapture);
         let _ = execute!(self.term.backend_mut(), LeaveAlternateScreen);
         let _ = self.term.show_cursor();
     }
@@ -88,6 +97,7 @@ pub fn run(svn: Svn) -> Result<()> {
         // 会行为异常（方向键/退格/Ctrl-C 全乱）。让出 → 编辑 → 收回。
         if let Some((editor, path)) = app.take_editor_request() {
             let _ = disable_raw_mode();
+            let _ = execute!(guard.term.backend_mut(), DisableMouseCapture);
             let _ = execute!(guard.term.backend_mut(), LeaveAlternateScreen);
             let _ = guard.term.show_cursor();
 
@@ -96,6 +106,10 @@ pub fn run(svn: Svn) -> Result<()> {
             // 无论成功失败都要收回终端，否则界面就没了
             let _ = execute!(guard.term.backend_mut(), EnterAlternateScreen);
             let _ = enable_raw_mode();
+            // 按用户当前的开关恢复，别无脑开回来
+            if app.mouse_on() {
+                let _ = execute!(guard.term.backend_mut(), EnableMouseCapture);
+            }
             let _ = guard.term.hide_cursor();
             let _ = guard.term.clear();
 
@@ -110,6 +124,15 @@ pub fn run(svn: Svn) -> Result<()> {
                 Err(e) => {
                     app.set_notice(format!("无法启动 {}：{}", editor, e));
                 }
+            }
+        }
+
+        // M 键改过鼠标开关就在这里生效（App 够不到 backend，只记了个标记）。
+        if let Some(on) = app.take_mouse_toggle() {
+            if on {
+                let _ = execute!(guard.term.backend_mut(), EnableMouseCapture);
+            } else {
+                let _ = execute!(guard.term.backend_mut(), DisableMouseCapture);
             }
         }
 
@@ -141,6 +164,9 @@ pub fn run(svn: Svn) -> Result<()> {
                 // 粘贴一段含 q / Esc 的文本会把界面点掉。
                 Event::Paste(text) => {
                     app.handle_paste(text);
+                }
+                Event::Mouse(m) => {
+                    app.handle_mouse(m);
                 }
                 Event::Resize(..) => {
                     // 什么都不做：下一帧 draw 会自动用新尺寸
