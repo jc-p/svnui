@@ -1,6 +1,6 @@
 //! 输出层：把领域数据渲染成 human / json / porcelain。
 //!
-//! 全局契约（yazi 侧只认这个）：
+//! 全局契约（调用方只认这个）：
 //! - JSON 一律信封 `{"ok":true,"data":...}` / `{"ok":false,"error":{"kind":..,"message":..}}`
 //! - 非 TTY 时 human 输出**不带** ANSI 颜色，避免污染管道。
 
@@ -49,7 +49,7 @@ pub mod style {
         paint("1", s, tty)
     }
 
-    /// 按状态符号选颜色 —— 与 yazi 侧的 theme.toml 保持一致的语义。
+    /// 按状态符号选颜色 —— 与 调用方的 theme.toml 保持一致的语义。
     pub fn by_sign(sign: char, s: &str, tty: bool) -> String {
         match sign {
             'A' | 'G' => green(s, tty),

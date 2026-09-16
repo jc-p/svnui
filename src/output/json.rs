@@ -9,7 +9,7 @@ pub fn ok<T: Serialize>(data: &T) -> String {
 
 /// 失败信封：`{"ok":false,"error":{"kind":..,"message":..}}`。
 ///
-/// `kind` 用稳定字符串（yazi 侧据此决定提示方式），不直接暴露 Rust 内部结构。
+/// `kind` 用稳定字符串（调用方据此决定提示方式），不直接暴露 Rust 内部结构。
 pub fn err(kind: &str, message: &str) -> String {
     serde_json::to_string(&json!({
         "ok": false,

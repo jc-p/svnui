@@ -264,28 +264,12 @@ pub enum Cmd {
         action: daemon::Action,
     },
 
-    /// 查询某目录层状态（yazi 主入口）。优先 daemon，不可用则直连 svn。
+    /// 查询某目录层状态。优先 daemon，不可用则直连 svn。
     Q {
         #[arg(long)]
         dir: Option<PathBuf>,
         #[arg(long)]
         since: Option<u64>,
-    },
-
-    /// 把 yazi 插件装进配置目录。
-    InstallYazi {
-        /// 只检查会装到哪里、不写盘。
-        #[arg(long)]
-        check: bool,
-        /// 覆盖已存在的插件文件。
-        #[arg(long)]
-        force: bool,
-        /// 自动把 require("svnui"):setup {} 追加进 init.lua。
-        #[arg(long)]
-        patch_init: bool,
-        /// 打印键位片段（不安装）。
-        #[arg(long)]
-        print_keymap: bool,
     },
 
     /// 查看 / 清理状态缓存。
@@ -320,19 +304,14 @@ impl Cli {
 pub fn run(cli: Cli) -> i32 {
     let start = cli.start_dir();
 
-    // 这两个命令不需要工作副本：
-    //   · install-yazi —— 装插件时人可能在任何目录，甚至还没装 svn
-    //   · probe        —— 它就是用来回答"为什么找不到仓库"的，
-    //                     进了非工作副本直接退出等于自废武功
     // 这些命令不需要工作副本：
-    //   · install-yazi —— 装插件时人可能在任何目录，甚至还没装 svn
     //   · probe        —— 它就是用来回答"为什么找不到仓库"的，
     //                     进了非工作副本直接退出等于自废武功
     //   · checkout     —— 它的用途就是**创建**工作副本，要求先有工作副本是循环依赖
     //   · login / auth —— 凭据是全局的（~/.subversion/auth），不隶属于某个副本
     let mut needs_wc = !matches!(
         cli.cmd,
-        Cmd::InstallYazi { .. } | Cmd::Probe | Cmd::Checkout { .. } | Cmd::Login { .. } | Cmd::Auth
+        Cmd::Probe | Cmd::Checkout { .. } | Cmd::Login { .. } | Cmd::Auth
     );
     // TUI 自己能处理"不在工作副本"的情况（进去给检出界面），
     // 所以在这一层放行，别先把它拦下来。
@@ -450,18 +429,6 @@ fn dispatch(cli: &Cli, svn: &crate::svn::Svn, tty: bool) -> Result<String, crate
         }
         Cmd::Q { dir, since } => {
             daemon_cmd::run(daemon_cmd::Cmd::Q { dir: dir.clone(), since: *since }, cli, svn)
-        }
-
-        Cmd::InstallYazi { check, force, patch_init, print_keymap } => {
-            if *print_keymap {
-                return Ok(crate::install::keymap_snippet().to_string());
-            }
-            let rep = crate::install::install(crate::install::Opts {
-                check: *check,
-                force: *force,
-                patch_init: *patch_init,
-            })?;
-            Ok(crate::install::render(&rep))
         }
 
         Cmd::Cache { clear } => {

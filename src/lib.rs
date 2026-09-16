@@ -17,7 +17,6 @@ pub mod cache;
 pub mod cli;
 pub mod daemon;
 pub mod domain;
-pub mod install;
 pub mod ipc;
 pub mod output;
 pub mod policy;

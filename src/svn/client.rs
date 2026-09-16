@@ -227,7 +227,7 @@ impl Svn {
         Ok(entries)
     }
 
-    /// 同上，但组装成带冒泡索引的 Snapshot。yazi 侧直接消费这个。
+    /// 同上，但组装成带冒泡索引的 Snapshot。调用方直接消费这个。
     pub fn snapshot(&self, o: &StatusOpts) -> Result<Snapshot> {
         let root_str = self.root.to_string_lossy().to_string();
         let mut snap = Snapshot::new(root_str);

@@ -170,7 +170,7 @@ fn direct(svn: &Svn, dir: &Path) -> Result<Layer> {
     })
 }
 
-/// 单个符号 → porcelain 两字符。yazi 侧按两字符解析。
+/// 单个符号 → porcelain 两字符。调用方按两字符解析。
 fn xy_of(sign: char) -> String {
     if sign == ' ' || sign == '\0' {
         "__".to_string()

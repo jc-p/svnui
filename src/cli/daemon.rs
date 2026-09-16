@@ -21,7 +21,7 @@ pub enum Cmd {
         action: Action,
     },
 
-    /// 查询某目录层的状态（yazi 用）。优先走 daemon，不可用则直连 svn。
+    /// 查询某目录层的状态。优先走 daemon，不可用则直连 svn。
     Q {
         /// 要查询的目录。默认当前目录。
         #[arg(long)]

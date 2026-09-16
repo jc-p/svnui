@@ -37,7 +37,7 @@ pub type Pending = Arc<Mutex<HashSet<PathBuf>>>;
 /// 但这也留下一个洞：用户在**终端里**跑 `svn add / svn ci / svn up` 时，
 /// 改的是 `.svn/wc.db`，工作副本里的文件 mtime 一个都没变。
 /// daemon 收不到任何事件 → 快照一直停留在旧状态 →
-/// **yazi 里显示的还是提交前的状态**，而用户以为刷新过了。
+/// **TUI 里显示的还是提交前的状态**，而用户以为刷新过了。
 ///
 /// 解法：单独盯 `.svn/wc.db` 这一个文件。它变了就置位，
 /// daemon 主循环看到它就去跑一次全量 status（而不是局部）。
