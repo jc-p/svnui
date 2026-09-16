@@ -106,15 +106,23 @@ pub const TRUST_CERT_ARG: &str =
 
 /// 是否启用证书信任。
 ///
-/// 优先级：环境变量 `SVNR_TRUST_CERT` > 参数 > 默认 false。
+/// 优先级：参数（`--trust-cert`）> 环境变量 > 默认 false。
 /// 环境变量是为了不用每次敲 —— 内网仓库配一次即可。
+/// 环境变量名 `SVNUI_TRUST_CERT`，老名字 `SVNR_TRUST_CERT` 也认。
 pub fn trust_cert_enabled(explicit: bool) -> bool {
     if explicit {
         return true;
     }
+    // 两个名字都认：SVNUI_ 跟二进制名一致（新），
+    // SVNR_ 是项目改名前的老名字，留着兼容已配好的环境。
+    env_flag("SVNUI_TRUST_CERT") || env_flag("SVNR_TRUST_CERT")
+}
+
+/// 读布尔型环境变量：`1 / true / yes / on` 视为开。
+fn env_flag(name: &str) -> bool {
     matches!(
-        std::env::var("SVNR_TRUST_CERT").as_deref(),
-        Ok("1") | Ok("true") | Ok("yes") | Ok("on")
+        std::env::var(name).ok().as_deref(),
+        Some("1") | Some("true") | Some("yes") | Some("on")
     )
 }
 

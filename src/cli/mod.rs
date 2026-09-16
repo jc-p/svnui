@@ -35,7 +35,8 @@ pub struct Cli {
     ///
     /// ⚠️ 这会跳过证书校验，等于放弃了对中间人攻击的防护。
     /// 只在确认是**自己的内网服务器**时启用。
-    /// 也可以用环境变量 SVNR_TRUST_CERT=1，省得每次敲。
+    /// 也可以设环境变量 SVNUI_TRUST_CERT=1，省得每次敲
+    /// （老名字 SVNR_TRUST_CERT 也认）。
     #[arg(long, global = true)]
     pub trust_cert: bool,
 

@@ -26,6 +26,19 @@ pub fn human_hint(e: &Error) -> String {
             }
             s
         }
+        // ⚠️ 必须显式处理：这个变体的 Display **只打印 summary**，
+        // 而它的全部价值就在 detail（"下一步该干什么"）。
+        // 走 `_ => format!("{e}")` 会把建议整段丢掉 —— 用户只看到
+        // "SSL 证书校验失败"，却不知道有 --trust-cert 这个开关。
+        Error::Explained { summary, detail } => {
+            let mut s = summary.clone();
+            for line in detail.lines() {
+                s.push('\n');
+                s.push_str("  ");
+                s.push_str(line);
+            }
+            s
+        }
         Error::Parse(msg) => format!("{msg}"),
         _ => format!("{e}"),
     }
@@ -50,6 +63,19 @@ mod tests {
             let h = human_hint(&e);
             assert!(h.contains(kw), "{e:?} 的提示里应含 `{kw}`，实际：{h}");
         }
+    }
+
+    #[test]
+    fn explained_hint_keeps_the_advice() {
+        // 回归：detail 曾被 Display 吞掉，只剩 summary。
+        // 这类错误的价值全在"下一步该干什么"，丢了等于没提示。
+        let e = Error::Explained {
+            summary: "SSL 证书校验失败（svn 退出码 1）".into(),
+            detail: "确认是自己的内网服务器后：加 --trust-cert 重跑".into(),
+        };
+        let h = human_hint(&e);
+        assert!(h.contains("SSL 证书校验失败"), "应保留 summary，实际：{h}");
+        assert!(h.contains("--trust-cert"), "应保留 detail 里的建议，实际：{h}");
     }
 
     #[test]
