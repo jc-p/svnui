@@ -3,7 +3,9 @@
 //! **每个方法都必须先过 `policy::judge`** —— 这是硬性约定，不是建议。
 //! 判定发生在执行之前，且不依赖任何外部状态，便于测试。
 
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use crate::domain::Error;
 use crate::policy::{danger_of, judge, render_targets, Op, Verdict};
@@ -76,10 +78,7 @@ pub fn remove(
     // Display 里已经写明，这里不再重复渲染。
     match guard(Op::Remove, danger_of(Op::Remove), &t, false, yes, tty)? {
         Some(_) => {}
-        // guard 目前不会返回 Ok(None)（四个判定分支全是 Some/Err），这条是防未来的地雷：
-        // 若哪天 judge 加了"静默跳过"，写操作就会什么都不做、还返回空串，
-        // 用户以为执行了。宁可多打一行也别静默。
-        None => return Ok("（未执行：护栏未放行，也没给出原因）".to_string()),
+        None => return Ok(String::new()),
     }
     let out = svn.remove(paths, keep_local)?;
     crate::cache::invalidate_for(&svn.root);
@@ -109,10 +108,7 @@ pub fn revert(
     match guard(Op::Revert, danger_of(Op::Revert), &effective, dry_run, yes, tty)? {
         Some(warn) if !warn.is_empty() => return Ok(warn),
         Some(_) => {}
-        // guard 目前不会返回 Ok(None)（四个判定分支全是 Some/Err），这条是防未来的地雷：
-        // 若哪天 judge 加了"静默跳过"，写操作就会什么都不做、还返回空串，
-        // 用户以为执行了。宁可多打一行也别静默。
-        None => return Ok("（未执行：护栏未放行，也没给出原因）".to_string()),
+        None => return Ok(String::new()),
     }
 
     let out = svn.revert(paths, false)?;
@@ -145,10 +141,7 @@ pub fn commit(
     match guard(Op::Commit, danger_of(Op::Commit), &effective, dry_run, yes, tty)? {
         Some(text) if !text.is_empty() => return Ok(text),
         Some(_) => {}
-        // guard 目前不会返回 Ok(None)（四个判定分支全是 Some/Err），这条是防未来的地雷：
-        // 若哪天 judge 加了"静默跳过"，写操作就会什么都不做、还返回空串，
-        // 用户以为执行了。宁可多打一行也别静默。
-        None => return Ok("（未执行：护栏未放行，也没给出原因）".to_string()),
+        None => return Ok(String::new()),
     }
 
     let msg = message.unwrap_or("(svnui: 无提交信息)");
@@ -178,10 +171,7 @@ pub fn update(
     match guard(Op::Update, danger_of(Op::Update), &t, false, yes, tty)? {
         Some(text) if !text.is_empty() => return Ok(text),
         Some(_) => {}
-        // guard 目前不会返回 Ok(None)（四个判定分支全是 Some/Err），这条是防未来的地雷：
-        // 若哪天 judge 加了"静默跳过"，写操作就会什么都不做、还返回空串，
-        // 用户以为执行了。宁可多打一行也别静默。
-        None => return Ok("（未执行：护栏未放行，也没给出原因）".to_string()),
+        None => return Ok(String::new()),
     }
 
     let out = svn.update(rev, paths)?;
@@ -229,7 +219,41 @@ pub fn checkout(
         no_auth_cache,
     };
 
-    let out = svn.checkout(url, &target, &auth, depth)?;
+    // 检出要拉整个仓库，可能几十秒到几分钟，期间一个字节都不输出，
+    // 非常容易被当成卡死。
+    // 提示走 stderr：stdout 可能被脚本/管道解析，不能被污染。
+    eprintln!("正在检出 {} -> {} …（仓库大时请耐心等待）", url, target.display());
+
+    // 进度也走 stderr，并且**原地刷新**（\r 不换行）。
+    // 只在 stderr 是终端时刷 —— 重定向到文件时打一堆 \r 是纯垃圾。
+    let live = std::io::stderr().is_terminal();
+    let mut n = 0usize;
+    let mut last = String::new();
+    let mut sent = Instant::now();
+    let out = svn.checkout_progress(url, &target, &auth, depth, move |line| {
+        let t = line.trim();
+        if t.is_empty() {
+            return;
+        }
+        n += 1;
+        // "A    trunk/foo.c" —— 跳过状态列，只留路径
+        if let Some(p) = t.split_whitespace().nth(1) {
+            last = p.to_string();
+        }
+        if live && sent.elapsed() >= Duration::from_millis(200) {
+            sent = Instant::now();
+            let v: Vec<char> = last.chars().collect();
+            let tail: String = if v.len() > 40 { v[v.len() - 40..].iter().collect() } else { last.clone() };
+            // \x1b[K 清掉行尾残留，否则短行会拖着上一次的长尾巴
+            let _ = write!(std::io::stderr(), "\r\x1b[2K  已检出 {} 项  {}   ", n, tail);
+            let _ = std::io::stderr().flush();
+        }
+    })?;
+    if live {
+        // 进度行是不换行的，收尾补一个 \n，否则"检出完成。"会贴在它后面
+        let _ = writeln!(std::io::stderr());
+    }
+    eprintln!("检出完成。");
 
     let mut s = format!("已检出到 {}\n", target.display());
     s.push_str(&out.stdout);

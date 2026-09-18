@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::domain::{Error, LogEntry, NodeKind, RepoInfo, Result, Snapshot, StatusEntry, StatusKind};
-use crate::svn::command::{run, run_with_stdin, RawOutput, RunOpts};
+use crate::svn::command::{run, run_streaming, run_with_stdin, RawOutput, RunOpts};
 
 use super::locator::{relative_to, svn_exe, wc_root};
 use super::version::SvnVersion;
@@ -592,6 +592,28 @@ impl Svn {
         auth: &AuthOpts,
         depth: &str,
     ) -> Result<RawOutput> {
+        self.checkout_progress(url, path, auth, depth, |_| {})
+    }
+
+    /// `svn checkout`，**逐行把进度交给回调**。
+    ///
+    /// 检出大仓库要几十分钟，界面上只有个不动的"检出 …"看着跟卡死一样。
+    /// svn 每落一个文件就打一行（`A   trunk/foo.c`），这里把它递出去，
+    /// UI 就能显示"已检出 1284 项"—— 有数字在动，才知道它活着。
+    ///
+    /// ⚠️ 回调在读线程里跑，且**必须由调用方节流**：几万行的仓库不节流
+    ///    会把 channel 打满，UI 收消息比干活还忙。
+    pub fn checkout_progress<F>(
+        &self,
+        url: &str,
+        path: &Path,
+        auth: &AuthOpts,
+        depth: &str,
+        on_line: F,
+    ) -> Result<RawOutput>
+    where
+        F: FnMut(&str) + Send + 'static,
+    {
         // 绝对路径：svn 会在 cwd 下创建它，相对路径容易搞错位置。
         let abs = if path.is_absolute() {
             path.to_path_buf()
@@ -614,7 +636,13 @@ impl Svn {
         };
 
         let abs_s = abs.to_string_lossy().to_string();
-        run(&self.exe, &["checkout", "--depth", depth, url, &abs_s], &cwd, &opts)
+        run_streaming(
+            &self.exe,
+            &["checkout", "--depth", depth, url, &abs_s],
+            &cwd,
+            &opts,
+            on_line,
+        )
     }
 
     /// 对远端跑一次 `svn info`，让 svn 缓存凭据。

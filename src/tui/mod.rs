@@ -57,7 +57,8 @@ impl TerminalGuard {
         let mut stdout = io::stdout();
         execute!(stdout, EnterAlternateScreen)?;
         execute!(stdout, EnableBracketedPaste)?;
-        execute!(stdout, EnableMouseCapture)?;
+        // 鼠标捕获默认不开：开了之后终端不再处理鼠标（无法选中复制），
+        // 且鼠标移动事件会淹没键盘事件。需要时按 M 键再开。
         let backend = CrosstermBackend::new(stdout);
         let term = Terminal::new(backend)?;
         Ok(Self { term })
@@ -75,11 +76,66 @@ impl Drop for TerminalGuard {
     }
 }
 
+/// 事件黑匣子（默认关闭）。
+///
+/// 排查"敲键没反应"时用：
+///
+/// ```sh
+/// SVNUI_DEBUG_KEY=1 svnui tui    # 进去敲几下、动动鼠标、按 Esc 退出
+/// cat /tmp/svnui-key.log
+/// ```
+///
+/// 判读：
+/// - 有 `Key` 行 → 事件到了程序，问题在分发（贴给我）
+/// - 一堆 `Mouse`、几乎没有 `Key` → 鼠标事件把键盘挤死了（按 M 关掉再试）
+/// - `Key` 的 kind 不是 `Press` → 就是上一版 `kind == Press` 把它挡掉的
+/// - 啥都没有 → 终端没把事件投递进来（换 iTerm2 / 系统 Terminal 复测）
+///
+/// 为什么写文件而不是 eprintln：TUI 在 alternate screen 里，
+/// 打出去的字会被界面覆盖，退出后也看不见。
+fn evlog(ev: &Event) {
+    // 鼠标事件可能上千条，别把日志写爆。
+    const CAP: u32 = 500;
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+    if std::env::var_os("SVNUI_DEBUG_KEY").is_none() {
+        return;
+    }
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let line = match ev {
+        Event::Key(k) => format!(
+            "Key   code={:?} mod={:?} kind={:?}",
+            k.code, k.modifiers, k.kind
+        ),
+        Event::Mouse(m) => format!("Mouse kind={:?} x={} y={}", m.kind, m.column, m.row),
+        Event::Paste(t) => format!("Paste {} 字节", t.len()),
+        Event::Resize(w, h) => format!("Resize {}x{}", w, h),
+        _ => return,
+    };
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/svnui-key.log")
+    {
+        if n < CAP {
+            let _ = writeln!(f, "{line}");
+        } else if n == CAP {
+            let _ = writeln!(f, "… 已达 {CAP} 条上限，停止记录（前面的足够判读了）");
+        }
+    }
+}
+
 /// 启动 TUI。
 ///
 /// `svn` 由调用方构造（已 discover 过工作副本）。
 pub fn run(svn: Svn) -> Result<()> {
     let mut guard = TerminalGuard::enter()?;
+
+    // 开诊断时先清空日志，免得跟上一次的混在一起判读不了。
+    if std::env::var_os("SVNUI_DEBUG_KEY").is_some() {
+        let _ = std::fs::write("/tmp/svnui-key.log", "");
+    }
 
     // panic 兜底：默认 panic hook 会在 alternate screen 里打印，
     // 用户看不到任何东西。这里先恢复终端再让默认 hook 输出。
@@ -147,31 +203,63 @@ pub fn run(svn: Svn) -> Result<()> {
 
         // 轮询式事件读取。120ms 超时 —— 后台任务完成时靠这个 tick 刷新画面，
         // 太长会让"处理中…"到结果的切换显得迟钝。
-        if event::poll(Duration::from_millis(120))? {
-            match event::read()? {
-                Event::Key(key) => {
-                    // 只处理按下，忽略 release / repeat
-                    // （crossterm 在某些终端会重复投递）
-                    if key.kind == KeyEventKind::Press {
-                        app.handle_key(key)?;
-                        if app.should_quit() {
-                            break;
+        //
+        // 有后台任务时压到 60ms：等待动画靠 poll 超时推进一次重绘，
+        // 120ms 只有约 8fps，spinner 转起来一顿一顿的。
+        let poll_ms = if app.is_busy() { 60 } else { 120 };
+        if event::poll(Duration::from_millis(poll_ms))? {
+            //
+            // ⚠️ 为什么这里要排空队列而不是只读一个事件：
+            //    开鼠标捕获时，鼠标移动会持续产生 MouseEvent。每帧只消费一个，
+            //    键盘事件就被挤到队列后面 —— 表现是"敲键没反应、输入不进去"。
+            //    budget 是防异常的：真来事件洪水时不至于把 UI 卡死。
+            //
+            let mut quit = false;
+            let mut budget: u16 = 256;
+            while budget > 0 {
+                budget -= 1;
+                let ev = event::read()?;
+                evlog(&ev);
+                match ev {
+                    Event::Key(key) => {
+                        // 只挡 Release，放行 Press 和 Repeat。
+                        //
+                        // ⚠️ 之前写成 `kind == Press`，把 Repeat 也挡在外面了。
+                        //    问题是"是不是 Press"完全取决于终端的能力协商：
+                        //    支持 kitty / ModifyOtherKeys 的终端可能不发 Press，
+                        //    于是**所有按键都被静默丢弃** —— 界面能画、键盘全死，
+                        //    跟"输入框是坏的"一模一样。
+                        //    Repeat 放行是安全的：它本来就是"按住不放"的重复输入，
+                        //    字符框里正常就该重复。
+                        if key.kind != KeyEventKind::Release {
+                            app.handle_key(key)?;
+                            if app.should_quit() {
+                                quit = true;
+                                break;
+                            }
                         }
                     }
+                    // 粘贴：整段插入。开了 bracketed paste 才有这个事件。
+                    // 不做逐字符模拟 —— 那样每个字符都会被当成快捷键判定一遍，
+                    // 粘贴一段含 q / Esc 的文本会把界面点掉。
+                    Event::Paste(text) => {
+                        app.handle_paste(text);
+                    }
+                    Event::Mouse(m) => {
+                        app.handle_mouse(m);
+                    }
+                    Event::Resize(..) => {
+                        // 什么都不做：下一帧 draw 会自动用新尺寸
+                    }
+                    _ => {}
                 }
-                // 粘贴：整段插入。开了 bracketed paste 才有这个事件。
-                // 不做逐字符模拟 —— 那样每个字符都会被当成快捷键判定一遍，
-                // 粘贴一段含 q / Esc 的文本会把界面点掉。
-                Event::Paste(text) => {
-                    app.handle_paste(text);
+                // 队列空了就走；还有就继续排。
+                if !event::poll(Duration::from_millis(0))? {
+                    break;
                 }
-                Event::Mouse(m) => {
-                    app.handle_mouse(m);
-                }
-                Event::Resize(..) => {
-                    // 什么都不做：下一帧 draw 会自动用新尺寸
-                }
-                _ => {}
+            }
+            if quit {
+                break;
             }
         }
     }

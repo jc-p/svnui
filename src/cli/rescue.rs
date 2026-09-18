@@ -115,10 +115,7 @@ pub fn resolve(
     match guard(Op::Resolve, danger_of(Op::Resolve), &effective, dry_run, yes, tty)? {
         Some(text) if !text.is_empty() => return Ok(text),
         Some(_) => {}
-        // guard 目前不会返回 Ok(None)（四个判定分支全是 Some/Err），这条是防未来的地雷：
-        // 若哪天 judge 加了"静默跳过"，写操作就会什么都不做、还返回空串，
-        // 用户以为执行了。宁可多打一行也别静默。
-        None => return Ok("（未执行：护栏未放行，也没给出原因）".to_string()),
+        None => return Ok(String::new()),
     }
 
     svn.resolve(paths, accept)?;
@@ -152,10 +149,7 @@ pub fn cleanup(
     match guard(Op::Cleanup, danger, &targets, dry_run, yes, tty)? {
         Some(text) if !text.is_empty() => return Ok(text),
         Some(_) => {}
-        // guard 目前不会返回 Ok(None)（四个判定分支全是 Some/Err），这条是防未来的地雷：
-        // 若哪天 judge 加了"静默跳过"，写操作就会什么都不做、还返回空串，
-        // 用户以为执行了。宁可多打一行也别静默。
-        None => return Ok("（未执行：护栏未放行，也没给出原因）".to_string()),
+        None => return Ok(String::new()),
     }
 
     svn.cleanup(remove_unversioned, remove_ignored, vacuum_pristines)?;

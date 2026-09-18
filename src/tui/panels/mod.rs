@@ -10,6 +10,7 @@ pub mod conflict;
 #[cfg(feature = "docs")]
 pub mod document;
 pub mod help;
+pub mod loading;
 pub mod log;
 pub mod preview;
 pub mod status;

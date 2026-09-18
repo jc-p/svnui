@@ -26,6 +26,7 @@
 
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -36,6 +37,7 @@ use ratatui::Frame;
 
 use crate::svn::{StatusOpts, Svn};
 use crate::tui::panels::checkout::CheckoutPanel;
+use crate::tui::panels::loading;
 use crate::tui::panels::commit::CommitPanel;
 use crate::tui::panels::preview::{read_file, BarHit, Kind as PreviewKind, PreviewPanel};
 use crate::tui::panels::help::HelpPanel;
@@ -134,6 +136,11 @@ enum BgDone {
         bool,
     ),
     LogDetail(u64, Vec<String>),
+    /// 检出的**中间进度**：(已落盘条目数, 最后一项)。
+    ///
+    /// 只在检出过程中发，由调用方节流（约 10 次/秒）。
+    /// 大仓库几万行，不节流会把 channel 打满。
+    CheckoutProgress(usize, String),
     /// 检出完成，带结果消息。
     Checkout(crate::domain::Result<String>),
     /// revert 干跑结果：将被还原的文件（相对路径）。
@@ -202,6 +209,11 @@ pub struct App {
     tx: Sender<BgDone>,
     rx: Receiver<BgDone>,
     busy: Option<String>,
+    /// busy 的起始时刻。所有设 `busy` 的地方都只赋字符串，计时统一在这里补 ——
+    /// 否则要改十几个调用点，漏一处就是"这个操作的时间不走"。
+    busy_start: Option<Instant>,
+    /// 检出的实时进度：(已落盘条目数, 最后一项)。只有 checkout 会填。
+    busy_prog: Option<(usize, String)>,
 
     notice: Option<String>,
     title: String,
@@ -241,7 +253,10 @@ impl App {
             commit_inflight: false,
             log_error: None,
             show_help: false,
-            mouse_on: true,
+            // 默认关闭：开启后终端不再处理鼠标，选中文本复制会失效，
+            // 而且鼠标移动会持续产生事件、把键盘事件挤到队列后面（表现为"敲键没反应"）。
+            // 需要拖拽滚动条时按 M 打开。
+            mouse_on: false,
             mouse_pending: None,
             drag: None,
             searching: None,
@@ -250,6 +265,8 @@ impl App {
             tx,
             rx,
             busy: None,
+            busy_start: None,
+            busy_prog: None,
             notice: None,
             sort: SortMode::Status,
             editor_req: None,
@@ -515,6 +532,11 @@ impl App {
         self.mouse_on
     }
 
+    /// 是否有后台任务在跑。事件循环用它把轮询间隔调密（动画更顺）。
+    pub fn is_busy(&self) -> bool {
+        self.busy.is_some()
+    }
+
     /// 鼠标事件处理：**只做滚动条拖拽，不接管滚轮**。
     ///
     /// 不做滚轮是刻意的 —— 滚轮一动就滚，很容易在看 diff 时误触把位置冲掉，
@@ -654,6 +676,17 @@ impl App {
     }
 
     pub fn tick(&mut self) {
+        // busy 的计时起点在这里统一补：设 busy 的调用点有十几个，
+        // 让它们各自记时间必然会漏。动画的帧号也由这个 elapsed 推出来。
+        if self.busy.is_some() {
+            if self.busy_start.is_none() {
+                self.busy_start = Some(Instant::now());
+            }
+        } else {
+            self.busy_start = None;
+            self.busy_prog = None;
+        }
+
         while let Ok(done) = self.rx.try_recv() {
             match done {
                 BgDone::Preview(gen, _rel, panel) => {
@@ -887,6 +920,10 @@ impl App {
                     }
                 }
 
+                BgDone::CheckoutProgress(n, last) => {
+                    // 只更新显示，不动 busy —— 检出还没结束。
+                    self.busy_prog = Some((n, last));
+                }
                 BgDone::Checkout(Ok(msg)) => {
                     self.busy = None;
                     self.notice = Some(format!("{} — 按 Q 退出后 cd 进去", msg.lines().next().unwrap_or("已检出")));
@@ -1525,13 +1562,34 @@ impl App {
                 password,
                 no_auth_cache: false,
             };
+            // 进度回传：svn 每落一个文件打一行，这里数行数、留最后一项。
+            // 节流到 ~8 次/秒 —— 大仓库几万行，不节流 channel 会被打满，
+            // UI 光收消息就够忙了。
+            let tx_p = tx.clone();
+            let mut n = 0usize;
+            let mut last = String::new();
+            let mut sent = Instant::now();
+
             let r = svn
-                .checkout(&url2, &path, &auth, "infinity")
+                .checkout_progress(&url2, &path, &auth, "infinity", move |line| {
+                    let t = line.trim();
+                    if t.is_empty() {
+                        return;
+                    }
+                    n += 1;
+                    // "A    trunk/foo.c" —— 跳过状态列，只留路径
+                    if let Some(p) = t.split_whitespace().nth(1) {
+                        last = p.to_string();
+                    }
+                    if sent.elapsed() >= Duration::from_millis(120) {
+                        sent = Instant::now();
+                        let _ = tx_p.send(BgDone::CheckoutProgress(n, last.clone()));
+                    }
+                })
                 .map(|out| {
                     format!("已检出到 {}
 {}", path.display(), out.stdout)
-                })
-                .map_err(|e| e);
+                });
             let _ = tx.send(BgDone::Checkout(r));
         });
 
@@ -2185,7 +2243,10 @@ impl App {
         }
 
         if let Some(panel) = self.checkout.as_ref() {
-            panel.render(f, centered_rect(70, 40, area));
+            // 16 行是硬下限：外框 2 + 4 个字段 ×3 + 凭证 1 + 提示 1。
+            // 终端太矮时按百分比算出的高度会把字段压没（内容区归零，
+            // 表现为"输入了却看不见"，极容易误判成键盘坏了）。
+            panel.render(f, centered_rect_min(70, 55, 16, area));
         }
 
         if self.show_help {
@@ -2233,10 +2294,27 @@ impl App {
         ));
 
         if let Some(busy) = &self.busy {
-            spans.push(Span::styled(
-                format!(" ⟳ {} … ", busy),
-                theme::Theme::props(),
-            ));
+            // 帧号只由"过了多少毫秒"推出来，不存计数器 —— 理由见 loading 模块。
+            let ms = self.busy_start.map(|t| t.elapsed().as_millis()).unwrap_or(0);
+
+            // 检出才有：已落盘条目数 + 最后一项（别的后台任务没这个信息）。
+            // 拼成 detail 交给组件，顶栏不再自己拼动画。
+            let detail = self.busy_prog.as_ref().map(|(n, last)| {
+                if last.is_empty() {
+                    format!("{} 项", n)
+                } else {
+                    format!("{} 项 …{}", n, tail_of(last, 24))
+                }
+            });
+
+            // 之前这里是手写的拼接，还用过静止的 `⟳`（跟色块没区别）。
+            // 现在交给统一的 loading 组件：别处（整屏等待框）调用同一份
+            // 帧计算，动起来必然是同一个节奏。
+            spans.extend(
+                loading::Loading::new(busy.as_str(), ms)
+                    .detail(detail.as_deref())
+                    .spans(),
+            );
         }
 
         f.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -2299,7 +2377,7 @@ impl App {
                 " 解决冲突 ",
                 "j/k 选文件   1/2/3 切版本   M 用我的   T 用服务器的   Enter 保留当前   Esc 返回",
             ),
-            Mode::Checkout => (" 检出 ", "Tab 切换   Enter 确认   Esc 退出"),
+            Mode::Checkout => (" 检出 ", "Tab 切换   Enter 确认   Ctrl+U 清空   Esc 退出"),
         };
 
         let block = Block::default()
@@ -2321,6 +2399,18 @@ impl App {
 ///
 /// macOS 上要多处理一种：工作副本根可能是 `/private/var/...`（canonicalize 后），
 /// 而 svn 输出用 `/var/...`。两种前缀都替换。
+/// 截尾：只留最后 `n` 个字符（`pretty_path` 相反，那个留头）。
+///
+/// ⚠️ 必须按 `char` 切：路径里常有中文，`&s[s.len()-n..]` 会切在 UTF-8
+///    字符中间，**直接 panic**。这是顶栏每帧都跑的代码，panic 就是界面崩掉。
+fn tail_of(s: &str, n: usize) -> String {
+    let v: Vec<char> = s.chars().collect();
+    if v.len() <= n {
+        return s.to_string();
+    }
+    v[v.len() - n..].iter().collect()
+}
+
 fn shorten_paths(text: &str, root: &str) -> String {
     if root.is_empty() {
         return text.to_string();
@@ -2483,6 +2573,21 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(popup)[1]
+}
+
+/// 同 `centered_rect`，但保证至少 `min_h` 行。
+///
+/// 按百分比算出来的高度在矮终端上会不够，而 checkout 面板的字段是
+/// 固定 3 行一块（Border 上下各 1 + 内容 1），压一点就整块消失。
+/// 这里在百分比结果不够时竖向撑到 min_h，横向不动。
+fn centered_rect_min(percent_x: u16, percent_y: u16, min_h: u16, r: Rect) -> Rect {
+    let out = centered_rect(percent_x, percent_y, r);
+    if out.height >= min_h || r.height <= out.height {
+        return out;
+    }
+    let h = min_h.min(r.height);
+    let y = r.y + (r.height - h) / 2;
+    Rect { y, height: h, ..out }
 }
 
 #[cfg(test)]

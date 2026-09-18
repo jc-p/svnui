@@ -98,6 +98,25 @@ impl Theme {
     pub fn status_bar() -> Style {
         Style::default().fg(Color::Black).bg(Color::Cyan)
     }
+
+    /// 输入框里的正文 —— **白字**。
+    ///
+    /// 之前输入框用的是 `status_bar()`（黑字青底）：那是给顶部条状区域
+    /// 设计的，铺在输入框里是一整片青底，字被底色压住反而看不清。
+    /// 输入框就是要白字，"当前焦点"交给 Block 的边框色去表达。
+    pub fn input() -> Style {
+        Style::default().fg(Color::White)
+    }
+
+    /// 输入框正文（聚焦中）—— 白字加粗，和未聚焦的框拉开差别。
+    ///
+    /// 只有边框变色不够：四个框排在一起时，用户要盯着边框找焦点。
+    /// 字本身加粗，余光就能定位。
+    pub fn input_active() -> Style {
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD)
+    }
 }
 
 /// 按状态符号取颜色。

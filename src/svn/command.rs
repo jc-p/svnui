@@ -1,6 +1,6 @@
-use std::io::Read;
+use std::io::{BufRead, Read};
 use std::path::Path;
-use std::process::{Child, ExitStatus, Stdio};
+use std::process::{Child, ChildStdout, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::domain::{Error, Result};
@@ -89,6 +89,96 @@ pub fn run(exe: &Path, args: &[&str], cwd: &Path, opts: &RunOpts) -> Result<RawO
     }
 
     Ok(out)
+}
+
+/// 跑一条 svn 命令，并**边跑边把 stdout 逐行交给回调**。
+///
+/// 和 `run` 唯一的区别在 stdout：这里按行切、读一行回调一次。
+/// 长操作（检出大仓库）全靠它把进度递回 UI —— 否则界面只能干等几十分钟。
+///
+/// ⚠️ 回调在**读线程**里跑，不能碰终端；它 panic 只会丢进度（join 失败），
+///    不会把主流程带崩。
+/// ⚠️ 最终结果仍以返回的 `RawOutput` 为准 —— 别拿回调次数当"完成数"，
+///    最后一行读完就不再回调了。
+pub fn run_streaming<F>(
+    exe: &Path,
+    args: &[&str],
+    cwd: &Path,
+    opts: &RunOpts,
+    on_line: F,
+) -> Result<RawOutput>
+where
+    F: FnMut(&str) + Send + 'static,
+{
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(&opts.global)
+        .args(args)
+        .current_dir(cwd)
+        .env("LC_ALL", "C.UTF-8")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().map_err(map_spawn_err)?;
+
+    let mut out_h = child.stdout.take();
+    let mut err_h = child.stderr.take();
+
+    // stdout 逐行回调；stderr 仍整块读 —— 错误信息要完整才有诊断价值。
+    let t_out = std::thread::spawn(move || stream_lines(&mut out_h, on_line));
+    let t_err = std::thread::spawn(move || read_all(&mut err_h));
+
+    let status = wait_timeout(&mut child, opts.timeout)?;
+
+    let stdout = t_out.join().unwrap_or_default();
+    let stderr = t_err.join().unwrap_or_default();
+
+    let out = RawOutput { stdout, stderr, code: status.code() };
+
+    if !out.is_success() && !opts.allow_fail {
+        if Error::is_lock_error(&out.stderr) {
+            return Err(Error::Locked(cwd.to_path_buf()));
+        }
+        return Err(crate::domain::with_explanation(
+            out.code.unwrap_or(-1),
+            out.stderr,
+        ));
+    }
+
+    Ok(out)
+}
+
+/// 按行读 stdout，每行回调一次，同时拼回全文（`RawOutput.stdout` 仍要能用）。
+///
+/// 用 `read_until(b'\n')` 而不是 `read_to_end`：后者要等子进程退出才返回，
+/// 进度就全堵到最后一口气才出来，等于没有。
+fn stream_lines<F>(h: &mut Option<ChildStdout>, mut on_line: F) -> String
+where
+    F: FnMut(&str),
+{
+    let Some(h) = h.as_mut() else {
+        return String::new();
+    };
+    let mut r = std::io::BufReader::new(h);
+    let mut all = String::new();
+    let mut line: Vec<u8> = Vec::with_capacity(256);
+    loop {
+        line.clear();
+        match r.read_until(b'\n', &mut line) {
+            Ok(0) => break,
+            Ok(_) => {
+                // 非 UTF-8 用替换字符兜底：进度行不重要，不能让它断掉整条流。
+                let s = String::from_utf8_lossy(&line);
+                let t = s.trim_end_matches(['\r', '\n']);
+                on_line(t);
+                all.push_str(t);
+                all.push('\n');
+            }
+            // 读失败（子进程被 kill 等）：已读到的照常返回，不把命令判成失败。
+            Err(_) => break,
+        }
+    }
+    all
 }
 
 fn read_all<R: Read>(h: &mut Option<R>) -> String {

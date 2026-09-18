@@ -54,7 +54,7 @@ pub struct Cli {
     pub verbose: bool,
 
     #[command(subcommand)]
-    pub cmd: Cmd,
+    pub cmd: Option<Cmd>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -285,7 +285,7 @@ impl Cli {
         // `daemon run --root X` 是由 `daemon start` 在后台拉起的，
         // 它的 cwd 继承自调用者，**不一定**在工作副本里。
         // 若这里不做特殊处理，discover 会因为 cwd 不对而直接失败退出。
-        if let Cmd::Daemon { action } = &self.cmd {
+        if let Some(Cmd::Daemon { action }) = &self.cmd {
             if let daemon::Action::Run { root, .. } = action {
                 return root.clone();
             }
@@ -301,7 +301,21 @@ impl Cli {
 }
 
 /// 分发。**出口层**：把领域错误翻译成人类可读提示 + 退出码。
-pub fn run(cli: Cli) -> i32 {
+pub fn run(mut cli: Cli) -> i32 {
+    // 不带子命令 → 进 TUI（主形态）
+    #[cfg(feature = "tui")]
+    if cli.cmd.is_none() {
+        cli.cmd = Some(Cmd::Tui);
+    }
+    
+    #[cfg(not(feature = "tui"))]
+    if cli.cmd.is_none() {
+        // 没编 TUI 又没给子命令：打帮助，别默默干别的事
+        use clap::CommandFactory;
+        let _ = Cli::command().print_help();
+        return 2;
+    }
+    
     let start = cli.start_dir();
 
     // 这些命令不需要工作副本：
@@ -311,12 +325,12 @@ pub fn run(cli: Cli) -> i32 {
     //   · login / auth —— 凭据是全局的（~/.subversion/auth），不隶属于某个副本
     let mut needs_wc = !matches!(
         cli.cmd,
-        Cmd::Probe | Cmd::Checkout { .. } | Cmd::Login { .. } | Cmd::Auth
+        Some(Cmd::Probe) | Some(Cmd::Checkout { .. }) | Some(Cmd::Login { .. }) | Some(Cmd::Auth)
     );
     // TUI 自己能处理"不在工作副本"的情况（进去给检出界面），
     // 所以在这一层放行，别先把它拦下来。
     #[cfg(feature = "tui")]
-    if matches!(cli.cmd, Cmd::Tui) {
+    if matches!(cli.cmd, Some(Cmd::Tui)) {
         needs_wc = false;
     }
 
@@ -367,7 +381,7 @@ fn emit_err(cli: &Cli, e: &crate::domain::Error) {
 fn dispatch(cli: &Cli, svn: &crate::svn::Svn, tty: bool) -> Result<String, crate::domain::Error> {
     use self::daemon as daemon_cmd;
 
-    match &cli.cmd {
+    match cli.cmd.as_ref().expect("cmd 已由 run() 填充") {
         #[cfg(feature = "tui")]
         Cmd::Tui => {
             // TUI 自己接管终端（raw mode + alternate screen），

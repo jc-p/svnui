@@ -169,12 +169,6 @@ pub fn log(
         }
         out.push('\n');
     }
-    if out.trim().is_empty() {
-        // 一条记录都没有时必须说一句。空串回到 run() 会被 `if !text.is_empty()`
-        // 整个吞掉 —— 用户看到的是"敲了命令、一行没出、退出码 0"，
-        // 只能去猜是查到了还是工具坏了。log_rev 早就有这个兜底，log 一直漏。
-        out.push_str("(无匹配的提交记录)\n");
-    }
     Ok(out)
 }
 
@@ -206,14 +200,6 @@ pub fn diff(
 
     if cli.json {
         return Ok(crate::output::ok(&serde_json::json!({ "diff": out.stdout })));
-    }
-
-    // ⚠️ 空 diff 必须先兜住，否则会**双重静默**：
-    //   1) page("") 第一行就 return Ok(()) —— pager 根本不会启动
-    //   2) 下面又 return Ok(String::new()) —— run() 再按空串跳过打印
-    // 两步叠加的结果就是"没有任何改动"时整整一行都不出，看着像命令挂了。
-    if out.stdout.trim().is_empty() {
-        return Ok("(无本地改动)\n".to_string());
     }
 
     // 分页器接管时直接返回空串：内容已经写进 pager，再 println 就重复了。
@@ -259,9 +245,5 @@ fn log_rev(cli: &Cli, svn: &Svn, rev: &str, oneline: bool) -> Result<String, Err
 /// blame 输出原文，不解析 —— 行数可能上万，解析再格式化纯属浪费，
 /// 而且用户要的就是 svn 原始的那份对齐格式。
 pub fn blame(svn: &Svn, path: &PathBuf) -> Result<String, Error> {
-    let out = svn.blame(path)?;
-    if out.trim().is_empty() {
-        return Ok(format!("(blame 无输出：{} 可能是空文件，或还没有提交历史)", path.display()));
-    }
-    Ok(out)
+    svn.blame(path)
 }
