@@ -76,7 +76,10 @@ pub fn remove(
     // Display 里已经写明，这里不再重复渲染。
     match guard(Op::Remove, danger_of(Op::Remove), &t, false, yes, tty)? {
         Some(_) => {}
-        None => return Ok(String::new()),
+        // guard 目前不会返回 Ok(None)（四个判定分支全是 Some/Err），这条是防未来的地雷：
+        // 若哪天 judge 加了"静默跳过"，写操作就会什么都不做、还返回空串，
+        // 用户以为执行了。宁可多打一行也别静默。
+        None => return Ok("（未执行：护栏未放行，也没给出原因）".to_string()),
     }
     let out = svn.remove(paths, keep_local)?;
     crate::cache::invalidate_for(&svn.root);
@@ -106,7 +109,10 @@ pub fn revert(
     match guard(Op::Revert, danger_of(Op::Revert), &effective, dry_run, yes, tty)? {
         Some(warn) if !warn.is_empty() => return Ok(warn),
         Some(_) => {}
-        None => return Ok(String::new()),
+        // guard 目前不会返回 Ok(None)（四个判定分支全是 Some/Err），这条是防未来的地雷：
+        // 若哪天 judge 加了"静默跳过"，写操作就会什么都不做、还返回空串，
+        // 用户以为执行了。宁可多打一行也别静默。
+        None => return Ok("（未执行：护栏未放行，也没给出原因）".to_string()),
     }
 
     let out = svn.revert(paths, false)?;
@@ -139,7 +145,10 @@ pub fn commit(
     match guard(Op::Commit, danger_of(Op::Commit), &effective, dry_run, yes, tty)? {
         Some(text) if !text.is_empty() => return Ok(text),
         Some(_) => {}
-        None => return Ok(String::new()),
+        // guard 目前不会返回 Ok(None)（四个判定分支全是 Some/Err），这条是防未来的地雷：
+        // 若哪天 judge 加了"静默跳过"，写操作就会什么都不做、还返回空串，
+        // 用户以为执行了。宁可多打一行也别静默。
+        None => return Ok("（未执行：护栏未放行，也没给出原因）".to_string()),
     }
 
     let msg = message.unwrap_or("(svnui: 无提交信息)");
@@ -169,7 +178,10 @@ pub fn update(
     match guard(Op::Update, danger_of(Op::Update), &t, false, yes, tty)? {
         Some(text) if !text.is_empty() => return Ok(text),
         Some(_) => {}
-        None => return Ok(String::new()),
+        // guard 目前不会返回 Ok(None)（四个判定分支全是 Some/Err），这条是防未来的地雷：
+        // 若哪天 judge 加了"静默跳过"，写操作就会什么都不做、还返回空串，
+        // 用户以为执行了。宁可多打一行也别静默。
+        None => return Ok("（未执行：护栏未放行，也没给出原因）".to_string()),
     }
 
     let out = svn.update(rev, paths)?;

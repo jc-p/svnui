@@ -82,8 +82,25 @@ impl CheckoutPanel {
         self.values[self.focus].push(c);
     }
 
+    /// 整段插入（粘贴）。
+    ///
+    /// 单行输入框吃不下换行：URL 里带 `\n` 会把框撑成两行、边框错位，
+    /// 所以统一压成空格。制表符同理（Tab 是切字段的键，不能出现在内容里）。
+    pub fn push_str(&mut self, s: &str) {
+        let flat: String = s
+            .chars()
+            .map(|c| if c == '\n' || c == '\r' || c == '\t' { ' ' } else { c })
+            .collect();
+        self.values[self.focus].push_str(&flat);
+    }
+
     pub fn pop_char(&mut self) {
         self.values[self.focus].pop();
+    }
+
+    /// 清空当前字段（Ctrl+U）。粘错一长串 URL 时逐字符退格太慢。
+    pub fn clear_field(&mut self) {
+        self.values[self.focus].clear();
     }
 
     pub fn render(&self, f: &mut Frame, area: Rect) {
@@ -134,6 +151,14 @@ impl CheckoutPanel {
             } else {
                 shown
             };
+            // 焦点框里补一个可见光标。
+            // 原来只有边框变色，框里空空如也 —— 看不出"能在这儿打字"，
+            // 尤其刚进来时四个框全空，很容易以为面板是死的。
+            let content = if active && !placeholder {
+                format!("{}▌", content)
+            } else {
+                content
+            };
 
             f.render_widget(
                 Paragraph::new(Line::from(Span::styled(
@@ -152,7 +177,7 @@ impl CheckoutPanel {
         let hint = match &self.hint {
             Some(h) => Line::from(Span::styled(h.as_str(), theme::Theme::conflicted())),
             None => Line::from(Span::styled(
-                " Tab 切换   Enter 开始检出（在最后一项按 Enter 直接开始）   Esc 退出",
+                " Tab 切换   Enter 开始检出（在最后一项按 Enter 直接开始）   Ctrl+U 清空   Esc 退出   可直接粘贴",
                 theme::Theme::dim(),
             )),
         };

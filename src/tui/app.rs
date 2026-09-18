@@ -937,6 +937,16 @@ impl App {
                     p.clear_hint();
                 }
             }
+            // 检出面板：插到当前字段。
+            //
+            // 这个必须接 —— 仓库 URL 长且难敲，没人手打，
+            // 全靠 Cmd+V。之前落进下面的 `_ => {}` 被静默忽略，
+            // 表现为"粘贴没反应"，看着就像输入框是坏的。
+            Mode::Checkout => {
+                if let Some(p) = self.checkout.as_mut() {
+                    p.push_str(&text);
+                }
+            }
             // 其余模式没有输入框，粘贴没有落点。
             // 静默忽略比报错好 —— 用户只是按错了地方。
             _ => {}
@@ -1469,6 +1479,10 @@ impl App {
             KeyCode::Backspace => panel.pop_char(),
             KeyCode::Up => panel.prev_field(),
             KeyCode::Down => panel.next_field(),
+            // Ctrl+U 清空当前字段：粘错一长串 URL 时逐字符退格太慢。
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                panel.clear_field()
+            }
             KeyCode::Char(c) => panel.push_char(c),
             KeyCode::Enter => {
                 let at_last = panel.focus() == 3;
