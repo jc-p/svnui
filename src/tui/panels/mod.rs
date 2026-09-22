@@ -13,6 +13,7 @@ pub mod help;
 pub mod loading;
 pub mod log;
 pub mod preview;
+pub mod repo;
 pub mod status;
 pub mod tree;
 

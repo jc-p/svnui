@@ -71,6 +71,17 @@ impl CheckoutPanel {
         self.hint = Some(h.into());
     }
 
+    /// 直接覆盖第 `i` 个字段（0=URL / 1=本地路径 / 2=用户名 / 3=密码）。
+    ///
+    /// 给 Repo 面板"检出这个目录"用 —— URL 已知，没必要再拼一次。
+    /// 只接受下标 0..3，越界直接忽略：调用方传错不该 panic。
+    pub fn set_field(&mut self, i: usize, s: &str) {
+        if let Some(v) = self.values.get_mut(i) {
+            *v = s.to_string();
+            self.focus = i;
+        }
+    }
+
     pub fn url(&self) -> &str {
         &self.values[0]
     }

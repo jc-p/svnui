@@ -536,10 +536,12 @@ impl TreePanel {
                 (name, is_dir)
             })
             .collect();
-        entries.sort_by(|a, b| {
-            // 目录在前，其次按名
-            b.1.cmp(&a.1).then(a.0.to_lowercase().cmp(&b.0.to_lowercase()))
-        });
+        // 目录在前，其次按名。
+        //
+        // 用 `_cached_key`：闭包里的 `to_lowercase()` 会分配一个新 String，
+        // `sort_by` 每次比较都现算，几千条的目录就是十几万次堆分配 ——
+        // 切目录时能感觉到卡。`_cached_key` 每个元素只算一次。
+        entries.sort_by_cached_key(|(name, is_dir)| (!*is_dir, name.to_lowercase()));
 
         let depth = self.nodes.get(rel).map(|n| n.depth + 1).unwrap_or(0);
         for (name, is_dir) in entries {

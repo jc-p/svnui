@@ -5,6 +5,19 @@ use std::time::{Duration, Instant};
 
 use crate::domain::{Error, Result};
 
+/// 流式读取时，拼回 `RawOutput.stdout` 的上限。
+///
+/// `run_streaming` 的进度靠**回调**逐行递出去，这份全文只是为了兼容
+/// `RawOutput` 的契约。检出几万文件时 svn 的 stdout 轻松几十 MB，
+/// 全留在内存里纯粹是浪费 —— 2MB 足够诊断用。
+const MAX_STREAM_BYTES: usize = 2 * 1024 * 1024;
+
+/// 单行上限。
+///
+/// `read_until(b'\n')` 只有遇到换行才停。输出里没有 `\n` 时（二进制内容、
+/// 异常的长行），一次调用会把整个流读进 `line`。
+const MAX_LINE_BYTES: usize = 64 * 1024;
+
 /// 一次 svn 调用的原始结果。**不做任何语义判断** —— 那属于 `client.rs`。
 #[derive(Debug, Clone, Default)]
 pub struct RawOutput {
@@ -100,6 +113,8 @@ pub fn run(exe: &Path, args: &[&str], cwd: &Path, opts: &RunOpts) -> Result<RawO
 ///    不会把主流程带崩。
 /// ⚠️ 最终结果仍以返回的 `RawOutput` 为准 —— 别拿回调次数当"完成数"，
 ///    最后一行读完就不再回调了。
+/// ⚠️ 返回的 `RawOutput.stdout` 有长度上限（[`MAX_STREAM_BYTES`]），
+///    超出部分**不会**出现在里面。回调是完整的，需要全量就自己攒。
 pub fn run_streaming<F>(
     exe: &Path,
     args: &[&str],
@@ -167,12 +182,23 @@ where
         match r.read_until(b'\n', &mut line) {
             Ok(0) => break,
             Ok(_) => {
+                // 单行长度也要封顶。`read_until(b'\n')` 遇到**没有换行**的输出
+                // （比如 svn 吐了一整块二进制）会把整个流塞进 `line`，
+                // 一行几十 MB 照样爆。超了就只保留头部，回调照常给。
+                if line.len() > MAX_LINE_BYTES {
+                    line.truncate(MAX_LINE_BYTES);
+                }
                 // 非 UTF-8 用替换字符兜底：进度行不重要，不能让它断掉整条流。
                 let s = String::from_utf8_lossy(&line);
                 let t = s.trim_end_matches(['\r', '\n']);
                 on_line(t);
-                all.push_str(t);
-                all.push('\n');
+                // 全文只在额度内拼。检出几万文件时 stdout 能轻松几十 MB，
+                // 而调用方真正要的进度早就通过 on_line 拿全了 ——
+                // 这份 String 留着只是为了兼容 RawOutput 的契约，封顶不影响功能。
+                if all.len() < MAX_STREAM_BYTES {
+                    all.push_str(t);
+                    all.push('\n');
+                }
             }
             // 读失败（子进程被 kill 等）：已读到的照常返回，不把命令判成失败。
             Err(_) => break,

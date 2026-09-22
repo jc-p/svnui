@@ -45,6 +45,7 @@ use crate::tui::panels::log::LogPanel;
 use crate::tui::panels::confirm::{ConfirmAction, ConfirmPanel, Danger};
 use crate::tui::panels::conflict::{ConflictPanel, Side, Strategy};
 use crate::tui::panels::tree::{TreeMode, TreePanel};
+use crate::tui::panels::repo::{RepoAction, RepoPanel};
 use crate::tui::theme;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -63,6 +64,8 @@ pub enum Mode {
     Conflict,
     /// 检出新工作副本（不在工作副本里启动时进这个）。
     Checkout,
+    /// 远端仓库浏览（`svn list --xml`，可逐层下钻）。
+    Repo,
 }
 
 /// 把路径压成相对工作副本根的显示名；不在 root 下就原样返回。
@@ -147,6 +150,11 @@ enum BgDone {
     RevertDry(Vec<String>),
     /// update 前的远端检查：(远端有更新的文件, 本地改动的相对路径)。
     OutdatedCheck(crate::domain::Result<(Vec<(PathBuf, u64)>, Vec<String>)>),
+    /// 远端目录列表：(请求的 URL, 结果)。
+    ///
+    /// 带 URL 是因为结果可能**迟到** —— 用户已经退到上级了，
+    /// 这时候拿旧 URL 的结果覆盖当前目录，界面会显示错层的内容。
+    RepoList(String, crate::domain::Result<Vec<crate::svn::parser::DirEntry>>),
     /// 冲突文件列表加载完成。
     Conflicts(crate::domain::Result<Vec<PathBuf>>),
     /// 某个历史版本的完整 diff。
@@ -168,6 +176,8 @@ pub struct App {
     checkout: Option<CheckoutPanel>,
     confirm: Option<ConfirmPanel>,
     conflict: Option<ConflictPanel>,
+    /// 远端仓库浏览面板（`V` 打开）。
+    repo: Option<RepoPanel>,
     /// 提交范围（打开提交面板时锁定，避免弹框期间勾选变化导致不一致）。
     commit_paths: Vec<PathBuf>,
     /// 是否有一个 svn commit 在后台跑。
@@ -248,6 +258,7 @@ impl App {
             checkout: None,
             confirm: None,
             conflict: None,
+            repo: None,
             commit_paths: Vec::new(),
             commit_draft: None,
             commit_inflight: false,
@@ -943,6 +954,30 @@ impl App {
                         p.set_detail(rev, lines);
                     }
                 }
+                BgDone::RepoList(url, res) => {
+                    self.busy = None;
+                    if let Some(p) = self.repo.as_mut() {
+                        match res {
+                            Ok(entries) => p.set_entries(&url, entries),
+                            Err(e) => {
+                                // 导航失败（进目录 / 退上级）时面板会自己退回上一层，
+                                // 并返回"需要重新拉的 URL" —— 这时不能占屏报错：
+                                // 用户还在面板里，位置已经退回去了，占屏反而把
+                                // 上一层的内容盖掉了。
+                                //
+                                // 只有首屏 / 刷新失败才占整屏，因为那时确实
+                                // 没有别的内容可显示（和 log 面板一个套路）。
+                                let retry = p.set_error(
+                                    e.to_string(),
+                                    crate::cli::hint::human_hint(&e),
+                                );
+                                if let Some(u) = retry {
+                                    self.spawn_repo_list(&u);
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -1050,6 +1085,7 @@ impl App {
             Mode::Confirm => self.handle_confirm_key(key),
             Mode::Conflict => self.handle_conflict_key(key),
             Mode::Checkout => self.handle_checkout_key(key),
+            Mode::Repo => self.handle_repo_key(key),
         }
     }
 
@@ -1213,8 +1249,12 @@ impl App {
                 });
             }
 
-            // V：冲突解决面板
-            KeyCode::Char('v') | KeyCode::Char('V') => self.open_conflict(),
+            // X：冲突解决面板
+            //
+            // ⚠️ 原来是 V，但 V 的认知度更像"查看/浏览"，让给远端仓库面板了。
+            //    resolve 这个词在 svn 里就是 `svn resolve`，取首字母 X 也不算生造
+            //    （C 已给 commit、R 给 revert，能用的单字母本来就不多）。
+            KeyCode::Char('x') | KeyCode::Char('X') => self.open_conflict(),
 
             // D = svn delete（大写，和小写 d 的 vim 翻页习惯区分开）
             KeyCode::Char('d') | KeyCode::Char('D') => self.do_delete(),
@@ -1227,9 +1267,17 @@ impl App {
 
             KeyCode::Char('c') | KeyCode::Char('C') => self.open_commit(),
             KeyCode::Char('a') | KeyCode::Char('A') => self.do_add(),
-            // 小写 r = revert；Shift+R = 重新扫描（区分靠 SHIFT 修饰位）
+            // 小写 r = revert。
+            //
+            // ⚠️ 原先大写 R 同时绑了"重新扫描"，同一个 match 里前者先命中，
+            //    重新扫描成了永远走不到的死分支。现在把它挪到 F5 ——
+            //    这种重复绑定编译器不会报错，只能靠人眼发现。
             KeyCode::Char('r') => self.do_revert(),
-            KeyCode::Char('R') => self.spawn_reload(),
+            // V = 远端仓库浏览（view）：不用切网页就能翻目录、复制路径、直接检出。
+            // 原来挂在 R 上，但 R 和小写 r（revert）只差一个 Shift，
+            // 而 revert 是破坏性操作 —— 手滑按成大写的代价太大。
+            KeyCode::Char('v') | KeyCode::Char('V') => self.open_repo(),
+            KeyCode::F(5) => self.spawn_reload(),
             KeyCode::Char('u') | KeyCode::Char('U') => self.do_update(),
             KeyCode::Char('h') | KeyCode::Char('H') => self.do_doctor(),
             KeyCode::Char('l') | KeyCode::Char('L') => self.open_log(),
@@ -1531,6 +1579,114 @@ impl App {
             _ => {}
         }
         Ok(())
+    }
+
+    // ── 远端仓库浏览 ───────────────────────────────────────
+
+    /// 打开 Repo 面板。
+    ///
+    /// 仓库根 URL 来自 `svn info` 的 repository root —— **同步**拿，
+    /// 因为它是纯本地读取（不加 `-u` 不联网），一次几毫秒，
+    /// 没必要为此多一套异步状态。真正的目录列表才走后台。
+    fn open_repo(&mut self) {
+        // 起点用**工作副本当前目录的 URL**，不用 repository root。
+        //
+        // 很多 SVN 是「按子树授权」的：账号只对 /trunk/A8_Patch/... 这一支有权限，
+        // 拿 repository root（/JR/KAMP）去 svn list 会被拒 ——
+        // svn 报 E170013（连不上）+ E175013（forbidden），
+        // 而 170013 是结果、175013 才是原因，看起来像"服务器挂了"，
+        // 实际是"这个账号看不了仓库根"。
+        //
+        // 从工作副本 URL 起步，能一路向上退到还有权限的那一层；
+        // 需要更上层就找管理员开通，而不是让人去查 VPN。
+        let (root_url, start_url) = match self.svn.info() {
+            Ok(info) => {
+                let root = info
+                    .repository_root
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_default()
+                    .trim_end_matches('/')
+                    .to_string();
+                let wc = info.url.trim_end_matches('/').to_string();
+                // repository root 拿不到（少见）就退化成"从工作副本起步"，
+                // 代价是退不上去，但至少面板能开。
+                if root.is_empty() {
+                    (wc.clone(), wc)
+                } else {
+                    (root, wc)
+                }
+            }
+            Err(e) => {
+                self.notice = Some(format!("读取仓库信息失败：{}", e));
+                return;
+            }
+        };
+
+        // root 归 root、起点靠 trail —— 直接把工作副本 URL 当 root 的话
+        // trail 恒为空，← 一步都退不上去。见 RepoPanel::new_at。
+        self.repo = Some(RepoPanel::new_at(root_url, start_url));
+        self.mode = Mode::Repo;
+        let url = self.repo.as_ref().unwrap().current_url();
+        self.spawn_repo_list(&url);
+    }
+
+    fn spawn_repo_list(&mut self, url: &str) {
+        let svn = self.svn.clone();
+        let tx = self.tx.clone();
+        let url = url.to_string();
+        // 远端 list 是联网操作，别用默认的 30s —— 大目录 + 慢服务器很容易超。
+        self.busy = Some("读取仓库目录".to_string());
+        std::thread::spawn(move || {
+            let _ = tx.send(BgDone::RepoList(url.clone(), svn.list(&url)));
+        });
+    }
+
+    fn handle_repo_key(&mut self, key: KeyEvent) -> crate::domain::Result<()> {
+        // 先把 action 取成 owned 再动 self：
+        // 下面几个分支都要 &mut self（spawn / 开检出框），
+        // 如果让 `panel` 这个 &mut 借用活到 match 里，就会撞上借用检查。
+        let action = match self.repo.as_mut() {
+            Some(p) => p.handle_key(key),
+            None => {
+                self.mode = Mode::Browse;
+                return Ok(());
+            }
+        };
+
+        match action {
+            RepoAction::None => {}
+            RepoAction::Load(url) => self.spawn_repo_list(&url),
+            RepoAction::Close => {
+                self.repo = None;
+                self.mode = Mode::Browse;
+            }
+            RepoAction::Copy(text) => match copy_to_clipboard(&text) {
+                Ok(()) => self.notice = Some(format!("已复制：{}", text)),
+                Err(e) => {
+                    // 复制失败别静默：用户以为复制了，粘出来还是旧内容。
+                    // 兜底把 URL 直接显示出来，至少能手动选中。
+                    self.notice = Some(format!("复制失败（{}）：{}", e, text));
+                }
+            },
+            RepoAction::Checkout(url) => {
+                // 直接复用检出面板并预填 URL —— 别自己再写一套检出逻辑
+                self.repo = None;
+                self.mode = Mode::Browse;
+                self.open_checkout_with(Some(url));
+            }
+        }
+        Ok(())
+    }
+
+    /// 打开检出面板，`url` 非空时预填。
+    fn open_checkout_with(&mut self, url: Option<String>) {
+        let mut p = CheckoutPanel::new(self.root.to_string_lossy().to_string());
+        if let Some(u) = url {
+            p.set_field(0, &u);
+            p.set_hint("URL 已从仓库面板带入；本地路径确认后按 Enter 开始检出");
+        }
+        self.checkout = Some(p);
+        self.mode = Mode::Checkout;
     }
 
     fn do_checkout(&mut self) -> crate::domain::Result<()> {
@@ -2249,6 +2405,31 @@ impl App {
             panel.render(f, centered_rect_min(70, 55, 16, area));
         }
 
+        // 仓库浏览：整屏浮层（要显示层级和详情，弹出框尺寸不够）
+        if self.mode == Mode::Repo {
+            match self.repo.as_mut() {
+                Some(p) => p.render(f, centered_rect(92, 90, area)),
+                None => {
+                    // panel 还没建好（理论上不会），至少别黑屏
+                    let rect = centered_rect(60, 25, area);
+                    f.render_widget(Clear, rect);
+                    f.render_widget(
+                        Paragraph::new(Line::from(Span::styled(
+                            " 正在连接仓库… ",
+                            theme::Theme::title(),
+                        )))
+                        .block(
+                            Block::default()
+                                .borders(Borders::ALL)
+                                .title(" 仓库 ")
+                                .border_style(theme::Theme::border_active()),
+                        ),
+                        rect,
+                    );
+                }
+            }
+        }
+
         if self.show_help {
             HelpPanel::render(f, centered_rect(70, 80, area));
         }
@@ -2352,7 +2533,11 @@ impl App {
         let (title, keys): (&str, &str) = match self.mode {
             Mode::Browse => (
                 " 操作 ",
-                "↑↓ 选择   Enter 打开   E 编辑   C 提交   / 搜索   ? 帮助   Q 退出",
+                "↑↓ 选择   Enter 打开   E 编辑   C 提交   V 浏览仓库   / 搜索   ? 帮助   Q 退出",
+            ),
+            Mode::Repo => (
+                " 仓库 ",
+                "↑↓ 选择   Enter 进入   ←/退格 返回   o 检出   Y 复制路径   R 刷新   Esc 返回",
             ),
             // "Esc 取消" 改成 "Esc 退出"：
             // 有内容时 Esc 会先弹确认框问一句，但**退出永远是可达的**
@@ -2553,6 +2738,58 @@ fn hex_val(b: u8) -> Option<u8> {
         b'A'..=b'F' => Some(b - b'A' + 10),
         _ => None,
     }
+}
+
+/// 写进系统剪贴板。
+///
+/// macOS 有 `pbcopy`；Linux 按优先级试 `wl-copy` / `xclip` / `xsel`，
+/// 都没有就返回错误 —— 交给调用方决定怎么提示，别静默失败
+/// （用户以为复制了，粘出来还是旧内容，比直接说失败更糟）。
+fn copy_to_clipboard(text: &str) -> crate::domain::Result<()> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let candidates: &[(&str, &[&str])] = if cfg!(target_os = "macos") {
+        &[("pbcopy", &[])]
+    } else {
+        &[
+            ("wl-copy", &[]),
+            ("xclip", &["-selection", "clipboard"]),
+            ("xsel", &["--clipboard", "--input"]),
+        ]
+    };
+
+    let mut last: Option<String> = None;
+    for (prog, args) in candidates {
+        let mut child = match Command::new(prog)
+            .args(*args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let ok = child
+            .stdin
+            .as_mut()
+            .map(|s| s.write_all(text.as_bytes()).is_ok())
+            .unwrap_or(false);
+        if ok && child.wait().map(|s| s.success()).unwrap_or(false) {
+            return Ok(());
+        }
+        last = Some(format!("{} 执行失败", prog));
+    }
+    Err(crate::domain::Error::Explained {
+        summary: "复制失败：系统里没有可用的剪贴板工具".to_string(),
+        detail: format!(
+            "试过：{}{}。\nmacOS 自带 pbcopy；Linux 请装 wl-copy 或 xclip。\n要复制的内容是：\n{}",
+            candidates.iter().map(|(p, _)| *p).collect::<Vec<_>>().join(" / "),
+            last.map(|s| format!("（{}）", s)).unwrap_or_default(),
+            text,
+        ),
+    })
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {

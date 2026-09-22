@@ -224,3 +224,86 @@ pub fn parse_info_xml(xml: &str, fallback_root: &str) -> Result<RepoInfo> {
         uuid: e.repository.and_then(|r| r.uuid),
     })
 }
+// ---------------------------------------------------------------- list
+
+/// `svn list --xml` 的一个条目。
+///
+/// 远端条目**没有本地状态**（不是工作副本里的文件），
+/// 所以只有 name / kind / size / 最后修改的 revision-info。
+#[derive(Debug, Clone)]
+pub struct DirEntry {
+    pub name: String,
+    pub is_dir: bool,
+    /// 文件大小（字节）。目录没有。
+    pub size: Option<u64>,
+    /// 最后改动的 revision。
+    pub revision: Option<u64>,
+    pub author: Option<String>,
+    /// 已压成 `YYYY-MM-DD`。原始值是 ISO8601（`2024-05-01T03:04:05.123456Z`），
+    /// 全长 27 字符，按字节截 10 正好是日期部分（ASCII 边界安全）。
+    pub date: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ListXml {
+    #[serde(default, rename = "list")]
+    lists: Vec<ListEl>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ListEl {
+    #[serde(default, rename = "entry")]
+    entries: Vec<ListEntryXml>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ListEntryXml {
+    #[serde(rename = "@kind", default)]
+    kind: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    size: Option<u64>,
+    #[serde(default)]
+    commit: Option<ListCommitXml>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ListCommitXml {
+    #[serde(rename = "@revision")]
+    revision: Option<u64>,
+    #[serde(default)]
+    author: Option<String>,
+    #[serde(default)]
+    date: Option<String>,
+}
+
+/// 解析 `svn list --xml`。
+///
+/// 目录名带尾斜杠是 `svn list` 的文本输出习惯，XML 里没有 ——
+/// 统一去掉，面板自己按 `is_dir` 渲染，避免 URL 拼接时多一个斜杠。
+pub fn parse_list_xml(xml: &str) -> Result<Vec<DirEntry>> {
+    let doc: ListXml = quick_xml::de::from_str(xml).map_err(|e| Error::Parse(e.to_string()))?;
+
+    let mut out = Vec::new();
+    for l in doc.lists {
+        for e in l.entries {
+            let name = e.name.unwrap_or_default();
+            if name.is_empty() {
+                continue;
+            }
+            let c = e.commit;
+            out.push(DirEntry {
+                is_dir: e.kind.as_deref() == Some("dir"),
+                name,
+                size: e.size,
+                revision: c.as_ref().and_then(|c| c.revision),
+                author: c.as_ref().and_then(|c| c.author.clone()),
+                date: c.as_ref().and_then(|c| c.date.clone()).map(|d| {
+                    if d.len() >= 10 { d[..10].to_string() } else { d }
+                }),
+            });
+        }
+    }
+    Ok(out)
+}

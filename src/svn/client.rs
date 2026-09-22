@@ -3,9 +3,16 @@ use std::time::Duration;
 
 use crate::domain::{Error, LogEntry, NodeKind, RepoInfo, Result, Snapshot, StatusEntry, StatusKind};
 use crate::svn::command::{run, run_streaming, run_with_stdin, RawOutput, RunOpts};
+use crate::svn::parser::DirEntry;
 
 use super::locator::{relative_to, svn_exe, wc_root};
 use super::version::SvnVersion;
+
+/// `svn list --xml` 的输出上限（解析前的闸门）。
+///
+/// 8MB 的 XML 大约对应 3~4 万个条目 —— 远超 TUI 能流畅渲染的量级，
+/// 再往上就是纯粹的浪费。见 [`Svn::list`] 里的拦截。
+const MAX_LIST_XML_BYTES: usize = 8 * 1024 * 1024;
 
 /// 一个工作副本的句柄。
 ///
@@ -444,6 +451,33 @@ impl Svn {
     pub fn info(&self) -> Result<RepoInfo> {
         let out = run(&self.exe, &["info", "--xml"], &self.root, &self.opts(false))?;
         super::parser::parse_info_xml(&out.stdout, &self.root.to_string_lossy())
+    }
+
+    /// 列远端目录（`svn list --xml`）。
+    ///
+    /// `url` 是**完整** URL（含 `https://`），不像其他方法那样传相对路径 ——
+    /// 远端浏览没有工作副本可言，cwd 对它没意义。
+    ///
+    /// 用 XML 而非文本：文本输出只有名字，拿不到 revision / 作者 / 日期，
+    /// 而"这个目录最后是谁在什么时候改的"正是浏览仓库时最想知道的。
+    pub fn list(&self, url: &str) -> Result<Vec<DirEntry>> {
+        let out = run(&self.exe, &["list", "--xml", url], &self.root, &self.opts(true))?;
+        // 在**解析之前**挡一道。quick_xml 是全量反序列化，
+        // 解析期的内存峰值大约是 XML 文本的 3~5 倍（每个条目都要建 3 个 String）。
+        // 让 100MB 的 XML 进去，出来就是几百 MB 的 Vec —— 必须提前拦。
+        if out.stdout.len() > MAX_LIST_XML_BYTES {
+            return Err(crate::domain::Error::Explained {
+                summary: "该目录条目过多，已中止读取".to_string(),
+                detail: format!(
+                    "svn 返回了约 {:.1} MB 的目录列表，超过 {:.0} MB 上限。\n\
+                     这种量级在 TUI 里逐行翻也没有意义（每帧都要重画上万行）。\n\
+                     建议：直接用更精确的子目录 URL 打开，或先用 svn list 在命令行里筛。",
+                    out.stdout.len() as f64 / 1024.0 / 1024.0,
+                    MAX_LIST_XML_BYTES as f64 / 1024.0 / 1024.0,
+                ),
+            });
+        }
+        super::parser::parse_list_xml(&out.stdout)
     }
 
     /// `svn cat` —— 预览已删除文件的原始内容时很有用。
