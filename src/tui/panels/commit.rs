@@ -20,7 +20,7 @@
 //! │ ┌───────────────────────────────────┐ │
 //! │ │ 修复状态同步                        │ │
 //! │ └───────────────────────────────────┘ │
-//! │ Ctrl+S / F2 提交   Enter 换行   Esc 退出│
+//! │ Ctrl+S 提交   Esc 退出                  │
 //! └───────────────────────────────────────┘
 //! ```
 
@@ -60,7 +60,7 @@ impl CommitPanel {
                 .borders(Borders::ALL)
                 .title(" 提交信息 "),
         );
-        textarea.set_placeholder_text("写点什么说明这次改动。Enter 换行，Ctrl+S 或 F2 提交");
+        textarea.set_placeholder_text("写点什么说明这次改动。Ctrl+S 提交");
 
         // 恢复草稿：按 Enter 前按过 Esc 的话，内容不该丢。
         // 只有真的有非空白内容才填 —— 空串会让 placeholder 消失，
@@ -216,10 +216,6 @@ impl CommitPanel {
             None => Line::from(vec![
                 Span::styled(" Ctrl+S ", theme::Theme::title()),
                 Span::styled("提交    ", theme::Theme::dim()),
-                Span::styled("F2 ", theme::Theme::title()),
-                Span::styled("提交    ", theme::Theme::dim()),
-                Span::styled("Enter ", theme::Theme::title()),
-                Span::styled("换行    ", theme::Theme::dim()),
                 Span::styled("Esc ", theme::Theme::title()),
                 Span::styled("退出", theme::Theme::dim()),
             ]),

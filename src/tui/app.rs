@@ -148,6 +148,11 @@ enum BgDone {
     Checkout(crate::domain::Result<String>),
     /// revert 干跑结果：将被还原的文件（相对路径）。
     RevertDry(Vec<String>),
+    /// 回退干跑：(目标版本, 当前 HEAD, 将被撤销的提交摘要, 受影响文件)。
+    ///
+    /// 带"被撤销的提交"是因为：光看文件列表不知道自己回到了哪，
+    /// 看到"这几个提交会被撤销"才敢按 Y —— 这是回退确认里最关键的一屏。
+    RevDry(u64, u64, Vec<String>, Vec<String>),
     /// update 前的远端检查：(远端有更新的文件, 本地改动的相对路径)。
     OutdatedCheck(crate::domain::Result<(Vec<(PathBuf, u64)>, Vec<String>)>),
     /// 远端目录列表：(请求的 URL, 结果)。
@@ -814,6 +819,39 @@ impl App {
                     }
                 }
 
+                BgDone::RevDry(rev, head, commits, files) => {
+                    self.busy = None;
+                    let mut items: Vec<String> = Vec::new();
+                    items.push(format!("将被撤销的提交（r{} 之后到 r{}）：", rev, head));
+                    for c in &commits {
+                        items.push(format!("  {}", c));
+                    }
+                    if commits.is_empty() {
+                        items.push("  （无）".to_string());
+                    }
+                    items.push(String::new());
+                    items.push(format!("受影响文件（{}）：", files.len()));
+                    if files.is_empty() {
+                        items.push("  （无）".to_string());
+                    } else {
+                        for f in &files {
+                            items.push(format!("  {}", f));
+                        }
+                    }
+                    let n = commits.len();
+                    self.confirm = Some(ConfirmPanel::new(
+                        format!("确认回到 r{}", rev),
+                        format!(
+                            "将撤销 r{} 之后的 {} 个提交。执行后工作副本回到 r{} 的状态，\n仍需再提交一次才会写进仓库。本地未提交的改动会与回退结果合并，有冲突会标出来。",
+                            rev, n, rev
+                        ),
+                        items,
+                        Danger::Critical,
+                        ConfirmAction::RevertToRev(rev),
+                    ));
+                    self.mode = Mode::Confirm;
+                }
+
                 BgDone::OutdatedCheck(Ok((remote, local))) => {
                     self.busy = None;
                     if remote.is_empty() {
@@ -1298,7 +1336,8 @@ impl App {
         // 但这是个多行编辑器，Enter=换行是所有编辑器的肌肉记忆，
         // 按下去发现变成提交了，正在写的东西直接飞走 —— 太危险。
         //
-        // 提交改用 Ctrl+S / F2（和"写完了保存"一个语义），
+        // 提交用 Ctrl+S（和"写完了保存"一个语义）。
+        // F2 曾经也接，但同一个动作两个入口只会让人记不住，已去掉。
         // 另外 Ctrl+Enter / Alt+Enter 也接（部分终端能投递修饰位，收不到也不影响）。
         let wants_commit = matches!(
             (key.code, key.modifiers),
@@ -1401,6 +1440,7 @@ impl App {
                             self.do_revert_confirmed(paths);
                         }
                     }
+                    ConfirmAction::RevertToRev(rev) => self.do_revert_to_rev_confirmed(rev),
                     ConfirmAction::Update => self.do_update_confirmed(),
                     ConfirmAction::Resolve(path, strategy) => {
                         self.do_resolve_confirmed(path, strategy)
@@ -1544,6 +1584,12 @@ impl App {
                 self.spawn_log_load(None, have + Self::LOG_PAGE, false);
                 return Ok(());
             }
+            // R：反向合并回到选中版本。
+            //
+            // 放在历史面板里而不是主界面，是因为"回退到哪一版"这个决定
+            // 只能看着历史做 —— 在主界面按 R 得先记住版本号再输一遍，
+            // 链路断了，功能等于没有。
+            KeyCode::Char('r') | KeyCode::Char('R') => return self.do_revert_to_rev(),
             KeyCode::Char('j') | KeyCode::Down => panel.move_down(),
             KeyCode::Char('k') | KeyCode::Up => panel.move_up(),
             _ => {}
@@ -1980,6 +2026,82 @@ impl App {
         });
     }
 
+    /// 历史面板按 R：反向合并回到选中版本（先干跑）。
+    ///
+    /// 干跑除了列出"会动哪些文件"，还会把**将被撤销的那几个提交**列出来。
+    /// 这是刻意的：回退的风险不在"改了哪些文件"，而在"我到底退到了哪"，
+    /// 后者只有看到被撤销的提交列表才能确认。
+    fn do_revert_to_rev(&mut self) -> crate::domain::Result<()> {
+        let rev = match self.logpanel.as_ref().and_then(|p| p.selected_rev()) {
+            Some(r) => r,
+            None => {
+                self.notice = Some("请先用 ↑↓ 选中一个版本".into());
+                return Ok(());
+            }
+        };
+        let root = self.root.clone();
+        let svn = self.svn.clone();
+        let tx = self.tx.clone();
+        self.busy = Some(format!("检查回到 r{} 的影响", rev));
+        std::thread::spawn(move || {
+            let head = match svn.info() {
+                Ok(i) => i.revision,
+                Err(e) => {
+                    let _ = tx.send(BgDone::Msg(Err(e)));
+                    return;
+                }
+            };
+            if rev >= head {
+                let _ = tx.send(BgDone::Msg(Err(crate::domain::Error::Explained {
+                    summary: format!("r{} 不早于当前版本 r{}", rev, head),
+                    detail: "回退只能回到更早的版本。".into(),
+                })));
+                return;
+            }
+            // 将被撤销的提交：rev+1 .. HEAD（log 默认倒序，翻转成正序更好读）
+            let commits: Vec<String> = match svn.log_rev(&format!("{}:{}", rev + 1, head), false) {
+                Ok(es) => es
+                    .iter()
+                    .rev()
+                    .map(|e| {
+                        format!(
+                            "r{}  {}  {}",
+                            e.revision,
+                            e.date.get(..10).unwrap_or(&e.date),
+                            e.author
+                        )
+                    })
+                    .collect(),
+                Err(_) => Vec::new(),
+            };
+            let files = match svn.merge_to(rev, true) {
+                Ok(out) => out
+                    .stdout
+                    .lines()
+                    .map(|l| l.trim())
+                    .filter(|l| !l.is_empty() && !l.starts_with("---"))
+                    .filter_map(|l| l.split_whitespace().nth(1))
+                    .filter(|p| *p != ".")
+                    .map(|p| short_rel(p, &root))
+                    .collect::<Vec<_>>(),
+                Err(e) => {
+                    let _ = tx.send(BgDone::Msg(Err(e)));
+                    return;
+                }
+            };
+            let _ = tx.send(BgDone::RevDry(rev, head, commits, files));
+        });
+        Ok(())
+    }
+
+    /// 真正执行回退（确认面板里按 Y 之后）。
+    fn do_revert_to_rev_confirmed(&mut self, rev: u64) {
+        self.spawn_busy(&format!("回退到 r{}", rev), move |svn| {
+            svn.merge_to(rev, false)?;
+            Ok(format!("已回退到 r{}，改动在工作副本里 —— 还需提交一次才会写进仓库", rev))
+        });
+    }
+
     /// 真正执行 revert（在确认面板里按 Enter 之后）。
     fn do_revert_confirmed(&mut self, paths: Vec<PathBuf>) {
         let n = paths.len();
@@ -2222,7 +2344,7 @@ impl App {
         // 写信息时一直能看到，不需要再确认一次。
         //
         // 弹框本来是为了防手滑，但 Enter 已经改成换行了，
-        // 提交必须用 Ctrl+S / F2 —— 会是手滑吗？不会，那是明确的动作。
+        // 提交必须用 Ctrl+S —— 会是手滑吗？不会，那是明确的动作。
         // 多一层的代价是每次提交都要多按一次键、多看一屏，
         // 而它拦住的那种误触已经不存在了。
         //
@@ -2544,7 +2666,7 @@ impl App {
             // （确认框里按 Y 就走）。写"取消"会让人以为按了没反应。
             Mode::Commit => (
                 " 提交 ",
-                "Ctrl+S 或 F2 提交   Enter 换行   Esc 退出   范围：文件树上用 Space 勾",
+                "Ctrl+S 提交   Esc 退出   范围：文件树上用 Space 勾",
             ),
             Mode::Diff => {
                 let what = match self.diff.as_ref().map(|p| p.kind()) {
@@ -2553,7 +2675,7 @@ impl App {
                 };
                 (what, "↑↓ 滚动   H/L 左右   < > 翻页   0 回最左   Esc 返回")
             }
-            Mode::Log => (" 历史 ", "↑↓ 选版本   / 搜索   Esc 返回"),
+            Mode::Log => (" 历史 ", "↑↓ 选版本   R 回退到此版本   / 搜索   Esc 返回"),
             // 必须和确认面板内部的 Y/N 一致。
             // 之前这里写"Enter 确认 Esc 取消"，跟面板里的"Y/N"是两套说法，
             // 用户按 Esc 以为能退出，实际被送回上一层 —— 两边矛盾最害人。

@@ -236,7 +236,7 @@ impl LogPanel {
             .borders(Borders::ALL)
             .title(title)
             .title_bottom(
-                Line::from(" j/k 移动 | / 搜索全部历史 | N 加载更早 | Esc 返回 ")
+                Line::from(" j/k 移动 | R 回退到此版本 | / 搜索全部历史 | N 加载更早 | Esc 返回 ")
                     .alignment(Alignment::Right),
             )
             .border_style(theme::Theme::border_active());

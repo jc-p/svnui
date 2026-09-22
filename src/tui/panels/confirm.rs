@@ -46,6 +46,9 @@ pub enum ConfirmAction {
     Resolve(std::path::PathBuf, crate::tui::panels::conflict::Strategy),
     /// svn delete：从版本控制删除。第二参数为 `keep_local`。
     Delete(Vec<std::path::PathBuf>, bool),
+    /// 反向合并回到指定版本（历史面板里按 R）。
+    /// 带版本号是为了确认框里能写清楚"要回到哪一版"。
+    RevertToRev(u64),
 }
 
 /// 确认面板。
@@ -180,6 +183,7 @@ impl ConfirmPanel {
             ConfirmAction::Delete(_, _) => "删除（本地文件一并删除）",
             ConfirmAction::Update => "继续更新",
             ConfirmAction::Resolve(_, _) => "应用该方案",
+            ConfirmAction::RevertToRev(_) => "回退（需再提交一次）",
         };
         let keys = Line::from(vec![
             Span::styled(" Y ", Style::default().fg(accent).add_modifier(Modifier::BOLD)),

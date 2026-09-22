@@ -555,6 +555,32 @@ impl Svn {
         super::command::run_with_stdin(&self.exe, &args, &self.root, message, &self.opts(true))
     }
 
+    /// 反向合并：`svn merge -r HEAD:{rev} .`
+    ///
+    /// 把 HEAD 到 `rev` 之间的差异**反向**应用到工作副本，
+    /// 等价于"回到 `rev` 那一刻"；`rev` 之后的提交从工作副本里被撤销
+    /// （仓库里那些提交还在，只是本地不再包含）。
+    ///
+    /// ⚠️ 执行完**还要再提交一次**才会真正写进仓库。
+    /// ⚠️ 固定 `--accept postpone`：冲突不自动解决，留给 resolve 面板。
+    ///
+    /// `dry_run = true` 时只输出"会动哪些文件"而不落盘。
+    /// （`svn revert` 没有 `--dry-run`，merge 有 —— 这是回退走 merge 的原因之一。）
+    pub fn merge_to(&self, rev: u64, dry_run: bool) -> Result<RawOutput> {
+        let mut args: Vec<String> = vec![
+            "merge".to_string(),
+            "--accept".to_string(),
+            "postpone".to_string(),
+        ];
+        if dry_run {
+            args.push("--dry-run".to_string());
+        }
+        args.push("-r".to_string());
+        args.push(format!("HEAD:{rev}"));
+        args.push(".".to_string());
+        self.op_no_targets(&args)
+    }
+
     /// `svn update`。默认 `--accept postpone` —— 不自动合并，把决定权留给人。
     ///
     /// 这是刻意的：自动合并（如 `theirs-full`）可能静默吃掉本地改动。
