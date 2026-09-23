@@ -31,6 +31,12 @@ tui = ["dep:ratatui", "dep:crossterm", "dep:tui-textarea"]
 docs = ["dep:csv", "dep:calamine", "dep:docx-lite"]
 
 [dependencies]
+# ── 配置与 LLM（提交信息生成）───────────────────────────
+# ureq 用同步 HTTP：请求是在后台线程发的，不需要 async runtime，
+# 也就不用把 tokio 拖进来（项目里 daemon 同样是 std 线程 + Mutex）。
+ureq = { version = "2", features = ["json"] }
+# 解析 ~/.config/svnui/config.toml
+toml = "0.8"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

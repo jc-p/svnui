@@ -33,6 +33,8 @@ use ratatui::{
 };
 use tui_textarea::TextArea;
 
+use super::commit_gen::{self, Change};
+
 use crate::tui::theme;
 
 /// 提交面板。
@@ -48,19 +50,27 @@ pub struct CommitPanel {
     hint: Option<String>,
     /// 文件列表滚动（文件多时）。
     scroll: usize,
+    /// 本次改动（相对路径 + 状态符号），`Ctrl+G` 生成提交信息的输入。
+    changes: Vec<Change>,
+    /// 后台生成的候选（`Ctrl+G`）。空则用本地规则现算。
+    cands: Vec<String>,
+    /// 上次生成的候选（下标 + 文本）。`Some` 表示框里现在是生成出来的内容。
+    gen: Option<(usize, String)>,
+    /// 底部提示（绿色，非错误）。生成反馈走这里，红色留给真错误。
+    notice: Option<String>,
 }
 
 impl CommitPanel {
     /// `files` 是要提交的文件显示名（已美化过的路径）。
     /// `draft` 是上次退出时存下的内容，有的话直接填进去。
-    pub fn new(files: Vec<String>, draft: Option<String>) -> Self {
+    pub fn new(files: Vec<String>, draft: Option<String>, changes: Vec<Change>) -> Self {
         let mut textarea = TextArea::default();
         textarea.set_block(
             Block::default()
                 .borders(Borders::ALL)
                 .title(" 提交信息 "),
         );
-        textarea.set_placeholder_text("写点什么说明这次改动。Ctrl+S 提交");
+        textarea.set_placeholder_text("写点什么说明这次改动（Ctrl+G 生成、Ctrl+S 提交）");
 
         // 恢复草稿：按 Enter 前按过 Esc 的话，内容不该丢。
         // 只有真的有非空白内容才填 —— 空串会让 placeholder 消失，
@@ -80,6 +90,10 @@ impl CommitPanel {
             files,
             textarea,
             hint: None,
+            changes,
+            cands: Vec::new(),
+            gen: None,
+            notice: None,
             scroll: 0,
         }
     }
@@ -128,6 +142,86 @@ impl CommitPanel {
     /// 继续挂着会让用户以为刚粘进去的内容没生效。
     pub fn clear_hint(&mut self) {
         self.hint = None;
+        // 只清提示，不清 gen：移动光标也算"编辑"，但内容没变，
+        // 这时再按 Ctrl+G 应该继续轮换，而不是叫人先清空。
+        // 真改动了内容也没关系 —— next_suggestion 里比对文本即可识别。
+        self.notice = None;
+    }
+
+    pub fn set_notice(&mut self, notice: impl Into<String>) {
+        self.notice = Some(notice.into());
+    }
+
+    /// 是否已有外部候选（后台生成的结果）。
+    pub fn has_candidates(&self) -> bool {
+        !self.cands.is_empty()
+    }
+
+    /// 填入后台生成的候选。
+    ///
+    /// 约定：模型候选在前、规则候选在后。这样模型失败时继续按
+    /// `Ctrl+G` 还能轮换到规则版本。
+    pub fn set_candidates(&mut self, cands: Vec<String>) {
+        self.cands = cands;
+    }
+
+    /// 生成 / 轮换提交信息（`Ctrl+G`）。返回给底部显示的一句反馈。
+    ///
+    /// ## 只在两种情况下动文本
+    ///
+    /// - 提交框是空的
+    /// - 当前内容**就是**上次生成的那条（用户没手动改过）
+    ///
+    /// 手填过的内容一律不覆盖 —— 生成的是"起点"，
+    /// 把别人写了一半的东西顶掉是最招人烦的行为。
+    /// 想重新生成自己清空，比偷偷覆盖好判断。
+    pub fn next_suggestion(&mut self) -> String {
+        if self.changes.is_empty() {
+            return "没有可分析的改动".to_string();
+        }
+        let cands = if self.cands.is_empty() {
+            commit_gen::suggest(&self.changes)
+        } else {
+            self.cands.clone()
+        };
+        let cur = self.textarea.lines().join("\n").trim().to_string();
+        let idx = match &self.gen {
+            Some((i, last)) if cur == *last => (*i + 1) % cands.len(),
+            Some(_) => {
+                return "内容已改过，清空后再按 Ctrl+G 可重新生成".to_string();
+            }
+            None if cur.is_empty() => 0,
+            None => {
+                return "已有内容，清空后再按 Ctrl+G 可重新生成".to_string();
+            }
+        };
+        let text = cands[idx].clone();
+        self.textarea = Self::build_editor(&text);
+        self.gen = Some((idx, text));
+        self.hint = None;
+        format!("已生成 {}/{}，再按 Ctrl+G 换下一个", idx + 1, cands.len())
+    }
+
+    /// 按给定文本重建编辑器。
+    ///
+    /// 为什么整体重建而不是就地改：TextArea 没有公开的"全选替换"，
+    /// 靠模拟按键去删既绕又容易删不干净。这里用的都是 `new()` 里
+    /// 已经在用的 API，行为可预期。
+    fn build_editor(text: &str) -> TextArea<'static> {
+        let mut ta = TextArea::default();
+        ta.set_block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" 提交信息 "),
+        );
+        ta.set_placeholder_text("写点什么说明这次改动（Ctrl+G 生成、Ctrl+S 提交）");
+        for (i, line) in text.lines().enumerate() {
+            if i > 0 {
+                ta.insert_newline();
+            }
+            ta.insert_str(line);
+        }
+        ta
     }
 
     pub fn scroll_down(&mut self) {
@@ -213,12 +307,20 @@ impl CommitPanel {
                 format!(" {}", h),
                 Style::default().fg(ratatui::style::Color::LightRed),
             )),
-            None => Line::from(vec![
-                Span::styled(" Ctrl+S ", theme::Theme::title()),
-                Span::styled("提交    ", theme::Theme::dim()),
-                Span::styled("Esc ", theme::Theme::title()),
-                Span::styled("退出", theme::Theme::dim()),
-            ]),
+            None => match &self.notice {
+                Some(n) => Line::from(Span::styled(
+                    format!(" {}", n),
+                    Style::default().fg(ratatui::style::Color::LightGreen),
+                )),
+                None => Line::from(vec![
+                    Span::styled(" Ctrl+S ", theme::Theme::title()),
+                    Span::styled("提交    ", theme::Theme::dim()),
+                    Span::styled(" Ctrl+G ", theme::Theme::title()),
+                    Span::styled("生成    ", theme::Theme::dim()),
+                    Span::styled(" Esc ", theme::Theme::title()),
+                    Span::styled("退出", theme::Theme::dim()),
+                ]),
+            },
         };
         f.render_widget(Paragraph::new(line), chunks[2]);
     }

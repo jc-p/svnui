@@ -207,6 +207,19 @@ impl TreePanel {
             .collect()
     }
 
+    /// 勾选项的「相对路径 + 状态符号」，供提交信息生成（`Ctrl+G`）用。
+    ///
+    /// 与 `checked_abs` 同序（都按 `visible` 走）—— 清单和待提交路径
+    /// 顺序一致，对照着看不会错位。
+    pub fn checked_changes(&self) -> Vec<(String, char)> {
+        self.visible
+            .iter()
+            .filter(|r| self.checked.contains(*r))
+            .filter(|r| self.is_checkable(r))
+            .filter_map(|r| self.nodes.get(r).map(|n| (n.rel.clone(), n.sign)))
+            .collect()
+    }
+
     /// 清掉已经不可提交的勾选（revert / commit 之后状态会变）。
     ///
     /// 不清的话会留下"看不见但还在"的幽灵勾选：

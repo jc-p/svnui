@@ -145,6 +145,21 @@ pub fn commit(
     }
 
     let msg = message.unwrap_or("(svnui: 无提交信息)");
+
+    // 缺失项（!）必须先 svn rm 调度删除：svn commit 对 missing 节点是**静默跳过**的，
+    // 不先调度就会出现"提示已提交、仓库没变"（改名/删除后提交无效的根因）。
+    let missing: Vec<PathBuf> = svn
+        .changed(&Default::default())?
+        .into_iter()
+        .filter(|e| e.text == crate::domain::StatusKind::Missing)
+        .filter(|e| effective.iter().any(|s| s == e.path.as_str()))
+        .map(|e| PathBuf::from(e.path.as_str()))
+        .collect();
+    if !missing.is_empty() {
+        // keep_local：本地文件本就不存在，无从删起，只调度版本库的删除。
+        svn.remove(&missing, true)?;
+    }
+
     let out = svn.commit(msg, paths)?;
     crate::cache::invalidate_for(&svn.root);
 
@@ -157,7 +172,28 @@ pub fn commit(
         .map(|s| s.trim_end_matches('.'))
         .unwrap_or("?");
 
-    Ok(format!("已提交 {} 项，revision {rev}", effective.len()))
+    // 实际提交数以 svn 输出为准（Sending/Adding/Deleting/Replacing 一行一个文件）。
+    // 用勾选数会"报喜不报忧" —— 勾选了不代表 svn 真的提交了。
+    let actual = out
+        .stdout
+        .lines()
+        .filter(|l| {
+            let t = l.trim_start();
+            t.starts_with("Sending")
+                || t.starts_with("Adding")
+                || t.starts_with("Deleting")
+                || t.starts_with("Replacing")
+        })
+        .count();
+
+    if rev == "?" && actual == 0 {
+        return Ok(format!(
+            "⚠️ svn 没有产生新的 revision：勾选 {n} 项，实际提交 0 项。\n\
+             若含缺失文件（!），请确认已纳入 svn rm；未版本化的新文件需先 svn add。",
+            n = effective.len()
+        ));
+    }
+    Ok(format!("已提交 {actual} 项，revision {rev}"))
 }
 
 pub fn update(

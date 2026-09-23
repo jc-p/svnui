@@ -39,6 +39,7 @@ use crate::svn::{StatusOpts, Svn};
 use crate::tui::panels::checkout::CheckoutPanel;
 use crate::tui::panels::loading;
 use crate::tui::panels::commit::CommitPanel;
+use crate::tui::panels::commit_gen::Change;
 use crate::tui::panels::preview::{read_file, BarHit, Kind as PreviewKind, PreviewPanel};
 use crate::tui::panels::help::HelpPanel;
 use crate::tui::panels::log::LogPanel;
@@ -146,6 +147,11 @@ enum BgDone {
     CheckoutProgress(usize, String),
     /// 检出完成，带结果消息。
     Checkout(crate::domain::Result<String>),
+    /// 提交信息候选项（模型候选在前，规则候选在后）。
+    ///
+    /// 规则候选一起带回来是为了兜底：模型没配、超时、返回怪东西时，
+    /// 按 Ctrl+G 还能轮换到规则给的版本，不会变成"按了没反应"。
+    CommitSug(Vec<String>),
     /// revert 干跑结果：将被还原的文件（相对路径）。
     RevertDry(Vec<String>),
     /// 回退干跑：(目标版本, 当前 HEAD, 将被撤销的提交摘要, 受影响文件)。
@@ -272,7 +278,7 @@ impl App {
             // 默认关闭：开启后终端不再处理鼠标，选中文本复制会失效，
             // 而且鼠标移动会持续产生事件、把键盘事件挤到队列后面（表现为"敲键没反应"）。
             // 需要拖拽滚动条时按 M 打开。
-            mouse_on: false,
+            mouse_on: crate::config::Config::load().ui.mouse,
             mouse_pending: None,
             drag: None,
             searching: None,
@@ -992,6 +998,18 @@ impl App {
                         p.set_detail(rev, lines);
                     }
                 }
+                BgDone::CommitSug(cands) => {
+                    self.busy = None;
+                    if let Some(panel) = self.commit.as_mut() {
+                        if cands.is_empty() {
+                            panel.set_notice("没能生成候选".to_string());
+                        } else {
+                            panel.set_candidates(cands);
+                            let msg = panel.next_suggestion();
+                            panel.set_notice(msg);
+                        }
+                    }
+                }
                 BgDone::RepoList(url, res) => {
                     self.busy = None;
                     if let Some(p) = self.repo.as_mut() {
@@ -1349,6 +1367,50 @@ impl App {
 
         if wants_commit {
             return self.do_commit();
+        }
+
+        // Ctrl+G：生成提交信息。
+        //
+        // 走后台线程，因为可能要联网问模型 —— 在主线程发请求会冻住界面。
+        // 规则候选始终一并算出来兜底：模型没配 / 超时 / 返回怪东西，都还有得用。
+        if matches!(
+            (key.code, key.modifiers),
+            (KeyCode::Char('g'), KeyModifiers::CONTROL)
+        ) {
+            // 先在 mut 借 commit 之前收清单，否则借用冲突。
+            let changes: Vec<Change> = self
+                .tree
+                .checked_changes()
+                .into_iter()
+                .map(|(rel, sign)| Change::new(rel, sign))
+                .collect();
+
+            if let Some(panel) = self.commit.as_mut() {
+                // 已有候选就就地轮换，不重复联网。
+                if panel.has_candidates() {
+                    let msg = panel.next_suggestion();
+                    panel.set_notice(msg);
+                    return Ok(());
+                }
+                if self.busy.is_some() {
+                    panel.set_notice("正在生成，请稍候".to_string());
+                    return Ok(());
+                }
+
+                let tx = self.tx.clone();
+                self.busy = Some("生成提交信息".to_string());
+                std::thread::spawn(move || {
+                    let cfg = crate::config::Config::load();
+                    let items: Vec<(String, char)> = changes
+                        .iter()
+                        .map(|c| (c.rel.clone(), c.sign))
+                        .collect();
+                    let mut out = crate::llm::suggest(&items, None, &cfg.llm).unwrap_or_default();
+                    out.extend(crate::tui::panels::commit_gen::suggest(&changes));
+                    let _ = tx.send(BgDone::CommitSug(out));
+                });
+            }
+            return Ok(());
         }
 
         // Esc：直接退出，**不弹二次确认**。
@@ -1934,10 +1996,19 @@ impl App {
             .map(|p| pretty_path(&p.to_string_lossy(), &self.root, 70))
             .collect();
 
+        // 提交信息生成用的改动清单（相对路径 + 状态符号）。
+        // 和 paths 同序（都按 visible 走），清单对得上。
+        let changes: Vec<Change> = self
+            .tree
+            .checked_changes()
+            .into_iter()
+            .map(|(rel, sign)| Change::new(rel, sign))
+            .collect();
+
         // 草稿在这里生效：上次按 Esc 退出时存的内容自动回来。
         // 用 take() 而不是 clone —— 恢复之后草稿就归提交框管了，
         // 留一份副本会在"提交成功"和"再次 Esc"之间产生两份不一致的状态。
-        self.commit = Some(CommitPanel::new(files, self.commit_draft.take()));
+        self.commit = Some(CommitPanel::new(files, self.commit_draft.take(), changes));
         self.commit_paths = paths;
         self.mode = Mode::Commit;
     }
@@ -2370,6 +2441,23 @@ impl App {
         self.commit_inflight = true;
 
         self.spawn_busy("svn commit", move |svn| {
+            // 缺失项（!）svn commit 会静默跳过 —— 先 svn rm 调度删除，
+            // 否则表现为"提示已提交、仓库没变"。
+            let selected: Vec<String> = paths
+                .iter()
+                .map(|p| p.to_string_lossy().to_string())
+                .collect();
+            let missing: Vec<std::path::PathBuf> = svn
+                .changed(&Default::default())?
+                .into_iter()
+                .filter(|e| e.text == crate::domain::StatusKind::Missing)
+                .filter(|e| selected.iter().any(|s| s == e.path.as_str()))
+                .map(|e| std::path::PathBuf::from(e.path.as_str()))
+                .collect();
+            if !missing.is_empty() {
+                svn.remove(&missing, true)?;
+            }
+
             let out = svn.commit(&msg, &paths)?;
             let tail = out
                 .stdout
@@ -2378,7 +2466,27 @@ impl App {
                 .unwrap_or("完成")
                 .trim()
                 .to_string();
-            Ok(format!("已提交 {} 项 — {}", n, tail))
+
+            // 实际提交数以 svn 输出为准，不用勾选数 —— 勾选了不代表真提交了。
+            let actual = out
+                .stdout
+                .lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    t.starts_with("Sending")
+                        || t.starts_with("Adding")
+                        || t.starts_with("Deleting")
+                        || t.starts_with("Replacing")
+                })
+                .count();
+
+            if actual == 0 {
+                return Ok(format!(
+                    "⚠️ 勾选 {n} 项，但 svn 实际提交了 0 项（{tail}）。\n\
+                     缺失文件（!）需先 svn rm；未版本化的新文件需先 svn add。"
+                ));
+            }
+            Ok(format!("已提交 {actual} 项 — {tail}"))
         });
     }
 

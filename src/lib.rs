@@ -14,6 +14,8 @@
 //! 3. `output` 负责所有格式化，其他模块不关心终端。
 
 pub mod cache;
+pub mod config;
+pub mod llm;
 pub mod cli;
 pub mod daemon;
 pub mod domain;
