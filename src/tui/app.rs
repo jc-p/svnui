@@ -726,6 +726,9 @@ impl App {
                     self.tree.prune_checked();
                     self.busy = None;
                     self.notice = Some(format!("已刷新：{} 项变更", n));
+                    // 顶栏的 @rNNN 只在启动时读过一次，提交/更新后不重读
+                    // 就会一直停在启动那一刻的版本号。
+                    self.load_title();
                     self.spawn_preview();
                 }
                 BgDone::Status(Err(e)) => {
@@ -742,6 +745,11 @@ impl App {
                         self.commit_draft = None;
                         self.commit_paths.clear();
                         self.tree.clear_check();
+                    }
+                    // 提交完历史里要能立刻看到这一版：svn log 默认从工作副本
+                    // revision 往回列，混合 revision 下会漏掉刚提交的条目。
+                    if self.mode == Mode::Log {
+                        self.spawn_log_load(None, Self::LOG_PAGE, false);
                     }
                     self.notice = Some(msg);
                     self.spawn_reload();

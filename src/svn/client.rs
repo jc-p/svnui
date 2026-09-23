@@ -396,7 +396,11 @@ impl Svn {
     ) -> Result<Vec<LogEntry>> {
         let owned = self.guard_paths(paths)?;
         let lim = limit.to_string();
-        let mut args: Vec<&str> = vec!["log", "--xml", "-l", &lim];
+        // 必须显式给 `-r`：不写时 svn 从「工作副本 revision」往回列，
+        // 而刚提交过的工作副本是混合 revision（提交过的文件是新号、
+        // 其余还是旧号），svn 取**最小的那个**当起点 —— 刚提交的条目
+        // 就不在列表里，表现是"提交完了看历史还是旧的"。
+        let mut args: Vec<&str> = vec!["log", "--xml", "-r", "HEAD:0", "-l", &lim];
         if let Some(kw) = search.filter(|s| !s.trim().is_empty()) {
             args.push("--search");
             args.push(kw);

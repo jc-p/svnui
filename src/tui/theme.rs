@@ -31,9 +31,12 @@ impl Theme {
         Style::default().fg(Color::Red)
     }
 
-    /// `C` / `T` 冲突 —— 红底加粗，这是唯一需要立刻处理的。
+    /// `C` / `T` 冲突 —— 红字加粗，这是唯一需要立刻处理的。
+    ///
+    /// 不铺红底：底色会把整行（连同选中态）一起盖掉，深色主题下
+    /// 连续几行红块时既读不出字、也看不出光标停在哪一行。
     pub fn conflicted() -> Style {
-        Style::default().fg(Color::White).bg(Color::Red).add_modifier(Modifier::BOLD)
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
     }
 
     /// `R` 替换、`~` 阻碍等 —— 品红，表示"结构变了"。
