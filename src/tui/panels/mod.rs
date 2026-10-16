@@ -11,6 +11,7 @@ pub mod conflict;
 #[cfg(feature = "docs")]
 pub mod document;
 pub mod help;
+pub mod file_preview;
 pub mod loading;
 pub mod log;
 pub mod preview;

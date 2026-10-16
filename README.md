@@ -243,10 +243,24 @@ export SVNR_TRUST_CERT=1          # 写进 ~/.zshrc 永久生效
 
 | 键 | 作用 |
 |---|---|
-| `J` / `K` | 上下滚一行 |
-| `Ctrl+d` / `Ctrl+u` | 翻页 |
-| `Shift+←` `Shift+→` | 横向滚动 |
-| `<` / `>` | 横向滚动 |
+| `Tab` / `Shift+Tab` | 在文件树与预览之间切换焦点，高亮边框标识当前面板 |
+| `↑` / `↓` 或 `k` / `j` | 预览激活后逐行滚动，文件树选中项保持不变 |
+| `PageUp` / `PageDown` 或 `Ctrl+u` / `Ctrl+d` | 预览激活后按可见高度翻页 |
+| `Home` / `End` 或 `g` / `G` | 预览激活后跳到顶部 / 底部 |
+| `←` / `→` | 横向慢移；预览激活后也可用 `h` / `l` |
+| `<` / `>` | 横向翻页 |
+| `0` | 回到最左 |
+| `Esc` | 预览激活时返回文件树，保留过滤与滚动位置 |
+| `J` / `K` | 文件树焦点下直接滚动预览（兼容原快捷键） |
+| `o` | 用系统默认应用打开当前文件（图片全屏内也可用） |
+
+预览激活后只处理阅读按键；添加、撤销和提交等文件操作需先返回文件树。窗口过小时预览隐藏，焦点自动返回文件树，仍可按 `Enter` 全屏查看文件。
+
+支持文本、代码、CSV/TSV、Excel、Word（`.docx`）以及 PNG、JPEG、WebP、GIF、BMP、ICO 图片。GIF 显示静态首帧，SVG 按源码预览。图片按比例适应窗口，文件树或预览焦点下按 `Enter` 都可全屏查看；终端支持时使用图片协议，否则使用字符色块预览。
+
+Ghostty/Kitty 使用 Kitty 图片协议，iTerm2/WezTerm/Rio 使用 iTerm2 图片协议；其他终端及 tmux/screen 使用兼容色块。根据终端标识选择协议，不读取键盘输入进行能力探测。
+
+压缩包及超过 **2 MiB** 的文件默认关闭内容预览，只显示原因和大小；图片、办公文档也遵守此上限。图片额外限制解码内存为 64 MiB、单边尺寸为 8192 像素。文本最多显示 5000 行。
 
 ### 日志界面
 
@@ -340,10 +354,12 @@ export SVNR_TRUST_CERT=1          # 写进 ~/.zshrc 永久生效
 
 ## 构建开关
 
+源码构建需要 Rust 1.88 或更新版本。
+
 ```toml
 [features]
 default = ["tui", "docs"]
-tui     = ["dep:ratatui", "dep:crossterm", "dep:tui-textarea"]
+tui     = ["dep:ratatui", "dep:crossterm", "dep:tui-textarea", "dep:ratatui-image", "dep:image"]
 docs    = ["dep:csv", "dep:calamine", "dep:docx-lite"]
 ```
 
@@ -353,8 +369,7 @@ docs    = ["dep:csv", "dep:calamine", "dep:docx-lite"]
 | 只要 CLI（省掉 crossterm 一堆依赖） | `cargo build --release --no-default-features` |
 | 不要办公文档预览 | `cargo build --release --no-default-features --features tui` |
 
-`docs` feature 提供 CSV / Excel / Word 预览。关掉后这类文件会提示"请开启 docs feature"
-而不是显示二进制乱码。
+`docs` feature 提供 CSV/TSV 表格排版和 Excel/Word 内容提取。关掉后 CSV/TSV 按普通文本预览，Excel/Word 提示未启用文档预览。图片支持随 `tui` feature 编译，无需安装额外插件或系统图片工具。
 
 > ratatui 0.30 默认配 crossterm 0.29，不同主版本各自维护事件队列和 raw mode，
 > 所以 `crossterm` 钉在 0.29、`tui-textarea` 用维护分支 `tui-textarea-2` 0.13。

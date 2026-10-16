@@ -34,13 +34,15 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Borders, Clear, Paragraph};
 use ratatui::Frame;
+use crate::tui::image_support::ImageSupport;
 
 use crate::svn::{StatusOpts, Svn};
 use crate::tui::panels::checkout::CheckoutPanel;
 use crate::tui::panels::loading;
 use crate::tui::panels::commit::CommitPanel;
 use crate::tui::panels::commit_gen::Change;
-use crate::tui::panels::preview::{read_file, BarHit, Kind as PreviewKind, PreviewPanel};
+use crate::tui::panels::preview::{BarHit, Kind as PreviewKind, PreviewPanel};
+use crate::tui::panels::file_preview::{self, FileContent};
 use crate::tui::panels::help::HelpPanel;
 use crate::tui::panels::log::LogPanel;
 use crate::tui::panels::confirm::{ConfirmAction, ConfirmPanel, Danger};
@@ -189,6 +191,9 @@ pub struct App {
     preview: Option<PreviewPanel>,
     /// 最近一帧是否展示内嵌预览，避免缩窗后命中旧滚动条坐标。
     preview_visible: bool,
+    /// 内嵌预览取得键盘焦点时，导航键不再移动文件树。
+    preview_focused: bool,
+    image_picker: ImageSupport,
     logpanel: Option<LogPanel>,
     checkout: Option<CheckoutPanel>,
     confirm: Option<ConfirmPanel>,
@@ -260,6 +265,11 @@ pub struct App {
 
 impl App {
     pub fn new(svn: Svn) -> crate::domain::Result<Self> {
+        Self::with_image_picker(svn, ImageSupport::halfblocks())
+    }
+
+    /// 实际终端根据终端标识选择图片协议；非交互调用和测试使用兼容色块。
+    pub(super) fn with_image_picker(svn: Svn, image_picker: ImageSupport) -> crate::domain::Result<Self> {
         let (tx, rx) = channel();
         // ⚠️ 必须在构造 Self 之前取：svn 马上要 move 进去，之后借不到了
         let self_trust = svn.trust_cert;
@@ -276,6 +286,8 @@ impl App {
             diff: None,
             preview: None,
             preview_visible: false,
+            preview_focused: false,
+            image_picker,
             logpanel: None,
             checkout: None,
             confirm: None,
@@ -656,6 +668,8 @@ impl App {
     }
 
     fn spawn_preview(&mut self) {
+        // 目录和空选中也使旧请求失效，避免迟到的图片覆盖当前选择。
+        self.preview_gen += 1;
         let Some(node) = self.tree.selected().cloned() else {
             self.preview = None;
             return;
@@ -674,7 +688,6 @@ impl App {
             return;
         }
 
-        self.preview_gen += 1;
         let gen = self.preview_gen;
         let rel = node.rel.clone();
         let abs = node.abs.clone();
@@ -683,44 +696,30 @@ impl App {
         let name = pretty_path(&node.rel, &self.root, 60);
         let root_str = self.root.to_string_lossy().to_string();
 
-        // 未版本化：没有 BASE 可比，svn diff 必然 E155010。
-        // 直接读文件内容 + 顶部提示，别去惊动 svn。
-        if node.sign == '?' {
-            let tx = self.tx.clone();
-            std::thread::spawn(move || {
-                let panel = match read_file(&abs) {
-                    Ok(c) => PreviewPanel::file_with_banner(
-                        name,
-                        &c,
-                        "未纳管 · 按 a 添加当前项，或 A 批量添加后才有 diff",
-                    ),
-                    Err(e) => PreviewPanel::notice(name, format!("读取失败：{}", e)),
-                };
-                let _ = tx.send(BgDone::Preview(gen, rel, panel));
-            });
-            return;
-        }
-
-        // 干净文件（无状态符号）：直接读内容，别跑 svn diff
-        if node.sign == ' ' || node.sign == '\0' {
-            let tx = self.tx.clone();
-            std::thread::spawn(move || {
-                let panel = match read_file(&abs) {
-                    Ok(c) => PreviewPanel::file(name, &c),
-                    Err(e) => PreviewPanel::notice(name, format!("读取失败：{}", e)),
-                };
-                let _ = tx.send(BgDone::Preview(gen, rel, panel));
-            });
-            return;
-        }
-
-        // 有改动：跑 svn diff
         let svn = self.svn.clone();
         let tx = self.tx.clone();
+        let picker = self.image_picker.clone();
         std::thread::spawn(move || {
-            let panel = match svn.diff(&[abs], None, false) {
-                Ok(out) => PreviewPanel::diff(name, &shorten_paths(&out.stdout, &root_str)),
-                Err(e) => PreviewPanel::notice(name, format!("diff 失败：{}", e)),
+            let content = match file_preview::load(&abs) {
+                // 删除/缺失项没有本地内容，仍允许查看 SVN 的删除 diff。
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound && matches!(node.sign, 'D' | '!') => {
+                    Ok(FileContent::Text(String::new()))
+                }
+                result => result,
+            };
+            let panel = match content {
+                Ok(FileContent::Disabled(reason)) => PreviewPanel::notice(name, reason),
+                Ok(FileContent::Image { pixels, bytes }) => PreviewPanel::image(name, pixels, bytes, &picker),
+                Ok(FileContent::Document(text)) => PreviewPanel::file(name, &text),
+                Ok(FileContent::Text(text)) if node.sign == '?' => PreviewPanel::file_with_banner(
+                    name, &text, "未纳管 · 按 a 添加当前项，或 A 批量添加后才有 diff",
+                ),
+                Ok(FileContent::Text(text)) if matches!(node.sign, ' ' | '\0') => PreviewPanel::file(name, &text),
+                Ok(FileContent::Text(_)) => match svn.diff(&[abs], None, false) {
+                    Ok(out) => PreviewPanel::diff(name, &shorten_paths(&out.stdout, &root_str)),
+                    Err(e) => PreviewPanel::notice(name, format!("diff 失败：{}", e)),
+                },
+                Err(e) => PreviewPanel::notice(name, format!("读取失败：{}", e)),
             };
             let _ = tx.send(BgDone::Preview(gen, rel, panel));
         });
@@ -1241,6 +1240,64 @@ impl App {
     }
 
     fn handle_browse_key(&mut self, key: KeyEvent) -> crate::domain::Result<()> {
+        if key.code == KeyCode::Char('o') {
+            self.request_open();
+            return Ok(());
+        }
+        if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+            if self.preview_focused {
+                self.preview_focused = false;
+            } else if self.preview_visible && self.preview.is_some() {
+                self.preview_focused = true;
+                self.notice = None;
+            } else {
+                self.notice = Some("预览暂不可用；选中文件后按 Enter 全屏查看".into());
+            }
+            return Ok(());
+        }
+        // 焦点内只接受阅读操作，避免翻页或按错键时对左侧文件执行写操作。
+        if self.preview_focused {
+            if key.code == KeyCode::Esc {
+                self.preview_focused = false;
+                return Ok(());
+            }
+            if key.code == KeyCode::Char('q') {
+                self.should_quit = true;
+                return Ok(());
+            }
+            if key.code == KeyCode::Enter {
+                if let Some(panel) = self.preview.take() {
+                    self.diff = Some(panel);
+                    self.mode = Mode::Diff;
+                    self.preview_focused = false;
+                }
+                return Ok(());
+            }
+            if let Some(panel) = self.preview.as_mut() {
+                match key.code {
+                    KeyCode::Down | KeyCode::Char('j' | 'J') => panel.scroll_down(1),
+                    KeyCode::Up | KeyCode::Char('k' | 'K')
+                        if !key.modifiers.contains(KeyModifiers::CONTROL) => panel.scroll_up(1),
+                    KeyCode::PageDown => panel.scroll_down(panel.vertical_page_step()),
+                    KeyCode::PageUp => panel.scroll_up(panel.vertical_page_step()),
+                    KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        panel.scroll_down(panel.vertical_page_step());
+                    }
+                    KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        panel.scroll_up(panel.vertical_page_step());
+                    }
+                    KeyCode::Home | KeyCode::Char('g') => panel.scroll_top(),
+                    KeyCode::End | KeyCode::Char('G') => panel.scroll_down(panel.max_scroll_v()),
+                    KeyCode::Left | KeyCode::Char('h') => panel.scroll_left(2),
+                    KeyCode::Right | KeyCode::Char('l') => panel.scroll_right(2),
+                    KeyCode::Char('<' | ',') => panel.scroll_left(panel.page_step()),
+                    KeyCode::Char('>' | '.') => panel.scroll_right(panel.page_step()),
+                    KeyCode::Char('0') => panel.scroll_home(),
+                    _ => {}
+                }
+            }
+            return Ok(());
+        }
         // 后台工作时仍可浏览和退出；写操作及打开其他后台面板等待当前任务结束。
         let navigation = !key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code,
             KeyCode::Char('q' | 'j' | 'k' | 'J' | 'K' | 'M' | '<' | '>' | ',' | '.' | '0' | ' ')
@@ -1546,8 +1603,10 @@ impl App {
             KeyCode::Esc | KeyCode::Char('q') => {
                 self.diff = None;
                 self.mode = Mode::Browse;
+                self.preview_focused = false;
                 self.spawn_preview();
             }
+            KeyCode::Char('o') if panel.kind() == PreviewKind::Image => self.request_open(),
             KeyCode::Char('j') | KeyCode::Down => panel.scroll_down(1),
             KeyCode::Char('k') | KeyCode::Up => panel.scroll_up(1),
             KeyCode::Char('d') | KeyCode::PageDown => panel.scroll_down(10),
@@ -1997,18 +2056,38 @@ impl App {
 
     /// 请求用外部编辑器打开选中文件。
     fn request_editor(&mut self) {
+        self.request_external(Self::default_editor());
+    }
+
+    /// 复用外部编辑器的终端让出/恢复流程；只在用户明确按 o 时启动默认查看器。
+    fn request_open(&mut self) {
+        if self.busy.is_some() {
+            self.notice = Some("后台任务进行中，请稍候再打开文件".into());
+            return;
+        }
+        let program = if cfg!(target_os = "macos") {
+            "open"
+        } else if cfg!(target_os = "windows") {
+            "explorer"
+        } else {
+            "xdg-open"
+        };
+        self.request_external(program.into());
+    }
+
+    fn request_external(&mut self, program: String) {
         let Some(node) = self.tree.selected().cloned() else {
             return;
         };
         if node.is_dir {
-            self.notice = Some("目录不能用编辑器打开".to_string());
+            self.notice = Some("请先选择要打开的文件".to_string());
             return;
         }
         if !node.abs.exists() {
             self.notice = Some("文件不存在（可能是已删除）".to_string());
             return;
         }
-        self.editor_req = Some((Self::default_editor(), node.abs.clone()));
+        self.editor_req = Some((program, node.abs.clone()));
     }
 
     // ── 动作 ──────────────────────────────────────────────
@@ -2802,7 +2881,9 @@ impl App {
             panel.render(f, centered_rect(80, 85, area));
         }
         if let Some(panel) = self.diff.as_mut() {
-            panel.render(f, centered_rect(92, 92, area));
+            if panel.kind() != PreviewKind::Image || !self.show_help {
+                panel.render(f, centered_rect(92, 92, area));
+            }
         }
         if let Some(panel) = self.logpanel.as_mut() {
             panel.render(f, centered_rect(92, 88, area));
@@ -3046,8 +3127,12 @@ impl App {
 
     fn render_body(&mut self, f: &mut Frame, area: Rect) {
         let (tree_area, preview_area) = body_regions(area);
-        self.tree.render(f, tree_area);
         self.preview_visible = preview_area.is_some();
+        // 缩窗隐藏预览或刷新后没有选中项时，不能把焦点留在不可操作的面板。
+        if !self.preview_visible || self.preview.is_none() {
+            self.preview_focused = false;
+        }
+        self.tree.render(f, tree_area, !self.preview_focused);
         let Some(preview_area) = preview_area else {
             if matches!(self.drag, Some(DragBar::Preview(_))) {
                 self.drag = None;
@@ -3056,15 +3141,18 @@ impl App {
         };
 
         match self.preview.as_mut() {
-            Some(p) => p.render_pane(f, preview_area),
-            None => {
+            Some(p) if p.kind() != PreviewKind::Image
+                || (self.mode == Mode::Browse && !self.show_help && self.searching.is_none()) => {
+                p.render_pane(f, preview_area, self.preview_focused)
+            }
+            _ => {
                 let block = theme::block()
                     .borders(Borders::ALL)
                     .title(" 预览 ")
                     .border_style(theme::Theme::border());
                 f.render_widget(
                     Paragraph::new(Line::from(Span::styled(
-                        " 选中文件查看内容或改动",
+                        if self.preview.is_some() { " 图片预览暂缓，返回后恢复" } else { " 选中文件查看内容或改动" },
                         theme::Theme::dim(),
                     )))
                     .block(block),
@@ -3078,6 +3166,12 @@ impl App {
     fn browse_hint(&self) -> &'static str {
         if self.searching.is_some() {
             return "输入过滤词   Enter 确认   Esc 清空   自动刷新暂缓";
+        }
+        if self.preview_focused {
+            if self.preview.as_ref().is_some_and(|p| p.kind() == PreviewKind::Image) {
+                return "图片 · 自动适应窗口   Enter 全屏   o 系统打开   Tab/Esc 文件树   ? 帮助";
+            }
+            return "预览 · ↑↓/j/k 滚动   PgUp/PgDn 翻页   ←→ 左右   Home/End 首尾   0 最左   Tab/Esc 文件树   ? 帮助";
         }
         if self.busy.is_some() {
             return "后台任务中   ↑↓ 选择   Space 勾选   q 退出   其他操作请稍候";
@@ -3118,6 +3212,9 @@ impl App {
                 "Ctrl+S 提交   Esc 退出   范围：文件树上用 Space 勾",
             ),
             Mode::Diff => {
+                if self.diff.as_ref().is_some_and(|p| p.kind() == PreviewKind::Image) {
+                    return (" 图片 ", "自动适应窗口   o 系统打开   Esc 返回文件树");
+                }
                 let what = match self.diff.as_ref().map(|p| p.kind()) {
                     Some(PreviewKind::File) => " 内容 ",
                     _ => " 改动 ",
@@ -3876,6 +3973,154 @@ mod refresh_tests {
         terminal.draw(|f| app.render(f, f.area())).unwrap();
     }
 
+
+    #[test]
+    #[ignore = "需要 svn + svnadmin；验证纯键盘预览焦点与实际渲染滚动"]
+    fn preview_keyboard_focus_scrolls_rendered_content() {
+        let (_tmp, mut app) = temporary_app();
+        app.tree.load_dir("").unwrap();
+        app.tree.set_mode(TreeMode::All);
+        select_path(&mut app, "a.txt");
+        let content = (0..100).map(|i| format!("marker{i:04}\n")).collect::<String>();
+        app.preview = Some(PreviewPanel::file("a.txt", &content));
+        let selected = app.tree.selected().unwrap().rel.clone();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 20)).unwrap();
+        let draw = |app: &mut App, terminal: &mut ratatui::Terminal<ratatui::backend::TestBackend>| {
+            let frame = terminal.draw(|f| app.render_body(f, f.area())).unwrap();
+            frame.buffer.content.iter().map(|cell| cell.symbol()).collect::<String>()
+        };
+        assert!(draw(&mut app, &mut terminal).contains("marker0000"));
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)).unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)).unwrap();
+        let text = draw(&mut app, &mut terminal);
+        assert!(!text.contains("marker0000"), "激活预览后 Down 应滚动右栏");
+        assert!(text.contains("marker0001"));
+        assert_eq!(app.tree.selected().unwrap().rel, selected);
+        assert!(app.preview_focused);
+        // TestBackend 为中文宽字符保留空白占位格。
+        assert!(text.replace(' ', "").contains("预览操作"));
+
+        app.busy = Some("svn status".into());
+        app.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)).unwrap();
+        let text = draw(&mut app, &mut terminal);
+        assert!(!text.contains("marker0001"));
+        assert!(text.contains("marker0018"));
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)).unwrap();
+        assert!(draw(&mut app, &mut terminal).contains("marker0001"));
+        app.busy = None;
+        app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE)).unwrap();
+        assert!(draw(&mut app, &mut terminal).contains("marker0099"));
+        app.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)).unwrap();
+        assert!(draw(&mut app, &mut terminal).contains("marker0000"));
+        // 焦点内的文件操作键不会作用到左侧选中项。
+        for code in [KeyCode::Char('r'), KeyCode::Char('a'), KeyCode::Char('C'), KeyCode::Char(' ')] {
+            app.handle_key(KeyEvent::new(code, KeyModifiers::NONE)).unwrap();
+            assert_eq!(app.mode, Mode::Browse);
+            assert_eq!(app.tree.checked_count(), 0);
+            assert!(app.busy.is_none());
+        }
+        app.tree.set_filter(Some("a.txt".into()));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+        assert!(!app.preview_focused);
+        assert!(app.tree.filter().is_some());
+        assert!(!app.should_quit());
+        app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)).unwrap();
+        assert!(app.preview_focused);
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)).unwrap();
+        assert!(!app.preview_focused);
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)).unwrap();
+        let mut narrow =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(30, 20)).unwrap();
+        draw(&mut app, &mut narrow);
+        assert!(!app.preview_focused);
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)).unwrap();
+        assert!(!app.preview_focused);
+        draw(&mut app, &mut terminal);
+        app.preview = None;
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)).unwrap();
+        assert!(!app.preview_focused);
+
+        app.preview = Some(PreviewPanel::file("long.txt", &format!("left-anchor{}right-anchor", "x".repeat(160))));
+        assert!(draw(&mut app, &mut terminal).contains("left-anchor"));
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)).unwrap();
+        for _ in 0..3 {
+            app.handle_key(KeyEvent::new(KeyCode::Char('>'), KeyModifiers::NONE)).unwrap();
+        }
+        let text = draw(&mut app, &mut terminal);
+        assert!(text.contains("right-anchor"));
+        assert!(!text.contains("left-anchor"));
+        app.handle_key(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::NONE)).unwrap();
+        let text = draw(&mut app, &mut terminal);
+        assert!(text.contains("left-anchor"));
+        assert!(!text.contains("right-anchor"));
+    }
+
+    #[test]
+    #[ignore = "需要 svn + svnadmin；验证图片、大小限制与归档预览在真实工作副本中的分流"]
+    fn image_preview_and_disabled_files_follow_policy() {
+        let (_tmp, mut app) = temporary_app();
+        let path = app.root.join("picture.png");
+        let pixels = image::RgbImage::from_pixel(64, 32, image::Rgb([210, 40, 70]));
+        pixels.save(&path).unwrap();
+        wait_until(&mut app, |a| a.preview.as_ref().is_some_and(|p| p.kind() == PreviewKind::Image));
+        assert!(!app.preview.as_ref().unwrap().is_empty());
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 24)).unwrap();
+        let frame = terminal.draw(|f| app.render(f, f.area())).unwrap();
+        assert!(frame.buffer.content.iter().any(|cell| matches!(cell.fg, Color::Rgb(..)) || matches!(cell.bg, Color::Rgb(..))), "兼容模式应绘制图片色块");
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)).unwrap();
+        assert!(app.browse_hint().contains("图片"));
+        app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE)).unwrap();
+        let (_, requested_path) = app.take_editor_request().expect("应排队系统打开请求");
+        assert_eq!(requested_path, path);
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)).unwrap();
+        assert_eq!(app.mode, Mode::Diff);
+        assert_eq!(app.diff.as_ref().unwrap().kind(), PreviewKind::Image);
+        assert!(!app.preview_focused);
+        app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE)).unwrap();
+        assert_eq!(app.take_editor_request().unwrap().1, path);
+        terminal.draw(|f| app.render(f, f.area())).unwrap();
+        for (width, height) in [(80, 24), (30, 10), (1, 1)] {
+            let mut resized = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            resized.draw(|f| app.render(f, f.area())).unwrap();
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+        assert!(!app.preview_focused);
+        wait_until(&mut app, |a| a.preview.as_ref().is_some_and(|p| p.kind() == PreviewKind::Image));
+
+        run("svn", &["add", "picture.png"], &app.root);
+        run("svn", &["commit", "--non-interactive", "-m", "image"], &app.root);
+        image::RgbImage::from_pixel(64, 32, image::Rgb([30, 150, 90])).save(&path).unwrap();
+        wait_until(&mut app, |a| a.items.iter().any(|i| i.rel == "picture.png" && i.sign == 'M'));
+        app.preview = None;
+        app.spawn_preview();
+        wait_until(&mut app, |a| a.preview.as_ref().is_some_and(|p| p.kind() == PreviewKind::Image));
+        app.show_help = true;
+        let frame = terminal.draw(|f| app.render(f, f.area())).unwrap();
+        assert!(!frame.buffer.content.iter().any(|cell| matches!(cell.fg, Color::Rgb(..)) || matches!(cell.bg, Color::Rgb(..))), "帮助弹层显示时暂停图片绘制");
+        app.show_help = false;
+
+        std::fs::File::create(app.root.join("large.png")).unwrap().set_len(file_preview::MAX_BYTES + 1).unwrap();
+        std::fs::write(app.root.join("archive.zip"), b"PK\x03\x04archive").unwrap();
+        run("svn", &["add", "large.png", "archive.zip"], &app.root);
+        wait_until(&mut app, |a| a.items.iter().any(|i| i.rel == "archive.zip"));
+        for (rel, reason) in [("large.png", "大文件预览已关闭"), ("archive.zip", "压缩包预览已关闭")] {
+            select_path(&mut app, rel);
+            app.preview = None;
+            app.spawn_preview();
+            wait_until(&mut app, |a| a.preview.as_ref().is_some_and(|p| p.kind() == PreviewKind::Notice));
+            let frame = terminal.draw(|f| app.render(f, f.area())).unwrap();
+            let text = frame.buffer.content.iter().map(|cell| cell.symbol()).collect::<String>().replace(' ', "");
+            assert!(text.contains(reason), "应显示禁用提示：{rel}");
+        }
+        // 取消选中后，即使旧的图片请求迟到也不能重新覆盖预览。
+        let old_gen = app.preview_gen;
+        app.tree.set_filter(Some("no-matching-file".into()));
+        app.spawn_preview();
+        app.tx.send(BgDone::Preview(old_gen, "picture.png".into(), PreviewPanel::image("old", image::DynamicImage::new_rgb8(8, 8), 0, &ImageSupport::halfblocks()))).unwrap();
+        app.tick();
+        assert!(app.preview.is_none());
+    }
 
     fn select_path(app: &mut App, rel: &str) {
         while app.tree.move_up() {}

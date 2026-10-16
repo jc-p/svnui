@@ -1,6 +1,6 @@
 //! 右侧预览面板。
 //!
-//! **按选中项的状态决定显示什么** —— 这是它和单纯 diff 面板的区别：
+//! 先按类型及大小分流：图片独立绘制，压缩包/大文件显示提示；普通文本按状态预览：
 //!
 //! | 选中 | 显示 |
 //! |---|---|
@@ -13,14 +13,15 @@
 //!
 //! 同一类型既用于右栏内嵌（`render_pane`），也用于全屏弹框（`render`）。
 
-use std::path::Path;
-
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
+    style::Style,
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
     Frame,
 };
+use ratatui_image::{protocol::StatefulProtocol, StatefulImage};
+use crate::tui::image_support::ImageSupport;
 
 use crate::tui::theme;
 
@@ -30,6 +31,7 @@ pub enum Kind {
     Diff,
     File,
     Notice,
+    Image,
 }
 
 /// 滚动条命中结果。拖拽滚动条时用。
@@ -49,6 +51,7 @@ pub struct PreviewPanel {
     lines: Vec<Line<'static>>,
     /// 顶部横幅（提示语）。占内容区第一行，**不随滚动移动**。
     banner: Option<String>,
+    image: Option<StatefulProtocol>,
     scroll: u16,
     /// 横向滚动偏移（列）。长行超出右边界时用。
     h_scroll: u16,
@@ -61,11 +64,9 @@ pub struct PreviewPanel {
     vis_w: u16,
     /// 上一次渲染时的可视高度（行）。竖向滚动位置的最大值要用。
     vis_h: u16,
-    /// 上一次渲染时的内容区矩形。
-    ///
-    /// 拖拽滚动条要做命中测试（点在不在条上、点在条的什么位置），
-    /// 而"条画在哪"只有 paint 知道，所以画的时候记一笔。
-    body_area: Rect,
+    /// 滚动条独占的区域；正文不绘制到这些格子里，拖拽也使用同一范围。
+    v_bar_area: Rect,
+    h_bar_area: Rect,
 }
 
 /// 单个预览最多显示多少行。
@@ -118,6 +119,21 @@ impl PreviewPanel {
         )
     }
 
+    /// 解码在后台完成；缩略图限制后续按窗口尺寸编码时的开销。
+    pub(crate) fn image(title: impl Into<String>, pixels: image::DynamicImage, bytes: u64, picker: &ImageSupport) -> Self {
+        let (width, height) = (pixels.width(), pixels.height());
+        let mut panel = Self::with_lines(Kind::Image, title, Vec::new(), Some(format!(
+            "{width} × {height} · {bytes} 字节 · 自动适应窗口"
+        )));
+        let pixels = if width > 1600 || height > 1600 {
+            pixels.thumbnail(1600, 1600)
+        } else {
+            pixels
+        };
+        panel.image = Some(picker.new_resize_protocol(pixels));
+        panel
+    }
+
     /// 同 `notice`，但额外带一条横幅（用于"未版本化，按 A add"这类）。
     pub fn file_with_banner(
         title: impl Into<String>,
@@ -141,11 +157,13 @@ impl PreviewPanel {
             title: title.into(),
             lines,
             banner,
+            image: None,
             scroll: 0,
             h_scroll: 0,
             vis_w: 0,
             vis_h: 0,
-            body_area: Rect::default(),
+            v_bar_area: Rect::default(),
+            h_bar_area: Rect::default(),
         }
     }
 
@@ -154,7 +172,7 @@ impl PreviewPanel {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.lines.is_empty()
+        self.lines.is_empty() && self.image.is_none()
     }
 
     // ── 滚动 ──────────────────────────────────────────────
@@ -194,22 +212,15 @@ impl PreviewPanel {
         std::cmp::max(8, w * 3 / 4)
     }
 
-    /// 最长行的显示宽度。横向滚动条和 clamp 都要用。
-    ///
-    /// 按字符数算而不是字节数 —— 中文一个字占 2 列但 3 字节。
-    /// 这里用 chars().count() 是近似值（中文实际上更宽），
-    /// 但对"能不能往右滚"这个判断足够，且不用引 unicode-width。
-    fn max_line_width(&self) -> usize {
-        self.lines
-            .iter()
-            .map(|l| {
-                l.spans
-                    .iter()
-                    .map(|sp| sp.content.chars().count())
-                    .sum::<usize>()
-            })
-            .max()
-            .unwrap_or(0)
+    /// 纵向翻页保留一行重叠，方便衔接上下文。
+    pub fn vertical_page_step(&self) -> u16 {
+        self.vis_h.saturating_sub(1).max(1)
+    }
+
+    /// 按终端显示列计算宽度，中文等宽字符同样计入横向滚动范围。
+    fn max_line_width(&self) -> u16 {
+        self.lines.iter().map(Line::width).max().unwrap_or(0)
+            .min(u16::MAX as usize) as u16
     }
 
     fn clamp_scroll(&mut self, visible_h: u16) {
@@ -228,35 +239,17 @@ impl PreviewPanel {
 
     /// 横向最大滚动位置（列）。
     fn max_scroll_h(&self) -> u16 {
-        (self.max_line_width() as u16).saturating_sub(self.vis_w)
+        self.max_line_width().saturating_sub(self.vis_w)
     }
 
-    fn has_bar_v(&self) -> bool {
-        self.lines.len() as u16 > self.vis_h
-    }
-
-    fn has_bar_h(&self) -> bool {
-        self.max_line_width() as u16 > self.vis_w
-    }
-
-    /// 坐标是否落在滚动条上。
-    ///
-    /// 竖向条占内容区最右一列，横向条占最底一行。
-    /// 右下角那个格子归竖向 —— 横向条本来就画不到那一列（被竖条占着），
-    /// 先判竖条不会挡住横条的可用区域。
-    ///
-    /// 没画出来的条（内容没超长）即使坐标对得上也不算命中，
-    /// 否则点空白区会被当成拖拽，视图乱跳。
+    /// 只命中独立轨道，右下角空白和正文不参与拖拽。
     pub fn hit_bar(&self, x: u16, y: u16) -> Option<BarHit> {
-        let a = self.body_area;
-        if a.width == 0 || a.height == 0 {
-            return None;
-        }
-        let (x0, y0, x1, y1) = (a.x, a.y, a.x + a.width, a.y + a.height);
-        if self.has_bar_v() && x + 1 == x1 && y >= y0 && y < y1 {
+        let v = self.v_bar_area;
+        if v.width > 0 && x == v.x && y >= v.y && y < v.bottom() {
             return Some(BarHit::Vertical);
         }
-        if self.has_bar_h() && y + 1 == y1 && x >= x0 && x < x1 {
+        let h = self.h_bar_area;
+        if h.height > 0 && y == h.y && x >= h.x && x < h.right() {
             return Some(BarHit::Horizontal);
         }
         None
@@ -267,7 +260,7 @@ impl PreviewPanel {
     /// 按比例映射而不是"移动了多少就滚多少"：
     /// 后者在长文件里拖到底都滚不完，滑块和鼠标会越离越远。
     pub fn drag_v(&mut self, y: u16) {
-        let a = self.body_area;
+        let a = self.v_bar_area;
         let max = self.max_scroll_v();
         if a.height == 0 || max == 0 {
             return;
@@ -279,7 +272,7 @@ impl PreviewPanel {
 
     /// 把横向条上的 x 坐标映射成滚动位置。
     pub fn drag_h(&mut self, x: u16) {
-        let a = self.body_area;
+        let a = self.h_bar_area;
         let max = self.max_scroll_h();
         if a.width == 0 || max == 0 {
             return;
@@ -292,16 +285,18 @@ impl PreviewPanel {
     // ── 渲染 ──────────────────────────────────────────────
 
     /// 内嵌在右栏。
-    pub fn render_pane(&mut self, f: &mut Frame, area: Rect) {
+    pub fn render_pane(&mut self, f: &mut Frame, area: Rect, focused: bool) {
         let label = match self.kind {
             Kind::Diff => "改动",
             Kind::File => "预览",
             Kind::Notice => "信息",
+            Kind::Image => "图片",
         };
         let block = theme::block()
             .borders(Borders::ALL)
             .title(format!(" {} · {} ", label, self.title))
-            .border_style(theme::Theme::border());
+            .title_bottom(if focused { " 预览操作 · Tab/Esc 返回文件树 " } else { " Tab 激活预览 " })
+            .border_style(if focused { theme::Theme::border_active() } else { theme::Theme::border() });
         self.paint(f, area, block);
     }
 
@@ -312,7 +307,9 @@ impl PreviewPanel {
         let block = theme::block()
             .borders(Borders::ALL)
             .title(format!(" {} （Esc 返回）", self.title))
-            .title_bottom(if self.lines.is_empty() {
+            .title_bottom(if self.image.is_some() {
+                Line::from(" 图片 · 自动适应窗口 · Esc 返回 ")
+            } else if self.lines.is_empty() {
                 Line::from(" （无内容）").alignment(Alignment::Center)
             } else {
                 Line::from(format!(
@@ -332,7 +329,7 @@ impl PreviewPanel {
         f.render_widget(block, area);
 
         // 有横幅就把内容区切出一行的位置给它
-        let (body_area, visible_h) = match &self.banner {
+        let body_area = match &self.banner {
             Some(b) if inner.height >= 2 => {
                 let chunks = Layout::default()
                     .direction(Direction::Vertical)
@@ -342,56 +339,176 @@ impl PreviewPanel {
                     Paragraph::new(Line::from(Span::styled(b.as_str(), theme::Theme::props()))),
                     chunks[0],
                 );
-                (chunks[1], chunks[1].height)
+                chunks[1]
             }
-            _ => (inner, inner.height),
+            _ => inner,
         };
 
+        if let Some(image) = self.image.as_mut() {
+            self.v_bar_area = Rect::default();
+            self.h_bar_area = Rect::default();
+            self.vis_w = body_area.width;
+            self.vis_h = body_area.height;
+            self.scroll = 0;
+            self.h_scroll = 0;
+            f.render_stateful_widget(StatefulImage::default(), body_area, image);
+            if let Some(Err(error)) = image.last_encoding_result() {
+                self.image = None;
+                self.kind = Kind::Notice;
+                self.banner = None;
+                self.lines = vec![Line::from(format!("无法绘制图片：{error}"))];
+                f.render_widget(Clear, body_area);
+                f.render_widget(Paragraph::new(self.lines.clone()), body_area);
+            }
+            return;
+        }
+
+        let max_w = self.max_line_width();
+        let mut visible_w = body_area.width;
+        let mut visible_h = body_area.height;
+        let (mut bar_v, mut bar_h) = (false, false);
+        // 任一轨道占位都可能使另一方向溢出；两轮即可稳定布局。
+        // 极小区域至少保留一列/行正文，避免轨道吞掉整个内容区。
+        for _ in 0..2 {
+            bar_v = body_area.width > 1 && self.lines.len() > visible_h as usize;
+            bar_h = body_area.height > 1 && max_w > visible_w;
+            visible_w = body_area.width.saturating_sub(u16::from(bar_v));
+            visible_h = body_area.height.saturating_sub(u16::from(bar_h));
+        }
+        self.vis_w = visible_w;
         self.vis_h = visible_h;
         self.clamp_scroll(visible_h);
-
-        // 横向也要 clamp：内容变短（切到别的文件）后，
-        // 旧的 h_scroll 会让画面停在一片空白上。
-        let max_w = self.max_line_width() as u16;
-        let visible_w = body_area.width.saturating_sub(1); // 留出竖向滚动条的列
-        self.vis_w = visible_w; // 供 page_step() 算横向翻页步长
-        self.body_area = body_area; // 供 hit_bar() 做拖拽命中测试
-        if self.h_scroll > max_w.saturating_sub(visible_w) {
-            self.h_scroll = max_w.saturating_sub(visible_w);
-        }
+        self.h_scroll = self.h_scroll.min(max_w.saturating_sub(visible_w));
+        let content = Rect::new(body_area.x, body_area.y, visible_w, visible_h);
+        self.v_bar_area = if bar_v {
+            Rect::new(content.right(), content.y, 1, visible_h)
+        } else {
+            Rect::default()
+        };
+        self.h_bar_area = if bar_h {
+            Rect::new(content.x, content.bottom(), visible_w, 1)
+        } else {
+            Rect::default()
+        };
 
         f.render_widget(
             Paragraph::new(Text::from(self.lines.clone())).scroll((self.scroll, self.h_scroll)),
-            body_area,
+            content,
         );
 
-        // 竖向滚动条
-        if self.lines.len() as u16 > visible_h {
-            let mut sb = ScrollbarState::new(self.lines.len()).position(self.scroll as usize);
+        // 明确重置背景及文字样式，避免滑块继承新增/删除行的颜色。
+        let thumb = Style::reset().patch(theme::Theme::text());
+        let track = Style::reset().patch(theme::Theme::border());
+        if bar_v {
+            // ScrollbarState 的最后位置是 content_length - 1；这里传可滚动位置数，
+            // 再单独传可视高度，保证正文到底时滑块也贴到轨道末端。
+            let mut state = ScrollbarState::new(self.max_scroll_v() as usize + 1)
+                .viewport_content_length(visible_h as usize)
+                .position(self.scroll as usize);
             f.render_stateful_widget(
-                Scrollbar::new(ScrollbarOrientation::VerticalRight),
-                body_area,
-                &mut sb,
+                Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .thumb_symbol("┃").track_symbol(Some("│"))
+                    .begin_symbol(None).end_symbol(None)
+                    .thumb_style(thumb).track_style(track),
+                self.v_bar_area,
+                &mut state,
             );
         }
-
-        // 横向滚动条：只在真的有内容超宽时出现。
-        //
-        // 用细横线（━）而不是默认实心块（█）：
-        // 默认样式是一条粗色带，压在内容底部很突兀，
-        // 而且会让人误以为那是分隔线或高亮行。
-        // begin/end symbol 设成 None 去掉首尾箭头，进一步收窄。
-        if max_w > visible_w {
-            let mut sb = ScrollbarState::new(max_w as usize).position(self.h_scroll as usize);
+        if bar_h {
+            let mut state = ScrollbarState::new(self.max_scroll_h() as usize + 1)
+                .viewport_content_length(visible_w as usize)
+                .position(self.h_scroll as usize);
             f.render_stateful_widget(
                 Scrollbar::new(ScrollbarOrientation::HorizontalBottom)
-                    .thumb_symbol("━")
-                    .track_symbol(None)
-                    .begin_symbol(None)
-                    .end_symbol(None),
-                body_area,
-                &mut sb,
+                    .thumb_symbol("━").track_symbol(Some("─"))
+                    .begin_symbol(None).end_symbol(None)
+                    .thumb_style(thumb).track_style(track),
+                self.h_bar_area,
+                &mut state,
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod scrollbar_tests {
+    use super::*;
+    use ratatui::{backend::TestBackend, buffer::Buffer, style::Color, Terminal};
+
+    fn draw(panel: &mut PreviewPanel, width: u16, height: u16) -> Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| panel.render_pane(f, f.area(), true)).unwrap().buffer.clone()
+    }
+
+    #[test]
+    fn scrollbars_have_neutral_styles_and_do_not_cover_content() {
+        let raw = (0..20).map(|i| format!("+line{i:02}-{}-tail{i:02}\n", "x".repeat(30))).collect::<String>();
+        let mut panel = PreviewPanel::diff("changes.txt", &raw);
+        let buffer = draw(&mut panel, 24, 10);
+        for y in panel.v_bar_area.y..panel.v_bar_area.bottom() {
+            let cell = &buffer[(panel.v_bar_area.x, y)];
+            assert!(matches!(cell.symbol(), "│" | "┃"));
+            assert!(matches!(cell.fg, Color::Gray | Color::DarkGray));
+            assert_eq!(cell.bg, Color::Reset);
+        }
+        for x in panel.h_bar_area.x..panel.h_bar_area.right() {
+            let cell = &buffer[(x, panel.h_bar_area.y)];
+            assert!(matches!(cell.symbol(), "─" | "━"));
+            assert!(matches!(cell.fg, Color::Gray | Color::DarkGray));
+            assert_eq!(cell.bg, Color::Reset);
+        }
+        assert_eq!(buffer[(1, 1)].symbol(), "+");
+        assert_eq!(buffer[(1, 1)].fg, Color::Green);
+        assert_eq!(buffer[(panel.v_bar_area.x, panel.v_bar_area.y)].symbol(), "┃");
+        assert_eq!(buffer[(panel.h_bar_area.x, panel.h_bar_area.y)].symbol(), "━");
+        let corner = (panel.v_bar_area.x, panel.h_bar_area.y);
+        assert_eq!(buffer[corner].symbol(), " ");
+        assert_eq!(panel.hit_bar(corner.0, corner.1), None);
+
+        panel.scroll_down(u16::MAX);
+        panel.scroll_right(u16::MAX);
+        let buffer = draw(&mut panel, 24, 10);
+        assert_eq!(buffer[(panel.v_bar_area.x, panel.v_bar_area.bottom() - 1)].symbol(), "┃");
+        assert_eq!(buffer[(panel.h_bar_area.right() - 1, panel.h_bar_area.y)].symbol(), "━");
+        let last_row = (1..panel.v_bar_area.x).map(|x| buffer[(x, panel.v_bar_area.bottom() - 1)].symbol()).collect::<String>();
+        assert!(last_row.ends_with("tail19"), "最后一行和长行末尾应完整可见：{last_row}");
+    }
+
+    #[test]
+    fn drag_tracks_reach_both_ends_and_exclude_text() {
+        let mut panel = PreviewPanel::diff("long", &format!("+{}\n", "x".repeat(50)).repeat(30));
+        draw(&mut panel, 24, 10);
+        let (v, h) = (panel.v_bar_area, panel.h_bar_area);
+        assert_eq!(panel.hit_bar(v.x, v.y), Some(BarHit::Vertical));
+        assert_eq!(panel.hit_bar(h.x, h.y), Some(BarHit::Horizontal));
+        assert_eq!(panel.hit_bar(1, 1), None);
+        panel.drag_v(v.bottom() - 1);
+        panel.drag_h(h.right() - 1);
+        assert_eq!(panel.scroll, panel.max_scroll_v());
+        assert_eq!(panel.h_scroll, panel.max_scroll_h());
+        panel.drag_v(v.y);
+        panel.drag_h(h.x);
+        assert_eq!((panel.scroll, panel.h_scroll), (0, 0));
+    }
+
+    #[test]
+    fn gutters_account_for_each_other_and_use_display_width() {
+        let mut fit = PreviewPanel::diff("fit", "+中文");
+        draw(&mut fit, 7, 4);
+        assert_eq!(fit.vis_w, 5);
+        assert_eq!(fit.v_bar_area, Rect::default());
+        assert_eq!(fit.h_bar_area, Rect::default());
+        for (lines, width) in [(4, 11), (5, 10)] {
+            let mut panel = PreviewPanel::diff("edge", &format!("{}\n", "x".repeat(width)).repeat(lines));
+            draw(&mut panel, 12, 6);
+            assert_eq!((panel.vis_w, panel.vis_h), (9, 3));
+            assert_eq!(panel.v_bar_area.height, 3);
+            assert_eq!(panel.h_bar_area.width, 9);
+        }
+        for width in 0..5 {
+            for height in 0..5 {
+                draw(&mut fit, width, height);
+            }
         }
     }
 }
@@ -414,60 +531,12 @@ fn colorize_diff(l: &str) -> Line<'static> {
     Line::from(Span::styled(l.to_string(), style))
 }
 
-/// 单个文件最多读多少字节。超了截断并提示。
-const MAX_BYTES: u64 = 2 * 1024 * 1024;
-
-/// 读文件用于预览。
-///
-/// 三件事必须处理，否则终端会被搞乱：
-/// 1. **二进制** —— 把图片/压缩包打进终端会输出一堆控制字符，
-///    甚至改变终端状态。靠前 8KB 里有没有 NUL 判定。
-/// 2. **超大文件** —— 2MB 以上截断。
-/// 3. **非 UTF-8** —— lossy 转换而不是报错。
-pub fn read_file(path: &Path) -> Result<String, std::io::Error> {
-    use std::io::Read;
-
-    // ── 办公文档：必须在下面的二进制检测之前拦截 ──
-    //
-    // .xlsx/.docx 是 zip 包，前 8KB 里一定有 NUL。如果不先分派给
-    // document::extract，它们会被二进制检测当成"图片/压缩包"直接挡掉。
-    #[cfg(feature = "docs")]
-    {
-        if crate::tui::panels::document::is_document(path) {
-            return match crate::tui::panels::document::extract(path) {
-                Some(text) => Ok(text),
-                // 走到这里说明扩展名对但内容解析不了：文件损坏、
-                // 被 Excel/Word 锁着、或者格式比库支持的更新。
-                None => Ok("（无法解析该文档：文件可能已损坏、正被占用，或格式不受支持）\n\n按 E 用外部程序打开".to_string()),
-            };
-        }
-    }
-
-    let meta = std::fs::metadata(path)?;
-    if !meta.is_file() {
-        return Ok(String::new());
-    }
-
-    if meta.len() > MAX_BYTES {
-        let mut f = std::fs::File::open(path)?;
-        let mut buf = vec![0u8; MAX_BYTES as usize];
-        let n = f.read(&mut buf)?;
-        buf.truncate(n);
-        let text = String::from_utf8_lossy(&buf).to_string();
-        return Ok(format!(
-            "{}\n\n… 文件过大（{} 字节），只显示前 {} 字节",
-            text, meta.len(), MAX_BYTES
-        ));
-    }
-
-    let mut buf = Vec::with_capacity(meta.len() as usize);
-    std::fs::File::open(path)?.read_to_end(&mut buf)?;
-
-    // 二进制检测：前 8KB 里有 NUL 就当二进制
-    let probe_end = buf.len().min(8192);
-    if buf[..probe_end].contains(&0) {
-        return Ok("（二进制文件，不显示内容）".to_string());
-    }
-
-    Ok(String::from_utf8_lossy(&buf).to_string())
+/// 保留文本读取入口；图片内容由图片面板绘制，其他类型遵守相同的大小和归档限制。
+pub fn read_file(path: &std::path::Path) -> std::io::Result<String> {
+    use super::file_preview::{self, FileContent};
+    Ok(match file_preview::load(path)? {
+        FileContent::Text(text) | FileContent::Document(text) => text,
+        FileContent::Disabled(reason) => reason,
+        FileContent::Image { .. } => "图片文件，请使用图片预览面板查看".into(),
+    })
 }

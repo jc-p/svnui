@@ -7,6 +7,7 @@ pub mod app;
 pub mod panels;
 pub mod theme;
 mod refresh;
+mod image_support;
 
 use std::io::{self, Stdout};
 use std::process::Command;
@@ -147,7 +148,7 @@ pub fn run(svn: Svn) -> Result<()> {
         default_hook(info);
     }));
 
-    let mut app = App::new(svn)?;
+    let mut app = App::with_image_picker(svn, image_support::detect())?;
 
     loop {
         // 外部编辑器：必须先让出终端，否则 vim 在 raw mode + alternate screen 里

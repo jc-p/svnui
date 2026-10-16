@@ -692,7 +692,7 @@ impl TreePanel {
 
     // ── 渲染 ──────────────────────────────────────────────
 
-    pub fn render(&mut self, f: &mut Frame, area: ratatui::layout::Rect) {
+    pub fn render(&mut self, f: &mut Frame, area: ratatui::layout::Rect, focused: bool) {
         if self.visible.is_empty() {
             let message = if self.filter.is_some() {
                 "无匹配项，按 / 修改过滤词，Esc 清空过滤"
@@ -703,7 +703,7 @@ impl TreePanel {
             };
             let block = theme::block().borders(Borders::ALL)
                 .title(if self.mode == TreeMode::Changed { " 变更 " } else { " 文件树 " })
-                .border_style(theme::Theme::border_active());
+                .border_style(if focused { theme::Theme::border_active() } else { theme::Theme::border() });
             f.render_widget(Paragraph::new(message).style(theme::Theme::dim()).block(block), area);
             return;
         }
@@ -772,7 +772,7 @@ impl TreePanel {
                 theme::block()
                     .borders(Borders::ALL)
                     .title(title)
-                    .border_style(theme::Theme::border_active()),
+                    .border_style(if focused { theme::Theme::border_active() } else { theme::Theme::border() }),
             )
             .highlight_style(theme::Theme::selected());
 

@@ -2,7 +2,7 @@
 name = "svnui"
 version = "0.4.0"
 edition = "2021"
-rust-version = "1.74"
+rust-version = "1.88"
 description = "Subversion with a real TUI: status, diff, commit, conflicts"
 license = "MIT"
 repository = "https://github.com/jc-p/svnui"
@@ -23,7 +23,7 @@ path = "src/lib.rs"
 # TUI 是主形态，但用 feature 隔离：不要 TUI 的场景（CI、最小化构建）
 # 可以 --no-default-features 关掉，省掉 crossterm 那堆依赖。
 default = ["tui", "docs"]
-tui = ["dep:ratatui", "dep:crossterm", "dep:tui-textarea"]
+tui = ["dep:ratatui", "dep:crossterm", "dep:tui-textarea", "dep:ratatui-image", "dep:image"]
 
 # 办公文档预览（CSV / Excel / Word）。
 # 关掉能省掉 calamine + csv + docx-lite 的编译时间；
@@ -52,6 +52,9 @@ camino = { version = "1", features = ["serde1"] }
 ratatui = { version = "0.30", optional = true }
 crossterm = { version = "0.29", optional = true }
 tui-textarea = { package = "tui-textarea-2", version = "0.13", optional = true }
+# 图片只启用常见格式；不引入 chafa 系统库或全部解码器。
+ratatui-image = { version = "10.0.6", default-features = false, features = ["crossterm"], optional = true }
+image = { version = "0.25.6", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp", "ico"], optional = true }
 
 # ── 办公文档预览（feature = "docs"）─────────────────────────
 # .xlsx/.docx 本质是 zip 包里装 XML，直接读会是二进制乱码，
