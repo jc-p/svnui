@@ -8,7 +8,7 @@ use ratatui::{
     style::{Color, Style},
     text::{Line, Span},
     widgets::{
-        Block, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar,
+        Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar,
         ScrollbarOrientation, ScrollbarState,
     },
     Frame,
@@ -232,7 +232,7 @@ impl LogPanel {
             }
             (None, None) => format!(" 提交历史（{} 条）", self.entries.len()),
         };
-        let list_block = Block::default()
+        let list_block = theme::block()
             .borders(Borders::ALL)
             .title(title)
             .title_bottom(
@@ -261,7 +261,7 @@ impl LogPanel {
         // ── 右：选中版本的详情
         // 搜不到时明确提示，别让人以为界面坏了
         if self.visible.is_empty() {
-            let block = Block::default()
+            let block = theme::block()
                 .borders(Borders::ALL)
                 .title(format!(" 提交历史（搜索：{}）", self.filter.as_deref().unwrap_or("")))
                 .border_style(theme::Theme::border_active());
@@ -336,7 +336,7 @@ impl LogPanel {
             ),
             None => " 详情 ".to_string(),
         };
-        let block = Block::default()
+        let block = theme::block()
             .borders(Borders::ALL)
             .title(title)
             .border_style(theme::Theme::border());

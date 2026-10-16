@@ -5,7 +5,7 @@
 
 use ratatui::{
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Scrollbar, ScrollbarOrientation, ScrollbarState},
+    widgets::{Borders, List, ListItem, ListState, Scrollbar, ScrollbarOrientation, ScrollbarState},
     Frame,
 };
 
@@ -70,7 +70,7 @@ impl StatusPanel {
 
         let list = List::new(list_items)
             .block(
-                Block::default()
+                theme::block()
                     .borders(Borders::ALL)
                     .title(" 变更 ")
                     .border_style(theme::Theme::border_active()),

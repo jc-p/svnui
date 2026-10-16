@@ -4,6 +4,12 @@
 //! 这样在 两种界面 之间来回切换时不会觉得"换了套皮肤"。
 
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::widgets::{Block, BorderType};
+
+/// 所有面板共用圆角边框；标题、颜色和边框范围仍由各面板决定。
+pub fn block<'a>() -> Block<'a> {
+    Block::default().border_type(BorderType::Rounded)
+}
 
 /// 状态语义色。
 ///

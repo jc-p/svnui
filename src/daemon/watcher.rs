@@ -63,6 +63,10 @@ pub fn watch(root: &Path) -> std::io::Result<(notify::RecommendedWatcher, Pendin
     let mut watcher = notify::RecommendedWatcher::new(
         move |res: notify::Result<notify::Event>| {
             if let Ok(ev) = res {
+                // 读取预览和 svn status 的读访问不能再次触发刷新。
+                if matches!(ev.kind, notify::EventKind::Access(_)) {
+                    return;
+                }
                 for path in &ev.paths {
                     if is_wc_db(path) {
                         // 元数据变了 → 需要做一次全量重扫

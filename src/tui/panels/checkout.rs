@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Borders, Clear, Paragraph},
     Frame,
 };
 
@@ -152,7 +152,7 @@ impl CheckoutPanel {
         // 外层再包一个边框：字段框自己有边框，外面这一层把它们收成一张
         // "表单卡片"，跟底下的主界面分开。标题放进 Block 的 title，
         // 比单独占一行省地方，也不会跟字段框的标题混淆层级。
-        let outer = Block::default()
+        let outer = theme::block()
             .borders(Borders::ALL)
             .title(Line::from(Span::styled(
                 " 检出一份工作副本 ",
@@ -189,7 +189,7 @@ impl CheckoutPanel {
                 self.values[i].clone()
             };
 
-            let block = Block::default()
+            let block = theme::block()
                 .borders(Borders::ALL)
                 .title(format!(" {} ", label))
                 .border_style(if active {

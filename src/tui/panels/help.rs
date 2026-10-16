@@ -6,7 +6,7 @@
 use ratatui::{
     layout::{Alignment, Rect},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Borders, Clear, Paragraph},
     Frame,
 };
 
@@ -23,14 +23,15 @@ const GROUPS: &[Group] = &[
         title: "导航",
         keys: &[
             ("↑↓ / j k", "上下移动光标"),
-            ("J / K", "滚动右侧预览（大写：j/k 已被光标占用）"),
-            ("Ctrl+d / Ctrl+u", "右侧预览纵向翻页"),
-            ("拖拽滚动条", "直接拖右侧/底部滚动条（M 键开关鼠标）"),
+            ("J / K", "滚动内嵌预览（大写：j/k 已被光标占用）"),
+            ("Ctrl+d / Ctrl+u", "内嵌预览纵向翻页"),
+            ("拖拽滚动条", "直接拖预览区滚动条（M 键开关鼠标）"),
             ("← / →", "横向慢移（看清长行末尾）"),
             ("< / >", "横向翻页（约 3/4 屏宽）"),
             ("0", "回到最左"),
             ("0", "回到最左（列 0）"),
-            ("Enter / Space", "打开：目录=展开折叠，文件=全屏看内容"),
+            ("Enter", "打开：目录=展开折叠，文件=全屏看内容"),
+            ("Space", "勾选/取消当前可提交文件"),
             ("E", "用外部编辑器打开（$VISUAL / $EDITOR / vim）"),
         ],
     },
@@ -42,7 +43,8 @@ const GROUPS: &[Group] = &[
             ("L", "提交历史（右侧显示每个版本改了什么）"),
             ("H", "工作副本体检：冲突、锁、缺失"),
             ("V", "远端仓库浏览：直接看服务器上的目录树（可复制 URL / 就地检出）"),
-            ("R / F5", "重新扫描（文件在外部被改动时用）"),
+            ("R / F5", "立即扫描并保留位置（空闲主界面也会自动刷新）"),
+            ("Esc", "清空文件过滤；无过滤时退出"),
         ],
     },
     Group {
@@ -56,8 +58,9 @@ const GROUPS: &[Group] = &[
     Group {
         title: "改动",
         keys: &[
-            ("A", "svn add：把未版本化的文件纳入管理"),
-            ("r", "svn revert：先干跑列出影响，二次确认后才执行（小写，别和大写搞混）"),
+            ("a", "添加当前未纳管文件；选中目录时先确认目录内的添加范围"),
+            ("A", "批量添加全部未纳管项（包含过滤外项目，先列出目标确认）"),
+            ("r", "丢弃本地改动：勾选项优先，否则当前文件/目录；先列范围及后果，Y 执行、Enter 取消"),
             ("D", "svn delete：从版本控制删除（目录是递归的）"),
             ("U", "svn update：先查远端更新，有冲突风险会预警"),
             ("X", "冲突解决：三路对比，选一份直接 resolve"),
@@ -67,7 +70,7 @@ const GROUPS: &[Group] = &[
     Group {
         title: "提交",
         keys: &[
-            ("Space", "在文件树上勾选/取消要提交的文件"),
+            ("Space", "在文件树上勾选/取消提交或撤销的文件"),
             ("Ctrl+A", "全选所有可提交的文件"),
             ("Ctrl+R", "清空勾选"),
             ("C", "打开提交面板（只写说明，文件清单在上面）"),
@@ -134,7 +137,7 @@ impl HelpPanel {
             theme::Theme::dim(),
         )));
 
-        let block = Block::default()
+        let block = theme::block()
             .borders(Borders::ALL)
             .title(" 快捷键 ")
             .title_bottom(Line::from(" 按 ? 或 Esc 关闭 ").alignment(Alignment::Right))

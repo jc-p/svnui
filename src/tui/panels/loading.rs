@@ -26,7 +26,7 @@
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Borders, Paragraph},
     Frame,
 };
 
@@ -144,7 +144,7 @@ impl<'a> Loading<'a> {
     /// 给"整屏只剩等待"的场景（比如还没有工作副本、正在拉大仓库）。
     /// `Clear` 不在这里画 —— 调用方才知道底下盖着什么。
     pub fn render(&self, f: &mut Frame, area: Rect) {
-        let block = Block::default()
+        let block = theme::block()
             .borders(Borders::ALL)
             .title(Line::from(Span::styled(
                 format!(" {} ", self.label),

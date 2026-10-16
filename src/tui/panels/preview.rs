@@ -298,7 +298,7 @@ impl PreviewPanel {
             Kind::File => "预览",
             Kind::Notice => "信息",
         };
-        let block = Block::default()
+        let block = theme::block()
             .borders(Borders::ALL)
             .title(format!(" {} · {} ", label, self.title))
             .border_style(theme::Theme::border());
@@ -309,7 +309,7 @@ impl PreviewPanel {
     pub fn render(&mut self, f: &mut Frame, area: Rect) {
         f.render_widget(Clear, area);
 
-        let block = Block::default()
+        let block = theme::block()
             .borders(Borders::ALL)
             .title(format!(" {} （Esc 返回）", self.title))
             .title_bottom(if self.lines.is_empty() {

@@ -6,6 +6,7 @@
 pub mod app;
 pub mod panels;
 pub mod theme;
+mod refresh;
 
 use std::io::{self, Stdout};
 use std::process::Command;

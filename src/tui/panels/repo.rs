@@ -23,7 +23,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar,
+    widgets::{Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar,
               ScrollbarOrientation},
     Frame,
 };
@@ -588,7 +588,7 @@ impl RepoPanel {
 
         let list = List::new(items)
             .block(
-                Block::default()
+                theme::block()
                     .borders(Borders::ALL)
                     .title(title)
                     .border_style(theme::Theme::border_active()),
@@ -675,7 +675,7 @@ impl RepoPanel {
         }
 
         let p = Paragraph::new(lines).block(
-            Block::default()
+            theme::block()
                 .borders(Borders::ALL)
                 .title(" 详情 ")
                 .border_style(theme::Theme::border()),

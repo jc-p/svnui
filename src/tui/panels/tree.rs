@@ -15,7 +15,7 @@ use std::collections::HashMap;
 
 use ratatui::{
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Scrollbar, ScrollbarOrientation},
+    widgets::{Borders, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation},
     Frame,
 };
 
@@ -111,7 +111,7 @@ impl TreePanel {
             // 干净文件：勾了也没用，svn commit 会直接跳过它。
             // 给它一个能勾的框等于骗人 —— 这是这个判断存在的理由。
             ' ' => Some("这个文件没有改动，不需要提交"),
-            '?' => Some("未版本化：先按 A 执行 svn add 才能提交"),
+            '?' => Some("未纳管：先按 a 添加当前项，或 A 批量添加，才能提交"),
             'I' => Some("已忽略的文件（svn:ignore），不会提交"),
             'X' => Some("外部定义（svn:externals），不属于本仓库"),
             _ => Some("这个文件当前没有可提交的状态"),
@@ -255,6 +255,52 @@ impl TreePanel {
     }
 
     // ── 构建 ──────────────────────────────────────────────
+
+    /// 刷新以路径恢复位置，保留折叠、过滤与有效勾选；全量树只重读已加载的目录。
+    pub fn refresh_from_items(&mut self, items: &[Item], root: &std::path::Path) {
+        let selected = self.selected().map(|n| n.rel.clone());
+        let index = self.state.selected();
+        let offset = self.state.offset();
+        let mode = self.mode;
+        let filter = self.filter.clone();
+        let mut dirs: Vec<_> = self
+            .nodes
+            .values()
+            .filter(|n| n.is_dir)
+            .map(|n| (n.rel.clone(), n.expanded, !n.children.is_empty(), n.depth))
+            .collect();
+        dirs.sort_by_key(|d| d.3);
+
+        self.build_from_items(items, root);
+        self.mode = mode;
+        if mode == TreeMode::All {
+            let _ = self.load_dir_raw("");
+            for (rel, expanded, loaded, _) in &dirs {
+                if *expanded || *loaded {
+                    let _ = self.load_dir_raw(rel);
+                }
+            }
+            // 搜索仍沿用原来的深度/节点限额，让新目录中的匹配项也可见。
+            if filter.is_some() {
+                self.ensure_loaded(4, 5000);
+                self.search_loaded = true;
+            }
+        }
+        for (rel, expanded, _, _) in dirs {
+            if let Some(node) = self.nodes.get_mut(&rel) {
+                node.expanded = expanded;
+            }
+        }
+        self.filter = filter;
+        self.rebuild_visible();
+        let restored = selected.and_then(|rel| self.visible.iter().position(|p| p == &rel));
+        self.state.select(restored.or_else(|| {
+            (!self.visible.is_empty()).then(|| index.unwrap_or(0).min(self.visible.len() - 1))
+        }));
+        let row = index.unwrap_or(0).saturating_sub(offset);
+        *self.state.offset_mut() = self.state.selected().unwrap_or(0).saturating_sub(row);
+        self.prune_checked();
+    }
 
     /// 从变更列表建树。
     ///
@@ -647,6 +693,20 @@ impl TreePanel {
     // ── 渲染 ──────────────────────────────────────────────
 
     pub fn render(&mut self, f: &mut Frame, area: ratatui::layout::Rect) {
+        if self.visible.is_empty() {
+            let message = if self.filter.is_some() {
+                "无匹配项，按 / 修改过滤词，Esc 清空过滤"
+            } else if self.mode == TreeMode::Changed {
+                "暂无变更，按 T 查看全部文件，R 重新扫描"
+            } else {
+                "目录为空，按 R 重新扫描"
+            };
+            let block = theme::block().borders(Borders::ALL)
+                .title(if self.mode == TreeMode::Changed { " 变更 " } else { " 文件树 " })
+                .border_style(theme::Theme::border_active());
+            f.render_widget(Paragraph::new(message).style(theme::Theme::dim()).block(block), area);
+            return;
+        }
         let items: Vec<ListItem> = self
             .visible
             .iter()
@@ -709,7 +769,7 @@ impl TreePanel {
 
         let list = List::new(items)
             .block(
-                Block::default()
+                theme::block()
                     .borders(Borders::ALL)
                     .title(title)
                     .border_style(theme::Theme::border_active()),
@@ -741,5 +801,93 @@ fn worse_sign(a: char, b: char) -> char {
         (Some(_), None) => a,
         (None, Some(_)) => b,
         (None, None) => a,
+    }
+}
+
+#[cfg(test)]
+mod refresh_state_tests {
+    use super::*;
+    use std::path::Path;
+
+    fn item(rel: &str, sign: char) -> Item {
+        Item {
+            rel: rel.into(),
+            abs: Path::new("/wc").join(rel),
+            sign,
+            xy: format!("{} ", sign),
+            is_dir: false,
+        }
+    }
+
+    fn select(tree: &mut TreePanel, rel: &str) {
+        tree.state
+            .select(Some(tree.visible.iter().position(|p| p == rel).unwrap()));
+    }
+
+    #[test]
+    fn refresh_preserves_path_fold_checks_and_viewport() {
+        let mut tree = TreePanel::new();
+        let root = Path::new("/wc");
+        let mut items = vec![
+            item("src/a.txt", 'M'),
+            item("src/c.txt", 'M'),
+            item("other/z.txt", 'M'),
+        ];
+        tree.build_from_items(&items, root);
+        tree.nodes.get_mut("other").unwrap().expanded = false;
+        tree.rebuild_visible();
+        select(&mut tree, "src/c.txt");
+        tree.set_checked("src/c.txt", true);
+        *tree.state.offset_mut() = tree.state.selected().unwrap() - 1;
+        items.insert(1, item("src/b.txt", '?'));
+        tree.refresh_from_items(&items, root);
+        assert_eq!(tree.selected().unwrap().rel, "src/c.txt");
+        assert_eq!(tree.state.selected().unwrap() - tree.state.offset(), 1);
+        assert!(!tree.nodes["other"].expanded);
+        assert!(tree.is_checked("src/c.txt"));
+        assert!(!tree.is_checkable("src/b.txt"));
+    }
+
+    #[test]
+    fn refresh_keeps_full_tree_filter_and_lazy_directory_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src/nested")).unwrap();
+        std::fs::create_dir(tmp.path().join("untouched")).unwrap();
+        std::fs::write(tmp.path().join("src/match.txt"), "old").unwrap();
+        let mut tree = TreePanel::new();
+        tree.build_from_items(&[], tmp.path());
+        tree.load_dir("").unwrap();
+        tree.set_mode(TreeMode::All);
+        tree.nodes.get_mut("src").unwrap().expanded = true;
+        tree.load_dir("src").unwrap();
+        tree.set_filter(Some("match".into()));
+        select(&mut tree, "src/match.txt");
+        std::fs::write(tmp.path().join("src/match-new.txt"), "new").unwrap();
+        tree.refresh_from_items(&[], tmp.path());
+        assert_eq!(tree.mode(), TreeMode::All);
+        assert_eq!(tree.filter().map(String::as_str), Some("match"));
+        assert_eq!(tree.selected().unwrap().rel, "src/match.txt");
+        assert!(tree.visible.iter().any(|p| p == "src/match-new.txt"));
+        assert!(!tree.nodes["src/nested"].expanded);
+        assert!(!tree.nodes["untouched"].expanded);
+        // 清空搜索后仍只展示原先展开的层级。
+        tree.set_filter(None);
+        assert!(tree.nodes["src"].expanded);
+        assert!(!tree.nodes["src/nested"].expanded);
+    }
+
+    #[test]
+    fn disappearing_selection_falls_back_and_expired_checks_are_pruned() {
+        let mut tree = TreePanel::new();
+        let root = Path::new("/wc");
+        tree.build_from_items(&[item("a.txt", 'M'), item("b.txt", 'M')], root);
+        select(&mut tree, "b.txt");
+        tree.set_checked("b.txt", true);
+        tree.refresh_from_items(&[item("a.txt", '?')], root);
+        assert_eq!(tree.selected().unwrap().rel, "a.txt");
+        assert_eq!(tree.checked_count(), 0);
+        tree.refresh_from_items(&[], root);
+        assert!(tree.selected().is_none());
+        assert_eq!(tree.state.offset(), 0);
     }
 }

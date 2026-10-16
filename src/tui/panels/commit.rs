@@ -28,7 +28,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::Style,
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
+    widgets::{Borders, Clear, List, ListItem, Paragraph},
     Frame,
 };
 use tui_textarea::TextArea;
@@ -66,7 +66,7 @@ impl CommitPanel {
     pub fn new(files: Vec<String>, draft: Option<String>, changes: Vec<Change>) -> Self {
         let mut textarea = TextArea::default();
         textarea.set_block(
-            Block::default()
+            theme::block()
                 .borders(Borders::ALL)
                 .title(" 提交信息 "),
         );
@@ -210,7 +210,7 @@ impl CommitPanel {
     fn build_editor(text: &str) -> TextArea<'static> {
         let mut ta = TextArea::default();
         ta.set_block(
-            Block::default()
+            theme::block()
                 .borders(Borders::ALL)
                 .title(" 提交信息 "),
         );
@@ -249,7 +249,7 @@ impl CommitPanel {
         f.render_widget(Clear, pop);
 
         let n = self.files.len();
-        let block = Block::default()
+        let block = theme::block()
             .borders(Borders::ALL)
             .title(Line::from(Span::styled(
                 format!(" 提交（{} 个文件） ", n),
@@ -288,7 +288,7 @@ impl CommitPanel {
         if rest > 0 {
             // 提示还有更多，避免用户以为只提交这几条
             list = list.block(
-                Block::default()
+                theme::block()
                     .borders(Borders::TOP)
                     .title(Span::styled(
                         format!(" 还有 {} 个… ", rest),

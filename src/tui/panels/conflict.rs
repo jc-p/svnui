@@ -18,7 +18,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
+    widgets::{Borders, Clear, List, ListItem, ListState, Paragraph},
     Frame,
 };
 
@@ -209,7 +209,7 @@ impl ConflictPanel {
         f.render_widget(Clear, pop);
 
         let n = self.files.len();
-        let block = Block::default()
+        let block = theme::block()
             .borders(Borders::ALL)
             .title(Line::from(Span::styled(
                 format!(" 解决冲突（{} 个） ", n),
@@ -240,7 +240,7 @@ impl ConflictPanel {
             .collect();
         f.render_stateful_widget(
             List::new(items)
-                .block(Block::default().borders(Borders::ALL).title(" 冲突文件 "))
+                .block(theme::block().borders(Borders::ALL).title(" 冲突文件 "))
                 .highlight_style(
                     Style::default()
                         .bg(Color::DarkGray)
