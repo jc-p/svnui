@@ -49,6 +49,14 @@ pub enum ConfirmAction {
     /// 反向合并回到指定版本（历史面板里按 R）。
     /// 带版本号是为了确认框里能写清楚"要回到哪一版"。
     RevertToRev(u64),
+    /// 树冲突的「恢复服务器版本」。
+    ///
+    /// ⚠ 树冲突**只能** resolve 到 `working` —— `mine-full` / `theirs-full`
+    /// 会被 svn 拒绝（`E155027 Inapplicable conflict resolution option`）。
+    /// 所以"要服务器版本"不能走 resolve，得两步：
+    ///   `svn revert -R <path>`  重建文件（base 版），顺带清掉树冲突标记
+    ///   `svn update  <path>`    拉到服务器最新
+    RestoreFromRepo(std::path::PathBuf),
 }
 
 /// 确认面板。
@@ -184,6 +192,7 @@ impl ConfirmPanel {
             ConfirmAction::Update => "继续更新",
             ConfirmAction::Resolve(_, _) => "应用该方案",
             ConfirmAction::RevertToRev(_) => "回退（需再提交一次）",
+            ConfirmAction::RestoreFromRepo(_) => "恢复服务器版本（本地改动将丢失）",
         };
         let keys = Line::from(vec![
             Span::styled(" Y ", Style::default().fg(accent).add_modifier(Modifier::BOLD)),

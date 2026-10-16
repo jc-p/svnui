@@ -177,6 +177,10 @@ impl Cache {
     /// 校验顺序刻意**从便宜到昂贵**：版本 → 根路径 → TTL → `wc.db` → 全树。
     /// 这样绝大多数"缓存已废"的情况在前几步就被拦下，不会白走树。
     pub fn load(&self, ttl: Duration) -> Option<Snapshot> {
+        // 0 明确表示禁用缓存，不能依赖秒级年龄比较（刚写入时年龄也是 0）。
+        if ttl.is_zero() {
+            return None;
+        }
         let raw = std::fs::read_to_string(&self.file).ok()?;
         let doc: CachedDoc = serde_json::from_str(&raw).ok()?;
 

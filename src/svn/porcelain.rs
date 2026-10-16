@@ -115,11 +115,11 @@ pub fn parse_line(line: &str) -> Option<StatusEntry> {
 ///
 /// ## 格式
 ///
-/// `svn status -u` 比普通 status 多两列（第 8 列 `*`、第 9 起是版本号）：
+/// `svn status -u` 在前 7 个状态列和第 8 列分隔空格后，用第 9 列标记 `*`：
 ///
 /// ```text
-/// M                4521   src/main.rs     ← 第8列空格：只有本地改动
-///         *        4521   src/lib.rs      ← 第8列 `*`：远端有更新
+/// M                4521   src/main.rs     ← 第9列空格：只有本地改动
+///         *        4521   src/lib.rs      ← 第9列 `*`：远端有更新
 /// Status against revision:   4521
 /// ```
 ///
@@ -133,8 +133,8 @@ pub fn parse_outdated(out: &str) -> Vec<(String, u64)> {
             continue;
         }
         let mut chars = line.chars();
-        // 第 8 列（下标 7）是 `*` 才表示远端有更新
-        match chars.nth(7) {
+        // 第 9 列（下标 8）是 `*` 才表示远端有更新。
+        match chars.nth(8) {
             Some('*') => {}
             _ => continue,
         }

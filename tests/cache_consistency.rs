@@ -15,6 +15,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use camino::Utf8PathBuf;
 use svnui::cache::Cache;
 use svnui::domain::{NodeKind, Snapshot, StatusEntry, StatusKind};
 

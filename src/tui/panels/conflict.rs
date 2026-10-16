@@ -88,11 +88,25 @@ impl Strategy {
     }
 }
 
+/// 一条冲突。
+///
+/// ## 为什么带 `tree`
+///
+/// 树冲突（`svn status` 第 7 列的 `C`）是「这个路径该存在还是该删除」
+/// 起的分歧，不是内容合并问题 —— 三路对比对它毫无意义，
+/// 面板必须为它换一套界面（见 `render`）。
+#[derive(Debug, Clone)]
+pub struct ConflictItem {
+    pub path: std::path::PathBuf,
+    /// 树冲突：本地删除/移动 vs 远端修改。
+    pub tree: bool,
+}
+
 /// 冲突面板。
 ///
 /// 左：冲突文件列表。右：当前文件的三路内容之一。
 pub struct ConflictPanel {
-    files: Vec<std::path::PathBuf>,
+    files: Vec<ConflictItem>,
     state: ListState,
     side: Side,
     /// 当前文件的三路内容（切换文件时重新加载）。
@@ -101,7 +115,7 @@ pub struct ConflictPanel {
 }
 
 impl ConflictPanel {
-    pub fn new(files: Vec<std::path::PathBuf>) -> Self {
+    pub fn new(files: Vec<ConflictItem>) -> Self {
         let mut state = ListState::default();
         if !files.is_empty() {
             state.select(Some(0));
@@ -171,7 +185,7 @@ impl ConflictPanel {
         self.scroll = self.scroll.saturating_sub(n);
     }
 
-    pub fn selected(&self) -> Option<&std::path::PathBuf> {
+    pub fn selected(&self) -> Option<&ConflictItem> {
         self.state.selected().and_then(|i| self.files.get(i))
     }
 
@@ -217,10 +231,10 @@ impl ConflictPanel {
         let items: Vec<ListItem> = self
             .files
             .iter()
-            .map(|p| {
+            .map(|it| {
                 ListItem::new(Line::from(Span::raw(format!(
                     " {}",
-                    Self::display(p, root)
+                    Self::display(&it.path, root)
                 ))))
             })
             .collect();
@@ -236,67 +250,153 @@ impl ConflictPanel {
             &mut self.state,
         );
 
-        // ── 右：三路内容 ──
+        // ── 右：内容区 ──
+        //
+        // 树冲突不显示三路对比：它不是内容分歧，三份内容对「去留」
+        // 没有任何帮助，硬给反而让人以为要在这里选一份。
+        let is_tree = self.selected().map(|it| it.tree).unwrap_or(false);
+
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(1), Constraint::Min(3), Constraint::Length(1)])
             .split(cols[1]);
 
-        // 三个页签：当前的高亮
-        let tabs = ["1 我的", "2 服务器的", "3 当前文件"];
-        let active = match self.side {
-            Side::Mine => 0,
-            Side::Theirs => 1,
-            Side::Working => 2,
-        };
-        let spans: Vec<Span> = tabs
-            .iter()
-            .enumerate()
-            .flat_map(|(i, t)| {
-                let style = if i == active {
+        if is_tree {
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    " 树冲突 · 无需三路对比 ",
                     Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    theme::Theme::dim()
-                };
-                [
-                    Span::styled(format!(" {t} "), style),
-                    Span::raw(" "),
-                ]
-            })
-            .collect();
-        f.render_widget(Paragraph::new(Line::from(spans)), rows[0]);
-
-        let body: Vec<Line> = if self.content.is_empty() {
-            vec![Line::from(Span::styled(
-                "（无内容）",
-                theme::Theme::dim(),
-            ))]
+                        .fg(Color::LightRed)
+                        .add_modifier(Modifier::BOLD),
+                ))),
+                rows[0],
+            );
+            f.render_widget(
+                Paragraph::new(tree_conflict_body()).scroll((self.scroll, 0)),
+                rows[1],
+            );
         } else {
-            self.content.lines().take(2000).map(|l| colorize(l)).collect()
-        };
-        f.render_widget(
-            Paragraph::new(body).scroll((self.scroll, 0)),
-            rows[1],
-        );
+            // 三个页签：当前的高亮
+            let tabs = ["1 我的", "2 服务器的", "3 当前文件"];
+            let active = match self.side {
+                Side::Mine => 0,
+                Side::Theirs => 1,
+                Side::Working => 2,
+            };
+            let spans: Vec<Span> = tabs
+                .iter()
+                .enumerate()
+                .flat_map(|(i, t)| {
+                    let style = if i == active {
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        theme::Theme::dim()
+                    };
+                    [
+                        Span::styled(format!(" {t} "), style),
+                        Span::raw(" "),
+                    ]
+                })
+                .collect();
+            f.render_widget(Paragraph::new(Line::from(spans)), rows[0]);
 
-        let keys = Line::from(vec![
-            Span::styled(" j/k ", theme::Theme::dim()),
-            Span::styled("选文件  ", theme::Theme::dim()),
-            Span::styled("1/2/3 ", theme::Theme::dim()),
-            Span::styled("切版本  ", theme::Theme::dim()),
-            Span::styled("m ", Style::default().fg(Color::Yellow)),
-            Span::styled("用我的  ", theme::Theme::dim()),
-            Span::styled("t ", Style::default().fg(Color::Yellow)),
-            Span::styled("用服务器的  ", theme::Theme::dim()),
-            Span::styled("Enter ", Style::default().fg(Color::Yellow)),
-            Span::styled("保留当前  ", theme::Theme::dim()),
-            Span::styled("Esc ", theme::Theme::dim()),
-            Span::styled("返回", theme::Theme::dim()),
-        ]);
+            // 二进制/超大/非 UTF-8 已在 client 侧转成提示串，这里只负责着色
+            let body: Vec<Line> = if self.content.is_empty() {
+                vec![Line::from(Span::styled(
+                    "（无内容：文件已被删除或移动，或不是文本）",
+                    theme::Theme::dim(),
+                ))]
+            } else {
+                self.content.lines().take(2000).map(|l| colorize(l)).collect()
+            };
+            f.render_widget(
+                Paragraph::new(body).scroll((self.scroll, 0)),
+                rows[1],
+            );
+        }
+
+        let keys = if is_tree {
+            Line::from(vec![
+                Span::styled(" j/k ", theme::Theme::dim()),
+                Span::styled("选文件  ", theme::Theme::dim()),
+                Span::styled("Enter ", Style::default().fg(Color::Yellow)),
+                Span::styled("保留现状（推荐）  ", theme::Theme::dim()),
+                Span::styled("r ", Style::default().fg(Color::Yellow)),
+                Span::styled("恢复服务器版本  ", theme::Theme::dim()),
+                Span::styled("m ", Style::default().fg(Color::Yellow)),
+                Span::styled("坚持我的删除  ", theme::Theme::dim()),
+                Span::styled("Esc ", theme::Theme::dim()),
+                Span::styled("返回", theme::Theme::dim()),
+            ])
+        } else {
+            Line::from(vec![
+                Span::styled(" j/k ", theme::Theme::dim()),
+                Span::styled("选文件  ", theme::Theme::dim()),
+                Span::styled("1/2/3 ", theme::Theme::dim()),
+                Span::styled("仅切换预览  ", theme::Theme::dim()),
+                Span::styled("m ", Style::default().fg(Color::Yellow)),
+                Span::styled("用我的  ", theme::Theme::dim()),
+                Span::styled("t ", Style::default().fg(Color::Yellow)),
+                Span::styled("用服务器的  ", theme::Theme::dim()),
+                Span::styled("Enter ", Style::default().fg(Color::Yellow)),
+                Span::styled("保留当前  ", theme::Theme::dim()),
+                Span::styled("Esc ", theme::Theme::dim()),
+                Span::styled("返回", theme::Theme::dim()),
+            ])
+        };
         f.render_widget(Paragraph::new(keys).alignment(Alignment::Left), rows[2]);
     }
+}
+
+/// 树冲突的说明区。
+///
+/// 树冲突常见于：本地 `mv` 改名，而服务器上原文件同时被改了。
+/// 它没有可合并的内容，三份对比毫无意义，所以这里直接把
+///「怎么选、选了会怎样」写清楚 —— 而不是让人在三栏里瞎按。
+fn tree_conflict_body() -> Vec<Line<'static>> {
+    let key = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    vec![
+        Line::from(Span::styled(
+            "这是一个树冲突（T）",
+            Style::default()
+                .fg(Color::LightRed)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from("你本地删除或移动了这个路径，而服务器上它同时被修改了。"),
+        Line::from("SVN 无法判断该听谁的 —— 这不是内容分歧，"),
+        Line::from("所以「我的 / 服务器的 / 当前文件」三路对比在这里没有意义。"),
+        Line::from(""),
+        Line::from(Span::styled("处理方式（三选一）：", bold)),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Enter  ", key),
+            Span::raw("保留现状（推荐）：按磁盘现在的样子标记为已解决"),
+        ]),
+        Line::from("          改名后的新文件保留，旧名字从版本控制里去掉"),
+        Line::from(vec![
+            Span::styled("  r      ", key),
+            Span::raw("恢复服务器版本：放弃本地的删除/移动"),
+        ]),
+        Line::from(vec![
+            Span::styled("  m      ", key),
+            Span::raw("坚持我的删除：服务器对它的改动一并丢弃"),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "⚠ 树冲突没有「合并」这回事，选完即定。",
+            theme::Theme::dim(),
+        )),
+        Line::from(Span::styled(
+            "  想保留改名历史请用 svn mv —— delete + add 会断掉历史。",
+            theme::Theme::dim(),
+        )),
+    ]
 }
 
 /// 冲突标记着色。

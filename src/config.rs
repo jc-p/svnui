@@ -189,6 +189,88 @@ pub struct Config {
     pub log: LogConfig,
 }
 
+/// 默认配置全文。首次运行时写进 `~/.config/svnui/config.toml`。
+///
+/// 每个字段都带注释 —— 生成一份"能读的配置"比让用户翻文档找字段有用得多。
+/// 内容和 `config.example.toml` 保持一致。
+const DEFAULT_TOML: &str = r##"# svnui 配置 —— ~/.config/svnui/config.toml
+#
+# 优先级：命令行参数 > 环境变量 > 本文件 > 内置默认。
+# 全部字段都可省略，省了的取默认值。
+#
+# 本文件不存在的时候 svnui 照常能用（用内置默认），
+# 写坏了也只会整体退回默认值，不会让工具起不来。
+
+# ── 提交信息生成（LLM）────────────────────────────────
+[llm]
+# 总开关。默认关闭 —— 配好 key 再打开。
+enabled = false
+
+# 兼容 OpenAI /v1/chat/completions 的地址（不要带 /chat/completions）。
+# 换服务商只改这两行，不用改代码：
+#   DeepSeek   https://api.deepseek.com/v1                          deepseek-chat
+#   通义千问    https://dashscope.aliyuncs.com/compatible-mode/v1    qwen-plus
+#   智谱       https://open.bigmodel.cn/api/paas/v4                  glm-4-flash
+#   本地 Ollama http://localhost:11434/v1                            qwen2.5-coder
+#   公司网关    问 IT
+base_url = "https://api.deepseek.com/v1"
+model = "deepseek-chat"
+
+# API Key 从哪个环境变量读。
+# 不把 key 写进配置文件：配置文件容易被误 git add，而 key 泄露没法撤销。
+#   echo 'export SVNUI_LLM_KEY=sk-xxx' >> ~/.zshrc && exec zsh
+api_key_env = "SVNUI_LLM_KEY"
+
+# 超时秒数。请求在后台发，超时只是这一次生成失败，不卡界面。
+timeout_secs = 20
+
+# ⚠️ 是否把 diff 正文发给模型。默认 false。
+# 这是隐私开关：公司代码出网前要过一遍 Compliance。
+# 关着的时候只发"改了哪些文件、各自什么状态"，模型判断会粗一些。
+send_diff = false
+
+# send_diff = true 时的截断上限（字节）。
+max_diff_bytes = 20000
+
+# 提交信息语言：zh / en
+lang = "zh"
+
+# 追加要求。比如团队规定结尾带任务号，写这里比改代码省事。
+extra_prompt = ""
+
+# ── SVN ──────────────────────────────────────────────
+[svn]
+# 信任自签名 / 内网 CA 证书。等价于环境变量 SVNUI_TRUST_CERT=1。
+# 内网服务器基本都是自签名，不开连不上。开了等于放弃防中间人。
+trust_cert = false
+
+# svn 可执行文件路径。留空按 PATH 找。
+svn_path = ""
+
+# ── 界面 ─────────────────────────────────────────────
+[ui]
+# 启动时是否捕获鼠标。
+# 开了能拖滚动条，代价是终端的文本选择复制失效 ——
+# diff 里复制路径是刚需，所以默认关。TUI 里按 M 可随时切换。
+mouse = false
+
+# 变更排序：status / path / time
+sort = "status"
+
+# ── 预览 ─────────────────────────────────────────────
+[preview]
+# diff 上下文行数
+context_lines = 3
+
+# 分页器：auto / delta / bat / less / none
+pager = "auto"
+
+# ── 日志 ─────────────────────────────────────────────
+[log]
+# 首次加载多少条。svn log 是联网操作，多了要等服务器。
+page_size = 100
+"##;
+
 impl Config {
     /// 加载配置。**任何失败都返回默认值**，不传播错误。
     ///
@@ -223,6 +305,91 @@ impl Config {
     /// 配置文件是否存在。用于给用户提示"你现在用的是默认值"。
     pub fn exists() -> bool {
         Self::path().map(|p| p.is_file()).unwrap_or(false)
+    }
+
+    /// 首次运行时生成一份带注释的配置。
+    ///
+    /// **只在文件不存在时写**，已存在一律不动 —— 绝不覆盖用户的改动。
+    /// 返回是否真的新建了文件（调用方据此决定要不要提示一句）。
+    ///
+    /// 所有失败都静默：home 不可写、只读文件系统、容器环境……
+    /// 理由见模块文档"加载失败怎么办" —— 配置文件不该有能力让工具起不来。
+    pub fn ensure_file() -> bool {
+        let Some(path) = Self::path() else {
+            return false;
+        };
+        if path.is_file() {
+            return false;
+        }
+        Self::write_to(&path).is_ok()
+    }
+
+    /// 写一份默认配置，返回路径。`force = true` 才覆盖已有文件。
+    ///
+    /// 供 `svnui config --init` 用：自动初始化只补缺失的，
+    /// 想拿回一份干净的注释版就得显式说要覆盖。
+    pub fn write_default(force: bool) -> std::io::Result<std::path::PathBuf> {
+        let path = Self::path().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "拿不到配置文件路径（HOME 未设置）",
+            )
+        })?;
+        if path.is_file() && !force {
+            return Ok(path);
+        }
+        Self::write_to(&path)?;
+        Ok(path)
+    }
+
+    fn write_to(path: &std::path::Path) -> std::io::Result<()> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(path, DEFAULT_TOML)
+    }
+
+    /// 当前生效配置的简要说明，供 `svnui config` 打印。
+    ///
+    /// 存在的理由是"看不出配置有没有生效"：文件写错了、key 没设、
+    /// 开关没开，三种情况在 TUI 里表现一模一样（都静默回退）。
+    pub fn describe(&self) -> String {
+        let p = Self::path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "（未知：HOME 未设置）".to_string());
+        let key_ok = std::env::var_os(&self.llm.api_key_env).is_some();
+        let mut out = String::new();
+        out.push_str("配置文件\n");
+        out.push_str(&format!("  路径: {}\n", p));
+        out.push_str(&format!(
+            "  状态: {}\n",
+            if Self::exists() {
+                "已存在"
+            } else {
+                "不存在（用内置默认）"
+            }
+        ));
+        out.push_str("\n提交信息生成（LLM）\n");
+        out.push_str(&format!("  启用: {}\n", self.llm.enabled));
+        out.push_str(&format!("  地址: {}\n", self.llm.base_url));
+        out.push_str(&format!("  模型: {}\n", self.llm.model));
+        out.push_str(&format!(
+            "  Key 环境变量: {}（{}）\n",
+            self.llm.api_key_env,
+            if key_ok {
+                "已设置"
+            } else {
+                "未设置 → 不会联网，Ctrl+G 走本地规则"
+            }
+        ));
+        out.push_str(&format!("  发送 diff: {}\n", self.llm.send_diff));
+        out.push_str("\nSVN\n");
+        out.push_str(&format!("  信任证书: {}\n", self.svn.trust_cert));
+        out.push_str("\n界面\n");
+        out.push_str(&format!("  鼠标: {}\n", self.ui.mouse));
+        out.push_str(&format!("  排序: {}\n", self.ui.sort));
+        out.push_str("\n改完立即生效，不用重启。\n");
+        out
     }
 }
 

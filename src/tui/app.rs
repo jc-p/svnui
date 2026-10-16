@@ -44,7 +44,7 @@ use crate::tui::panels::preview::{read_file, BarHit, Kind as PreviewKind, Previe
 use crate::tui::panels::help::HelpPanel;
 use crate::tui::panels::log::LogPanel;
 use crate::tui::panels::confirm::{ConfirmAction, ConfirmPanel, Danger};
-use crate::tui::panels::conflict::{ConflictPanel, Side, Strategy};
+use crate::tui::panels::conflict::{ConflictItem, ConflictPanel, Side, Strategy};
 use crate::tui::panels::tree::{TreeMode, TreePanel};
 use crate::tui::panels::repo::{RepoAction, RepoPanel};
 use crate::tui::theme;
@@ -167,7 +167,7 @@ enum BgDone {
     /// 这时候拿旧 URL 的结果覆盖当前目录，界面会显示错层的内容。
     RepoList(String, crate::domain::Result<Vec<crate::svn::parser::DirEntry>>),
     /// 冲突文件列表加载完成。
-    Conflicts(crate::domain::Result<Vec<PathBuf>>),
+    Conflicts(crate::domain::Result<Vec<ConflictItem>>),
     /// 某个历史版本的完整 diff。
     RevDiff(u64, crate::domain::Result<String>),
     /// 冲突三路内容加载完成。
@@ -364,9 +364,12 @@ impl App {
     fn fetch(svn: &Svn, sort: SortMode) -> crate::domain::Result<(Vec<crate::tui::panels::Item>, PathBuf)> {
         let snap = svn.snapshot(&StatusOpts::default())?;
         let root = PathBuf::from(snap.root.as_str());
+        // 浏览列表也要展示未版本化文件，用户才能按 A 加入 SVN；
+        // 能否勾选提交仍由 Item / TreePanel 的提交资格规则控制。
         let mut items: Vec<crate::tui::panels::Item> = snap
-            .changed()
-            .into_iter()
+            .entries
+            .values()
+            .filter(|e| e.is_changed() || e.text == crate::domain::StatusKind::Unversioned)
             .map(|e| crate::tui::panels::Item::from_entry(e, &root))
             .collect();
         Self::sort_items(&mut items, sort);
@@ -1175,7 +1178,7 @@ impl App {
                     self.spawn_preview();
                 }
             }
-            KeyCode::Char('k') | KeyCode::Up => {
+            KeyCode::Char('k') | KeyCode::Up if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if self.tree.move_up() {
                     self.spawn_preview();
                 }
@@ -1289,6 +1292,16 @@ impl App {
                 self.notice = Some("已清空勾选".into());
             }
 
+            // Ctrl+K = svn cleanup：只解锁、清中断的操作，不删任何文件。
+            // 三 false 是刻意的（不删未版本化、不删忽略项、不真空 pristine），
+            // 危险开关留在 CLI `svnui cleanup --remove-unversioned`。
+            KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.spawn_busy("svn cleanup", |svn| {
+                    svn.cleanup(false, false, false)?;
+                    Ok("已清理工作副本（解锁 + 清除中断的操作）".to_string())
+                });
+            }
+
             // E = 用外部编辑器打开（$VISUAL / $EDITOR / vim）
             KeyCode::Char('e') | KeyCode::Char('E') => self.request_editor(),
 
@@ -1331,17 +1344,13 @@ impl App {
 
             KeyCode::Char('c') | KeyCode::Char('C') => self.open_commit(),
             KeyCode::Char('a') | KeyCode::Char('A') => self.do_add(),
-            // 小写 r = revert。
-            //
-            // ⚠️ 原先大写 R 同时绑了"重新扫描"，同一个 match 里前者先命中，
-            //    重新扫描成了永远走不到的死分支。现在把它挪到 F5 ——
-            //    这种重复绑定编译器不会报错，只能靠人眼发现。
+            // 小写 r 还原，大写 R 刷新；不能合并大小写匹配，否则刷新会误入还原。
             KeyCode::Char('r') => self.do_revert(),
             // V = 远端仓库浏览（view）：不用切网页就能翻目录、复制路径、直接检出。
             // 原来挂在 R 上，但 R 和小写 r（revert）只差一个 Shift，
             // 而 revert 是破坏性操作 —— 手滑按成大写的代价太大。
             KeyCode::Char('v') | KeyCode::Char('V') => self.open_repo(),
-            KeyCode::F(5) => self.spawn_reload(),
+            KeyCode::Char('R') | KeyCode::F(5) => self.spawn_reload(),
             KeyCode::Char('u') | KeyCode::Char('U') => self.do_update(),
             KeyCode::Char('h') | KeyCode::Char('H') => self.do_doctor(),
             KeyCode::Char('l') | KeyCode::Char('L') => self.open_log(),
@@ -1515,6 +1524,9 @@ impl App {
                     ConfirmAction::Resolve(path, strategy) => {
                         self.do_resolve_confirmed(path, strategy)
                     }
+                    ConfirmAction::RestoreFromRepo(path) => {
+                        self.do_restore_from_repo_confirmed(path)
+                    }
                     ConfirmAction::Delete(paths, keep_local) => {
                         if paths.is_empty() {
                             self.notice = Some("没有要删除的项".into());
@@ -1586,7 +1598,27 @@ impl App {
                 self.load_conflict_content();
             }
             // m = 用我的，t = 用服务器的，Enter = 保留当前文件
-            KeyCode::Char('m') | KeyCode::Char('M') => self.do_resolve(Strategy::MineFull),
+            // 树冲突的「恢复服务器版本」。
+            //
+            // ⚠ 树冲突**只能** resolve 到 working，mine-full / theirs-full
+            //   会被 svn 拒绝（E155027），按了没反应就是这么来的。
+            //   所以树冲突下 r 不走 resolve，改走 revert + update。
+            //   普通冲突仍用 theirs-full（t 键同义）。
+            KeyCode::Char('r') => {
+                if self.conflict_tree_selected() {
+                    self.do_restore_from_repo();
+                } else {
+                    self.do_resolve(Strategy::TheirsFull);
+                }
+            }
+            // 树冲突的「坚持我的删除」== 磁盘现状，只能表达成 working。
+            KeyCode::Char('m') | KeyCode::Char('M') => {
+                if self.conflict_tree_selected() {
+                    self.do_resolve(Strategy::Working);
+                } else {
+                    self.do_resolve(Strategy::MineFull);
+                }
+            }
             KeyCode::Char('t') | KeyCode::Char('T') => self.do_resolve(Strategy::TheirsFull),
             KeyCode::Enter => self.do_resolve(Strategy::Working),
             KeyCode::Char('d') | KeyCode::PageDown => {
@@ -2233,7 +2265,12 @@ impl App {
         std::thread::spawn(move || {
             let res = svn.conflicts().map(|v| {
                 v.into_iter()
-                    .map(|e| e.path.into_std_path_buf())
+                    .map(|e| ConflictItem {
+                        // 第 7 列的 `C`：树冲突。三路对比对它没意义，
+                        // 面板据此换一套界面。
+                        tree: e.tree_conflict,
+                        path: e.path.into_std_path_buf(),
+                    })
                     .collect::<Vec<_>>()
             });
             let _ = tx.send(BgDone::Conflicts(res));
@@ -2245,7 +2282,7 @@ impl App {
         let Some(panel) = self.conflict.as_ref() else {
             return;
         };
-        let Some(path) = panel.selected().cloned() else {
+        let Some(path) = panel.selected().map(|it| it.path.clone()) else {
             return;
         };
         let side = panel.side();
@@ -2267,13 +2304,19 @@ impl App {
         let Some(panel) = self.conflict.as_ref() else {
             return;
         };
-        let Some(path) = panel.selected().cloned() else {
+        let Some(item) = panel.selected().cloned() else {
             return;
         };
+        let path = item.path.clone();
         let rel = short_rel(&path.to_string_lossy(), &self.root);
+        let mut body =
+            format!("对 {} 执行「{}」。\n{}", rel, strategy.label(), strategy.warning());
+        if item.tree {
+            body.push_str("\n\n这是树冲突：没有可合并的内容，选完即定。");
+        }
         self.confirm = Some(ConfirmPanel::new(
             format!("确认：{}", strategy.label()),
-            format!("对 {} 执行「{}」。\n{}", rel, strategy.label(), strategy.warning()),
+            body,
             vec![rel],
             Danger::Critical,
             ConfirmAction::Resolve(path, strategy),
@@ -2287,6 +2330,57 @@ impl App {
         self.spawn_busy("svn resolve", move |svn| {
             svn.resolve(&[path], &arg)?;
             Ok("已标记为已解决".to_string())
+        });
+    }
+
+    /// 当前选中的冲突项是不是树冲突。
+    ///
+    /// 树冲突的解决路径和普通冲突完全不同（只能 working），
+    /// 所以每个执行键都得先问一句。
+    fn conflict_tree_selected(&self) -> bool {
+        self.conflict
+            .as_ref()
+            .and_then(|p| p.selected())
+            .map(|it| it.tree)
+            .unwrap_or(false)
+    }
+
+    /// 树冲突的「恢复服务器版本」。
+    ///
+    /// 不走 `svn resolve` —— 树冲突只能 resolve 到 working，
+    /// 想拿服务器版本只能 revert 掉本地的删除/改名再 update。
+    fn do_restore_from_repo(&mut self) {
+        let Some(path) = self
+            .conflict
+            .as_ref()
+            .and_then(|p| p.selected())
+            .map(|it| it.path.clone())
+        else {
+            return;
+        };
+        let rel = short_rel(&path.to_string_lossy(), &self.root);
+        self.confirm = Some(ConfirmPanel::new(
+            "确认：恢复服务器版本（树冲突）",
+            format!(
+                "放弃你对 {rel} 的本地删除/改名，从服务器重新拉取。\n\
+                 执行：svn revert -R 然后 svn update。\n\n\
+                 ⚠ 你 mv 改名生成的新文件不受影响，但旧路径会恢复；\n\
+                   改名历史无法保留（要保留请用 svn mv）。"
+            ),
+            vec![rel],
+            Danger::Critical,
+            ConfirmAction::RestoreFromRepo(path),
+        ));
+        self.mode = Mode::Confirm;
+    }
+
+    /// 真的执行 revert + update。
+    fn do_restore_from_repo_confirmed(&mut self, path: PathBuf) {
+        self.spawn_busy("恢复服务器版本", move |svn| {
+            let ps = vec![path];
+            svn.revert(&ps, false)?;
+            svn.update(None, &ps)?;
+            Ok("已恢复为服务器版本（本地删除/改名已撤销）".to_string())
         });
     }
 
@@ -3120,5 +3214,105 @@ mod path_tests {
     fn root_itself_becomes_dot() {
         let root = std::path::Path::new("/wc");
         assert_eq!(pretty_path("/wc", root, 80), ".");
+    }
+}
+
+#[cfg(test)]
+mod refresh_tests {
+    use super::*;
+    use std::path::Path;
+    use std::process::Command;
+
+    fn run(exe: &str, args: &[&str], cwd: &Path) {
+        let out = Command::new(exe).args(args).current_dir(cwd).output().unwrap();
+        assert!(out.status.success(), "{exe}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    fn wait_for_scan(app: &mut App) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.is_busy() {
+            assert!(Instant::now() < deadline, "扫描未在期限内结束");
+            app.tick();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    #[ignore = "需要 svn + svnadmin；仅操作临时本地仓库"]
+    fn unversioned_files_are_visible_before_add_and_committable_after_add() {
+        let tmp = tempfile::tempdir().unwrap();
+        run("svnadmin", &["create", "repo"], tmp.path());
+        let url = format!("file://{}/repo", tmp.path().display());
+        run("svn", &["checkout", "--non-interactive", &url, "wc"], tmp.path());
+        let wc = tmp.path().join("wc");
+        let plugin = wc.join("hardware-plugin");
+        std::fs::create_dir(&plugin).unwrap();
+        run("svn", &["add", "hardware-plugin"], &wc);
+        run("svn", &["commit", "--non-interactive", "-m", "init"], &wc);
+
+        std::fs::write(plugin.join("kingdom.ico"), b"test icon").unwrap();
+        let svn = Svn::discover(&wc, Duration::from_secs(5), false).unwrap();
+        let mut app = App::new(svn).unwrap();
+        assert_eq!(app.items.len(), 1, "启动时必须显示未版本化的新文件");
+        assert_eq!(app.items[0].sign, '?');
+
+        std::fs::write(plugin.join("升级说明.md"), "新增说明\n").unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::NONE)).unwrap();
+        wait_for_scan(&mut app);
+        assert_eq!(app.items.len(), 2, "刷新必须显示运行期间新增的文件");
+        for item in &app.items {
+            assert_eq!(item.sign, '?');
+            assert!(!item.committable());
+            assert!(!app.tree.is_checkable(&item.rel));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::NONE)).unwrap();
+        assert_eq!(app.mode, Mode::Browse, "未版本化文件不能直接进入提交面板");
+        assert_eq!(app.tree.checked_count(), 0);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::NONE)).unwrap();
+        wait_for_scan(&mut app);
+        assert_eq!(app.items.len(), 2);
+        for item in &app.items {
+            assert_eq!(item.sign, 'A', "加入 SVN 后必须更新为 A");
+            assert!(app.tree.is_checkable(&item.rel));
+        }
+        assert_eq!(std::fs::read_to_string(plugin.join("升级说明.md")).unwrap(), "新增说明\n");
+    }
+
+    #[test]
+    #[ignore = "需要 svn + svnadmin；仅操作临时本地仓库"]
+    fn refresh_keys_detect_external_edits_and_clear_restored_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        run("svnadmin", &["create", "repo"], tmp.path());
+        let url = format!("file://{}/repo", tmp.path().display());
+        run("svn", &["checkout", "--non-interactive", &url, "wc"], tmp.path());
+        let wc = tmp.path().join("wc");
+        let file = wc.join("a.txt");
+        std::fs::write(&file, "original\n").unwrap();
+        run("svn", &["add", "a.txt"], &wc);
+        run("svn", &["commit", "--non-interactive", "-m", "init"], &wc);
+        let svn = Svn::discover(&wc, Duration::from_secs(5), false).unwrap();
+        let mut app = App::new(svn).unwrap();
+        assert!(app.items.is_empty());
+
+        // 走真实按键分发和后台扫描，防止文档有快捷键、实际分支却未绑定。
+        for key in [KeyCode::Char('R'), KeyCode::F(5)] {
+            std::fs::write(&file, "changed externally\n").unwrap();
+            app.handle_key(KeyEvent::new(key, KeyModifiers::NONE)).unwrap();
+            assert!(app.is_busy(), "{key:?} 必须启动状态扫描");
+            wait_for_scan(&mut app);
+            assert_eq!(app.items.len(), 1, "{key:?} 必须显示外部改动");
+            assert_eq!(app.items[0].rel, "a.txt");
+            assert_eq!(app.items[0].sign, 'M');
+            assert_eq!(app.mode, Mode::Browse, "刷新不能触发还原面板");
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), "changed externally\n");
+            app.tree.set_checked("a.txt", true);
+
+            std::fs::write(&file, "original\n").unwrap();
+            app.handle_key(KeyEvent::new(key, KeyModifiers::NONE)).unwrap();
+            wait_for_scan(&mut app);
+            assert!(app.items.is_empty(), "恢复原内容后必须清除 M 状态");
+            assert_eq!(app.tree.checked_count(), 0, "清除过期提交勾选");
+        }
     }
 }

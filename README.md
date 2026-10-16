@@ -137,6 +137,19 @@ cargo build --release
 sudo cp target/release/svnui /usr/local/bin/
 ```
 
+### 本地源码更新
+
+修改源码后，在项目根目录运行一键更新脚本：
+
+```bash
+./install-local.sh
+```
+
+脚本离线编译 Release，安装到 `/usr/local/bin/svnui`，需要时提示输入 sudo
+密码，并核对安装后的二进制和 PATH。编译或安装失败会立即停止。
+依赖需已缓存在本机；已编译好时可加 `--no-build` 直接安装。
+更新完成后退出旧界面，重新运行 `svnui tui`。
+
 ---
 
 ## 快速上手
@@ -184,7 +197,7 @@ export SVNR_TRUST_CERT=1          # 写进 ~/.zshrc 永久生效
 | `T` | 切换「仅变更 / 全部文件」 |
 | `S` | 切换排序 |
 | `/` | 搜索文件 |
-| `R` | 刷新 |
+| `R` / `F5` | 刷新（外部修改文件后重新扫描） |
 
 只有**真正能提交**的文件（`M A D R C T !`）才显示复选框。
 干净文件、未版本化、忽略项、目录留空——`svn commit` 本来就会跳过它们，

@@ -331,7 +331,7 @@ impl Svn {
         Ok(ConflictVersions {
             mine: read_or_cat(mine_path.as_deref(), || self.cat(&rel_s, Some("BASE"))),
             theirs: read_or_cat(theirs_path.as_deref(), || self.cat(&rel_s, Some("HEAD"))),
-            working: std::fs::read_to_string(abs).unwrap_or_default(),
+            working: read_text_lossy(abs),
         })
     }
 
@@ -877,15 +877,78 @@ pub working: String,
 /// 优先读文件，读不到就执行 `f()`；`f()` 失败也给空串而不是报错。
 ///
 /// 冲突三路里任何一路缺失都不该让整个面板挂掉 —— 少看一路用户也能做决定。
+/// 读文件内容用于文本展示。
+///
+/// 三件事必须先做掉，否则冲突预览会变成一屏乱码：
+/// 1. **二进制**（zip / 图片 / 编译产物…）—— 硬解成 UTF-8 会输出一堆
+///    替换字符和控制序列。靠前 8KB 里有没有 NUL 判定。
+/// 2. **超大文件** —— 2MB 以上截断。
+/// 3. **非 UTF-8** —— lossy 转换而不是返回 Err。这里返回 Err 会让调用
+///    方 `unwrap_or_default()` 变成空串，看起来像"没有内容"，
+///    实际是"读不出来"，两者处理方式完全不同。
+///
+/// 为什么不复用 `tui::panels::preview::read_file`：那是 tui 层，
+/// svn 层不能反向依赖它。这里只抄它的三件判定（办公文档提取
+/// 在冲突场景用不上，没抄）。
+fn read_text_lossy(path: &Path) -> String {
+    use std::io::Read;
+    const MAX: usize = 2 * 1024 * 1024;
+
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return String::new();
+    };
+    let file_size = f.metadata().map(|m| m.len()).ok();
+    let mut buf = Vec::new();
+    // 多读一个字节用于判断截断，避免只为预览而把大文件全部载入内存。
+    if (&mut f).take((MAX + 1) as u64).read_to_end(&mut buf).is_err() {
+        return String::new();
+    }
+    let total = file_size.unwrap_or(buf.len() as u64);
+
+    let probe = buf.len().min(8192);
+    if buf[..probe].contains(&0) {
+        return format!("（二进制文件 · {} 字节，不显示内容）", total);
+    }
+
+    let (shown, cut) = if buf.len() > MAX {
+        (&buf[..MAX], true)
+    } else {
+        (&buf[..], false)
+    };
+    let mut s = String::from_utf8_lossy(shown).to_string();
+    if cut {
+        s.push_str(&format!(
+            "\n\n… 文件过大（{} 字节），只显示前 {MAX} 字节",
+            total
+        ));
+    }
+    s
+}
+
 fn read_or_cat<F>(path: Option<&Path>, f: F) -> String
 where
 F: FnOnce() -> Result<String>,
 {
 if let Some(p) = path {
-    if let Ok(s) = std::fs::read_to_string(p) {
+    // 走 read_text_lossy 而不是 read_to_string：二进制会直接读成空串，
+    // 看起来像"没内容"，实际是"读不出来"。
+    let s = read_text_lossy(p);
+    if !s.is_empty() {
         return s;
     }
 }
-f().unwrap_or_default()
+// ⚠ 回退路径同样要挡二进制：`svn cat` 拿到的是字节硬解成 UTF-8 的结果，
+//   zip 之类会变成满屏菱形替换字符。树冲突时文件已被 mv 走，
+//   .mine / .rOLD 常常不存在 —— 走的正是这条路径。
+match f() {
+    Ok(s)
+        if s.contains('\0')
+            || s.chars().filter(|c| *c == '\u{FFFD}').take(8).count() >= 8 =>
+    {
+        format!("（二进制内容 · 约 {} 字节，不显示）", s.len())
+    }
+    Ok(s) => s,
+    Err(_) => String::new(),
+}
 }
 

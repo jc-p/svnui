@@ -95,6 +95,100 @@ pub fn suggest(items: &[Item], diff: Option<&str>, cfg: &LlmConfig) -> Result<Ve
     Ok(out)
 }
 
+/// 连通性自检：确认 base_url / model / API Key 三样都对。
+///
+/// 存在的理由是"失败太安静了" —— 配置写错时调用方只回退本地规则，
+/// 用户看到的是"生成的还是老样子"，分不清是模型没接上还是本来就该这样。
+/// 所以给一个能直接问的命令：`svnui llm --test`。
+pub fn ping(cfg: &LlmConfig) -> Result<String, String> {
+    if !cfg.enabled {
+        return Err("llm.enabled = false：配置里没打开，当前走的是本地规则".to_string());
+    }
+
+    let key = std::env::var(&cfg.api_key_env)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "没读到 API Key：环境变量 {} 未设置或为空（写进 ~/.zshrc 后要 exec zsh）",
+                cfg.api_key_env
+            )
+        })?;
+
+    let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
+    let body = serde_json::json!({
+        "model": cfg.model,
+        "messages": [{"role": "user", "content": "只回复 OK 两个字"}],
+        "max_tokens": 16,
+    });
+
+    let t0 = std::time::Instant::now();
+    let resp = ureq::post(&url)
+        .set("Authorization", &format!("Bearer {}", key))
+        .set("Content-Type", "application/json")
+        .timeout(std::time::Duration::from_secs(cfg.timeout_secs.max(1)))
+        .send_json(body)
+        .map_err(|e| format!("连不上 {}：{}", url, e))?;
+    let ms = t0.elapsed().as_millis();
+
+    let v: serde_json::Value = resp
+        .into_json()
+        .map_err(|e| format!("响应不是 JSON（base_url 是不是指错了？）：{}", e))?;
+
+    let content = v
+        .get("choices")
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get("message"))
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_str())
+        .ok_or_else(|| {
+            let hint = v
+                .get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(|m| m.as_str())
+                .unwrap_or("（响应里没有 error 字段，多半是 base_url 不对）");
+            format!("响应格式不符预期：{}", hint)
+        })?;
+
+    Ok(format!(
+        "连通正常\n  模型: {}\n  地址: {}\n  耗时: {} ms\n  回复: {}",
+        cfg.model,
+        url,
+        ms,
+        content.trim()
+    ))
+}
+
+/// 当前 LLM 配置的文字说明（不联网，只说清"会怎么走"）。
+pub fn describe(cfg: &LlmConfig) -> String {
+    let key_state = match std::env::var(&cfg.api_key_env) {
+        Ok(v) if !v.trim().is_empty() => format!("已设置（{} 位字符）", v.trim().len()),
+        _ => format!("未设置 → 不会联网，Ctrl+G 走本地规则"),
+    };
+
+    format!(
+        "LLM 状态\n  启用: {}\n  地址: {}\n  模型: {}\n  Key 环境变量: {}（{}）\n  发送 diff: {}（{}）\n  超时: {} 秒\n\n{}",
+        cfg.enabled,
+        cfg.base_url,
+        cfg.model,
+        cfg.api_key_env,
+        key_state,
+        cfg.send_diff,
+        if cfg.send_diff {
+            "会带代码正文出网"
+        } else {
+            "只发文件路径和状态"
+        },
+        cfg.timeout_secs,
+        if cfg.enabled {
+            "用 svnui llm --test 实发一个请求验证连通性"
+        } else {
+            "在 ~/.config/svnui/config.toml 里把 llm.enabled 改成 true 启用"
+        }
+    )
+}
+
 /// 构造提示词。
 ///
 /// 明确要求"只输出提交信息本身、每行一条" —— 不然模型很爱先来一段

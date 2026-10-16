@@ -272,6 +272,34 @@ pub enum Cmd {
         since: Option<u64>,
     },
 
+    /// LLM 配置自检：当前会用哪条路径生成提交信息、能不能连上。
+    ///
+    /// 配置写错时 TUI 只静默回退本地规则，看着和"没接上"一样 ——
+    /// 这个命令把"到底生效没"说清楚。
+    Llm {
+        /// 实发一个最小请求验证连通性（会消耗少量 token）。
+        #[arg(long)]
+        test: bool,
+    },
+
+    /// 配置文件状态与初始化。
+    ///
+    /// 不带参数：显示路径、是否存在、当前生效的关键项。
+    /// --init：写一份默认配置（已存在时不覆盖，加 --force 才覆盖）。
+    Config {
+        /// 写入默认配置文件。
+        #[arg(long)]
+        init: bool,
+
+        /// 配合 --init 使用：覆盖已有文件。
+        #[arg(long)]
+        force: bool,
+
+        /// 只打印配置文件路径，方便 `vim $(svnui config --path)`。
+        #[arg(long)]
+        path: bool,
+    },
+
     /// 查看 / 清理状态缓存。
     Cache {
         /// 删除缓存文件。
@@ -378,6 +406,51 @@ fn emit_err(cli: &Cli, e: &crate::domain::Error) {
     }
 }
 
+/// LLM 自检输出。不联网时只描述配置；`--test` 才实发请求。
+fn llm_report(test: bool) -> String {
+    let cfg = crate::config::Config::load();
+    let mut out = crate::llm::describe(&cfg.llm);
+
+    if test {
+        out.push_str("\n\n");
+        match crate::llm::ping(&cfg.llm) {
+            Ok(s) => out.push_str(&s),
+            Err(e) => out.push_str(&format!("连通性测试失败：{}", e)),
+        }
+    }
+    out
+}
+
+/// 配置文件自检。`--init` 写入默认配置，`--path` 只打路径。
+fn config_report(
+    init: bool,
+    force: bool,
+    path_only: bool,
+) -> Result<String, crate::domain::Error> {
+    // --path 也顺手补一份：否则 vim 打开的是不存在的文件，白高兴一场。
+    if path_only {
+        crate::config::Config::ensure_file();
+        return Ok(crate::config::Config::path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "（拿不到路径：HOME 未设置）".to_string()));
+    }
+
+    if init {
+        let p = crate::config::Config::write_default(force)?;
+        return Ok(format!(
+            "配置文件已写入 {}\n{}\n\n改完可用 `svnui config` 复核。",
+            p.display(),
+            if force {
+                "（已覆盖原有文件）"
+            } else {
+                "（原文件已存在则未改动）"
+            }
+        ));
+    }
+
+    Ok(crate::config::Config::load().describe())
+}
+
 fn dispatch(cli: &Cli, svn: &crate::svn::Svn, tty: bool) -> Result<String, crate::domain::Error> {
     use self::daemon as daemon_cmd;
 
@@ -419,6 +492,8 @@ fn dispatch(cli: &Cli, svn: &crate::svn::Svn, tty: bool) -> Result<String, crate
         Cmd::Info => query::info(cli, svn),
         Cmd::Diff { stat, rev, page, paths } => query::diff(cli, svn, *stat, rev.as_deref(), *page, paths),
         Cmd::Conflicts => rescue::conflicts(cli, svn, tty),
+        Cmd::Llm { test } => Ok(llm_report(*test)),
+        Cmd::Config { init, force, path } => config_report(*init, *force, *path),
 
         Cmd::Add { paths } => mutate::add(svn, paths),
         Cmd::Remove { keep_local, yes, paths } => {
