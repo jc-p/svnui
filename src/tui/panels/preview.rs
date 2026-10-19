@@ -49,6 +49,8 @@ pub struct PreviewPanel {
     kind: Kind,
     title: String,
     lines: Vec<Line<'static>>,
+    /// 内容构造时计算，避免每帧遍历全部文本。
+    max_width: u16,
     /// 顶部横幅（提示语）。占内容区第一行，**不随滚动移动**。
     banner: Option<String>,
     image: Option<StatefulProtocol>,
@@ -81,6 +83,25 @@ impl PreviewPanel {
     pub fn diff(title: impl Into<String>, raw: &str) -> Self {
         let lines: Vec<Line<'static>> = raw.lines().take(MAX_LINES).map(colorize_diff).collect();
         Self::with_lines(Kind::Diff, title, lines, None)
+    }
+
+    /// 只读预览的截断提示独立显示，不混入 diff 正文。
+    pub(crate) fn diff_with_limits(
+        title: impl Into<String>,
+        raw: &str,
+        stdout_truncated: bool,
+        stderr_truncated: bool,
+    ) -> Self {
+        let mut panel = Self::diff(title, raw);
+        let lines_truncated = raw.lines().nth(MAX_LINES).is_some();
+        if stdout_truncated || lines_truncated {
+            panel.banner = Some(format!(
+                "预览已截断 · 最多显示 {MAX_LINES} 行 · 返回文件树后按 E 编辑或 o 系统打开查看完整文件"
+            ));
+        } else if stderr_truncated {
+            panel.banner = Some("SVN 诊断输出已截断 · diff 正文完整".into());
+        }
+        panel
     }
 
     /// 文件内容。行号暗色显示，正文不套 diff 着色规则。
@@ -152,7 +173,10 @@ impl PreviewPanel {
         lines: Vec<Line<'static>>,
         banner: Option<String>,
     ) -> Self {
+        let max_width = lines.iter().map(Line::width).max().unwrap_or(0)
+            .min(u16::MAX as usize) as u16;
         Self {
+            max_width,
             kind,
             title: title.into(),
             lines,
@@ -219,8 +243,7 @@ impl PreviewPanel {
 
     /// 按终端显示列计算宽度，中文等宽字符同样计入横向滚动范围。
     fn max_line_width(&self) -> u16 {
-        self.lines.iter().map(Line::width).max().unwrap_or(0)
-            .min(u16::MAX as usize) as u16
+        self.max_width
     }
 
     fn clamp_scroll(&mut self, visible_h: u16) {
@@ -357,6 +380,7 @@ impl PreviewPanel {
                 self.kind = Kind::Notice;
                 self.banner = None;
                 self.lines = vec![Line::from(format!("无法绘制图片：{error}"))];
+                self.max_width = self.lines[0].width().min(u16::MAX as usize) as u16;
                 f.render_widget(Clear, body_area);
                 f.render_widget(Paragraph::new(self.lines.clone()), body_area);
             }
@@ -391,8 +415,11 @@ impl PreviewPanel {
             Rect::default()
         };
 
+        // 未启用换行；只克隆当前视口，纵向偏移已由切片处理。
+        let visible: Vec<_> = self.lines.iter().skip(self.scroll as usize)
+            .take(visible_h as usize).cloned().collect();
         f.render_widget(
-            Paragraph::new(Text::from(self.lines.clone())).scroll((self.scroll, self.h_scroll)),
+            Paragraph::new(Text::from(visible)).scroll((0, self.h_scroll)),
             content,
         );
 
@@ -438,6 +465,52 @@ mod scrollbar_tests {
     fn draw(panel: &mut PreviewPanel, width: u16, height: u16) -> Buffer {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal.draw(|f| panel.render_pane(f, f.area(), true)).unwrap().buffer.clone()
+    }
+
+    #[test]
+    fn viewport_slicing_matches_full_paragraph_with_chinese_and_long_lines() {
+        let raw = (0..100).map(|i| format!("+第{i:03}行：中文与很长的内容{}", "x".repeat(80)))
+            .collect::<Vec<_>>().join("\n");
+        let mut panel = PreviewPanel::diff("viewport", &raw);
+        for (v, h, width, height) in [(0, 0, 40, 12), (30, 7, 40, 12), (99, 90, 24, 6), (70, 2, 60, 20)] {
+            panel.scroll = v;
+            panel.h_scroll = h;
+            let actual = draw(&mut panel, width, height);
+            let area = Rect::new(1, 1, panel.vis_w, panel.vis_h);
+            let mut expected = Buffer::empty(Rect::new(0, 0, width, height));
+            ratatui::widgets::Widget::render(
+                Paragraph::new(Text::from(panel.lines.clone())).scroll((panel.scroll, panel.h_scroll)),
+                area, &mut expected,
+            );
+            for y in area.y..area.bottom() {
+                for x in area.x..area.right() {
+                    assert_eq!(actual[(x, y)].symbol(), expected[(x, y)].symbol(), "at {x},{y}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn preview_diff_limits_are_visible_without_changing_patch_lines() {
+        let raw = "+original patch line\n";
+        for (stdout_cut, stderr_cut, expected) in [
+            (true, false, "预览已截断"),
+            (false, true, "诊断输出已截断"),
+        ] {
+            let panel = PreviewPanel::diff_with_limits("file", raw, stdout_cut, stderr_cut);
+            assert!(panel.banner.as_deref().unwrap().contains(expected));
+            if stdout_cut {
+                assert!(panel.banner.as_deref().unwrap().contains("返回文件树后按 E"));
+            }
+            assert_eq!(panel.lines[0].to_string(), "+original patch line");
+        }
+        assert!(PreviewPanel::diff_with_limits("file", raw, false, false).banner.is_none());
+        let exact = "+line\n".repeat(MAX_LINES);
+        assert!(PreviewPanel::diff_with_limits("file", &exact, false, false).banner.is_none());
+        let over = format!("{exact}+one more\n");
+        let panel = PreviewPanel::diff_with_limits("file", &over, false, false);
+        assert_eq!(panel.lines.len(), MAX_LINES);
+        assert!(panel.banner.unwrap().contains("预览已截断"));
     }
 
     #[test]

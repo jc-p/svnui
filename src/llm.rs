@@ -37,22 +37,11 @@ pub fn suggest(items: &[Item], diff: Option<&str>, cfg: &LlmConfig) -> Result<Ve
         return Err("没有勾选项，无从生成".to_string());
     }
 
-    let key = std::env::var(&cfg.api_key_env)
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            format!(
-                "没读到 API Key：环境变量 {} 未设置或为空（写进 ~/.zshrc 后要 exec zsh）",
-                cfg.api_key_env
-            )
-        })?;
-
     let prompt = build_prompt(items, diff, cfg);
-    let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
+    let url = format!("{}/chat/completions", cfg.endpoint().trim_end_matches('/'));
 
     let body = serde_json::json!({
-        "model": cfg.model,
+        "model": cfg.model_name(),
         "messages": [
             {"role": "user", "content": prompt}
         ],
@@ -61,12 +50,7 @@ pub fn suggest(items: &[Item], diff: Option<&str>, cfg: &LlmConfig) -> Result<Ve
         "max_tokens": 300,
     });
 
-    let resp = ureq::post(&url)
-        .set("Authorization", &format!("Bearer {}", key))
-        .set("Content-Type", "application/json")
-        .timeout(std::time::Duration::from_secs(cfg.timeout_secs.max(1)))
-        .send_json(body)
-        .map_err(|e| format!("请求失败：{}", e))?;
+    let resp = send_request(cfg, &url, body)?;
 
     let v: serde_json::Value = resp
         .into_json()
@@ -78,15 +62,7 @@ pub fn suggest(items: &[Item], diff: Option<&str>, cfg: &LlmConfig) -> Result<Ve
         .and_then(|c| c.get("message"))
         .and_then(|m| m.get("content"))
         .and_then(|c| c.as_str())
-        .ok_or_else(|| {
-            // 常见的是 key 错了被网关挡回来，body 里带 error.message
-            let hint = v
-                .get("error")
-                .and_then(|e| e.get("message"))
-                .and_then(|m| m.as_str())
-                .unwrap_or("（响应里没有 error 字段）");
-            format!("响应格式不符预期：{}", hint)
-        })?;
+        .ok_or_else(|| "模型响应缺少 choices[0].message.content，请检查接口兼容性和模型权限".to_string())?;
 
     let out = parse_candidates(content);
     if out.is_empty() {
@@ -105,31 +81,15 @@ pub fn ping(cfg: &LlmConfig) -> Result<String, String> {
         return Err("llm.enabled = false：配置里没打开，当前走的是本地规则".to_string());
     }
 
-    let key = std::env::var(&cfg.api_key_env)
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            format!(
-                "没读到 API Key：环境变量 {} 未设置或为空（写进 ~/.zshrc 后要 exec zsh）",
-                cfg.api_key_env
-            )
-        })?;
-
-    let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
+    let url = format!("{}/chat/completions", cfg.endpoint().trim_end_matches('/'));
     let body = serde_json::json!({
-        "model": cfg.model,
+        "model": cfg.model_name(),
         "messages": [{"role": "user", "content": "只回复 OK 两个字"}],
         "max_tokens": 16,
     });
 
     let t0 = std::time::Instant::now();
-    let resp = ureq::post(&url)
-        .set("Authorization", &format!("Bearer {}", key))
-        .set("Content-Type", "application/json")
-        .timeout(std::time::Duration::from_secs(cfg.timeout_secs.max(1)))
-        .send_json(body)
-        .map_err(|e| format!("连不上 {}：{}", url, e))?;
+    let resp = send_request(cfg, &url, body)?;
     let ms = t0.elapsed().as_millis();
 
     let v: serde_json::Value = resp
@@ -142,41 +102,77 @@ pub fn ping(cfg: &LlmConfig) -> Result<String, String> {
         .and_then(|c| c.get("message"))
         .and_then(|m| m.get("content"))
         .and_then(|c| c.as_str())
-        .ok_or_else(|| {
-            let hint = v
-                .get("error")
-                .and_then(|e| e.get("message"))
-                .and_then(|m| m.as_str())
-                .unwrap_or("（响应里没有 error 字段，多半是 base_url 不对）");
-            format!("响应格式不符预期：{}", hint)
-        })?;
+        .ok_or_else(|| "模型响应缺少 choices[0].message.content，请检查接口兼容性和模型权限".to_string())?;
 
     Ok(format!(
         "连通正常\n  模型: {}\n  地址: {}\n  耗时: {} ms\n  回复: {}",
-        cfg.model,
+        cfg.model_name(),
         url,
         ms,
         content.trim()
     ))
 }
 
+/// 两条调用路径共享认证与错误诊断，避免自检通过但生成采用另一套配置。
+fn send_request(
+    cfg: &LlmConfig,
+    url: &str,
+    mut body: serde_json::Value,
+) -> Result<ureq::Response, String> {
+    if cfg.endpoint().trim_end_matches('/').ends_with("/chat/completions") {
+        return Err("base_url 不要带 /chat/completions；工具会自动补齐该路径".into());
+    }
+    let mut req = ureq::post(url)
+        .set("Content-Type", "application/json")
+        .timeout(std::time::Duration::from_secs(cfg.timeout_secs.max(1)));
+    if cfg.requires_key() {
+        let key = std::env::var(&cfg.api_key_env)
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .ok_or_else(|| {
+                format!(
+                    "API Key 未设置或为空：{}；设置后重新启动 svnui",
+                    cfg.api_key_env
+                )
+            })?;
+        req = req.set("Authorization", &format!("Bearer {}", key.trim()));
+    }
+    // Flash 默认思考可能耗尽短提交信息的输出预算，仅对已核实的模型关闭。
+    if cfg.model_name() == "glm-4.7-flash" {
+        body["thinking"] = serde_json::json!({"type": "disabled"});
+    }
+    req.send_json(body).map_err(|err| match err {
+        ureq::Error::Status(401 | 403, _) => "认证失败或模型无权限，请检查 API Key 和账号权限".into(),
+        ureq::Error::Status(429, _) => "请求限流或额度不足，请稍后重试并检查服务商额度；不会自动切换付费模型".into(),
+        ureq::Error::Status(404, _) => "接口或模型不存在，请检查 base_url 和 model；本地模型可用 ollama list 查看".into(),
+        ureq::Error::Status(code, _) => format!("模型服务返回 HTTP {code}，请检查服务状态"),
+        ureq::Error::Transport(_) if !cfg.requires_key() => "无法连接 Ollama 或请求超时，请确认本地服务已启动、模型已下载，并检查地址和 timeout_secs".into(),
+        ureq::Error::Transport(_) => "模型请求连接失败或超时，请检查网络、接口地址和 timeout_secs".into(),
+    })
+}
+
 /// 当前 LLM 配置的文字说明（不联网，只说清"会怎么走"）。
 pub fn describe(cfg: &LlmConfig) -> String {
-    let key_state = match std::env::var(&cfg.api_key_env) {
-        Ok(v) if !v.trim().is_empty() => format!("已设置（{} 位字符）", v.trim().len()),
-        _ => format!("未设置 → 不会联网，Ctrl+G 走本地规则"),
+    let key_state = if !cfg.requires_key() {
+        "无需 Key（不发送 Authorization）".to_string()
+    } else {
+        match std::env::var(&cfg.api_key_env) {
+            Ok(v) if !v.trim().is_empty() => "已设置".to_string(),
+            _ => "未设置 → Ctrl+G 回退本地规则".to_string(),
+        }
     };
 
     format!(
-        "LLM 状态\n  启用: {}\n  地址: {}\n  模型: {}\n  Key 环境变量: {}（{}）\n  发送 diff: {}（{}）\n  超时: {} 秒\n\n{}",
+        "LLM 状态\n  预设: {}\n  启用: {}\n  地址: {}\n  模型: {}\n  Key 环境变量: {}（{}）\n  发送 diff: {}（{}）\n  超时: {} 秒\n\n{}",
+        cfg.provider.name(),
         cfg.enabled,
-        cfg.base_url,
-        cfg.model,
+        cfg.endpoint(),
+        cfg.model_name(),
         cfg.api_key_env,
         key_state,
         cfg.send_diff,
         if cfg.send_diff {
-            "会带代码正文出网"
+            "调用方提供时可携带正文；当前 TUI 仅发送路径和状态"
         } else {
             "只发文件路径和状态"
         },

@@ -29,6 +29,47 @@ use std::path::PathBuf;
 
 // ── LLM（提交信息生成）────────────────────────────────────
 
+/// 预设只提供默认地址、模型和认证方式；显式地址与模型仍优先。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LlmProvider {
+    #[default]
+    Deepseek,
+    Zhipu,
+    Ollama,
+}
+
+impl LlmProvider {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Deepseek => "deepseek",
+            Self::Zhipu => "zhipu",
+            Self::Ollama => "ollama",
+        }
+    }
+
+    fn defaults(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Deepseek => ("https://api.deepseek.com/v1", "deepseek-chat"),
+            Self::Zhipu => ("https://open.bigmodel.cn/api/paas/v4", "glm-4.7-flash"),
+            Self::Ollama => ("http://localhost:11434/v1", "qwen2.5-coder:3b"),
+        }
+    }
+}
+
+impl std::str::FromStr for LlmProvider {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "deepseek" => Ok(Self::Deepseek),
+            "zhipu" => Ok(Self::Zhipu),
+            "ollama" => Ok(Self::Ollama),
+            _ => Err("可选预设：zhipu、ollama、deepseek".into()),
+        }
+    }
+}
+
 /// `base_url` 填兼容 OpenAI `/v1/chat/completions` 的地址即可，
 /// 换服务商不用改代码。国内常见的：
 ///
@@ -36,7 +77,7 @@ use std::path::PathBuf;
 /// |---|---|---|
 /// | DeepSeek | `https://api.deepseek.com/v1` | `deepseek-chat` |
 /// | 通义千问 | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `qwen-plus` |
-/// | 智谱 | `https://open.bigmodel.cn/api/paas/v4` | `glm-4-flash` |
+/// | 智谱 | `https://open.bigmodel.cn/api/paas/v4` | `glm-4.7-flash` |
 /// | 本地 Ollama | `http://localhost:11434/v1` | `qwen2.5-coder` |
 /// | 公司内网网关 | 问 IT 要 | — |
 #[derive(Debug, Clone, Deserialize)]
@@ -44,6 +85,8 @@ use std::path::PathBuf;
 pub struct LlmConfig {
     /// 总开关。**默认 false** —— 没配好就别发请求。
     pub enabled: bool,
+
+    pub provider: LlmProvider,
 
     /// 兼容 OpenAI 的接口地址（不带 `/chat/completions`，代码会拼）。
     pub base_url: String,
@@ -83,8 +126,9 @@ impl Default for LlmConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            base_url: "https://api.deepseek.com/v1".to_string(),
-            model: "deepseek-chat".to_string(),
+            provider: LlmProvider::default(),
+            base_url: String::new(),
+            model: String::new(),
             api_key_env: "SVNUI_LLM_KEY".to_string(),
             timeout_secs: 20,
             send_diff: false,
@@ -92,6 +136,38 @@ impl Default for LlmConfig {
             lang: "zh".to_string(),
             extra_prompt: String::new(),
         }
+    }
+}
+
+impl LlmConfig {
+    /// 空值表示采用预设，兼容旧配置的显式 base_url / model。
+    pub fn endpoint(&self) -> &str {
+        if self.base_url.trim().is_empty() {
+            self.provider.defaults().0
+        } else {
+            self.base_url.trim()
+        }
+    }
+
+    pub fn model_name(&self) -> &str {
+        if self.model.trim().is_empty() {
+            self.provider.defaults().1
+        } else {
+            self.model.trim()
+        }
+    }
+
+    pub fn requires_key(&self) -> bool {
+        self.provider != LlmProvider::Ollama
+    }
+
+    /// 只输出配置片段，不写用户文件或读取密钥。
+    pub fn preset_example(provider: LlmProvider) -> String {
+        let (endpoint, model) = provider.defaults();
+        format!(
+            "# 合并到配置文件的 [llm] 段；不要重复添加同名段。\n# 预设地址：{endpoint}\n# 预设模型：{model}\n[llm]\nenabled = true\nprovider = \"{}\"\n# 留空采用预设；自定义地址或模型时填写。\nbase_url = \"\"\nmodel = \"\"\napi_key_env = \"SVNUI_LLM_KEY\"\ntimeout_secs = {}\nsend_diff = false\nlang = \"zh\"\n",
+            provider.name(), if provider == LlmProvider::Ollama { 60 } else { 20 }
+        )
     }
 }
 
@@ -210,11 +286,15 @@ enabled = false
 # 换服务商只改这两行，不用改代码：
 #   DeepSeek   https://api.deepseek.com/v1                          deepseek-chat
 #   通义千问    https://dashscope.aliyuncs.com/compatible-mode/v1    qwen-plus
-#   智谱       https://open.bigmodel.cn/api/paas/v4                  glm-4-flash
+#   智谱       https://open.bigmodel.cn/api/paas/v4                  glm-4.7-flash
 #   本地 Ollama http://localhost:11434/v1                            qwen2.5-coder
 #   公司网关    问 IT
-base_url = "https://api.deepseek.com/v1"
-model = "deepseek-chat"
+# zhipu：云端免费模型（需要 Key，额度以服务商为准）；ollama：本地免 Key。
+# 查看配置示例：svnui llm --preset zhipu / svnui llm --preset ollama
+provider = "deepseek"
+# 留空使用预设；显式配置优先于预设，切换预设时请清空旧覆盖值。
+base_url = ""
+model = ""
 
 # API Key 从哪个环境变量读。
 # 不把 key 写进配置文件：配置文件容易被误 git add，而 key 泄露没法撤销。
@@ -288,6 +368,18 @@ impl Config {
         }
     }
 
+    /// LLM 自检保留配置错误，不把配置拼错误报成“尚未启用”。
+    pub fn load_checked() -> Result<Self, String> {
+        let path = Self::path().ok_or("无法确定配置文件路径")?;
+        match std::fs::read_to_string(&path) {
+            Ok(text) => toml::from_str(&text).map_err(|_: toml::de::Error| {
+                "配置文件格式或字段无效，请检查 provider、字段类型和引号（未使用默认配置）".into()
+            }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(_) => Err("无法读取配置文件，请检查路径与权限".into()),
+        }
+    }
+
     /// 配置文件路径。找不到 home 时返回 `None`。
     pub fn path() -> Option<PathBuf> {
         if let Some(p) = std::env::var_os("SVNUI_CONFIG") {
@@ -357,7 +449,6 @@ impl Config {
         let p = Self::path()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "（未知：HOME 未设置）".to_string());
-        let key_ok = std::env::var_os(&self.llm.api_key_env).is_some();
         let mut out = String::new();
         out.push_str("配置文件\n");
         out.push_str(&format!("  路径: {}\n", p));
@@ -369,20 +460,9 @@ impl Config {
                 "不存在（用内置默认）"
             }
         ));
-        out.push_str("\n提交信息生成（LLM）\n");
-        out.push_str(&format!("  启用: {}\n", self.llm.enabled));
-        out.push_str(&format!("  地址: {}\n", self.llm.base_url));
-        out.push_str(&format!("  模型: {}\n", self.llm.model));
-        out.push_str(&format!(
-            "  Key 环境变量: {}（{}）\n",
-            self.llm.api_key_env,
-            if key_ok {
-                "已设置"
-            } else {
-                "未设置 → 不会联网，Ctrl+G 走本地规则"
-            }
-        ));
-        out.push_str(&format!("  发送 diff: {}\n", self.llm.send_diff));
+        out.push('\n');
+        out.push_str(&crate::llm::describe(&self.llm));
+        out.push('\n');
         out.push_str("\nSVN\n");
         out.push_str(&format!("  信任证书: {}\n", self.svn.trust_cert));
         out.push_str("\n界面\n");
@@ -418,8 +498,8 @@ mod tests {
         let c: Config = toml::from_str("[llm]\nenabled = true\nmodel = \"glm-4\"\n").unwrap();
         assert!(c.llm.enabled);
         assert_eq!(c.llm.model, "glm-4");
-        // 未写的字段仍应是默认，不是空串
-        assert_eq!(c.llm.base_url, LlmConfig::default().base_url);
+        // 空覆盖值会解析到 DeepSeek 默认地址，保持旧配置行为。
+        assert_eq!(c.llm.endpoint(), "https://api.deepseek.com/v1");
         assert_eq!(c.llm.api_key_env, "SVNUI_LLM_KEY");
     }
 

@@ -1,51 +1,43 @@
 #!/usr/bin/env bash
-# 一条命令发版：改版本号 → 提交 → push → 打包 → 发 Release → 更新 tap。
-#
-#   ./scripts/release.sh 0.2.0
-#   ./scripts/release.sh 0.2.0 --host-only     # 之后的参数原样透传给 dist.sh
-#
-# 等价于手动三步：
-#   ./scripts/bump.sh 0.2.0
-#   git push origin main
-#   ./scripts/dist.sh
-#
-# 为什么要先 push main 再跑 dist.sh：
-#   gh release create 建的 tag 指向远端默认分支的 HEAD。本地 commit 了但没推，
-#   tag 就会指到上一个提交 —— 二进制是对的（本地编的），但 tag 对不上源码，
-#   以后翻历史会困惑。
-#
-# 只走本地发布。想改用 GitHub Actions，就别跑这个脚本，改成：
-#   ./scripts/bump.sh 0.2.0
-#   git push origin main && git push origin 0.2.0
-# 两条路线别同时跑，否则本地和 CI 抢着上传同名 asset，
-# tap 里的 sha256 可能对不上最终文件。
-
+# ./scripts/release.sh <版本> [dist.sh 参数]
+# --no-publish 只打包当前版本，必须在任何版本/Git 写操作前分流。
 set -euo pipefail
-
 cd "$(dirname "$0")/.."
-
 NEW="${1:-}"
-if [ -z "$NEW" ]; then
-  echo "用法: $0 <新版本号> [dist.sh 参数...]"
-  echo ""
-  echo "  例如:"
-  echo "    $0 0.2.0                # 完整发布"
-  echo "    $0 0.2.0 --host-only    # 只编本机架构"
-  echo "    $0 0.2.0 --no-publish   # 只打包，不碰远端"
-  exit 1
-fi
+[ -n "${NEW}" ] || { echo "用法: $0 <版本> [--no-publish] [--offline] [--tap-dir <dir>]" >&2; exit 1; }
 shift
-
-# ① 改版本号 + commit + 打本地 tag
-./scripts/bump.sh "$NEW"
-
-# ② 推提交（tag 不需要推，dist.sh 里 gh release create 会在远端建）
-BR="$(git rev-parse --abbrev-ref HEAD)"
-echo ""
-echo "── 推送 ${BR} ──"
-git push origin "$BR"
-echo "  ✓"
-
-# ③ 打包 + 发布 + 更新 tap
-echo ""
-./scripts/dist.sh "$@"
+NEW="${NEW#v}"
+NO_PUBLISH=0 TAP_ONLY=0
+for arg in "$@"; do
+  case "$arg" in --no-publish) NO_PUBLISH=1 ;; --tap-only) TAP_ONLY=1 ;; esac
+done
+CURRENT="$(python3 - <<'PY'
+import pathlib, re
+package = re.search(r'(?ms)^\[package\]\s*\n(.*?)(?=^\[|\Z)', pathlib.Path('Cargo.toml').read_text())
+print(re.search(r'(?m)^version\s*=\s*"([^"]+)"', package[1])[1])
+PY
+)"
+if [ "${NO_PUBLISH}" = 1 ] || [ "${TAP_ONLY}" = 1 ]; then
+  [ "${NEW}" = "${CURRENT}" ] || { echo "纯打包/恢复只接受当前版本 ${CURRENT}，不修改版本或 Git" >&2; exit 1; }
+  exec ./scripts/dist.sh "$@"
+fi
+# 提前验证参数，避免拼错选项后才发现已经产生版本提交。
+args=("$@")
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --offline|--no-push|--brew-update) shift ;;
+    --tap-dir) [ "$#" -ge 2 ] && [ -n "$2" ] || exit 1; shift 2 ;;
+    *) echo "完整发布不支持参数: $1" >&2; exit 1 ;;
+  esac
+done
+if [ "${NEW}" != "${CURRENT}" ]; then
+  ./scripts/bump.sh "${NEW}"
+fi
+COMMIT="$(git rev-parse HEAD)"
+echo "发布提交: ${COMMIT}；后续失败保留提交和 tag，不自动回退"
+git push origin HEAD
+# macOS Bash 3 在 nounset 下展开空数组会报错，空参数单独处理。
+if [ "${#args[@]}" -gt 0 ]; then
+  exec ./scripts/dist.sh "${args[@]}"
+fi
+exec ./scripts/dist.sh

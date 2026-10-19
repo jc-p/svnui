@@ -4,13 +4,16 @@
 //! 恢复终端状态（包括 panic）。
 
 pub mod app;
-pub mod panels;
-pub mod theme;
-mod refresh;
 mod image_support;
+pub mod panels;
+mod preview_worker;
+mod refresh;
+pub mod theme;
 
 use std::io::{self, Stdout};
 use std::process::Command;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyEventKind};
@@ -24,9 +27,7 @@ use crossterm::terminal::{
 // crossterm 不认识这个序列，会把开头的 `\x1b` **单独解析成一个 Esc 键**。
 // 后果：在提交框里 Cmd+V 粘贴 → 收到 Esc → 弹框被当成"取消"关掉，
 // 刚写的东西全丢。开了之后整段粘贴作为一个 Paste 事件投递。
-use crossterm::event::{
-    DisableBracketedPaste, EnableBracketedPaste,
-};
+use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 // 鼠标滚轮。开着它，滚轮才能滚预览（触控板横滑也能横向滚）。
 //
 // ⚠️ 代价：终端不再处理鼠标，文本选中复制会失效。
@@ -42,39 +43,154 @@ use app::App;
 
 type Backend = CrosstermBackend<Stdout>;
 
-/// 终端守卫。
-///
-/// ⚠️ 为什么要有这个类型：TUI 一旦进了 raw mode + alternate screen，
-///    如果中途 panic 或提前 return，用户的终端就废了（输入不回显、看不到历史）。
-///
-///    之前用 pager 时踩过类似的坑。所以这里用 Drop 兜底 ——
-///    **任何**退出路径都会恢复终端，不需要每个分支手写 cleanup。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TerminalMode {
+    Raw = 1,
+    Alternate = 2,
+    Paste = 4,
+    Mouse = 8,
+    HiddenCursor = 16,
+}
+
+#[derive(Default)]
+struct TerminalState {
+    active: AtomicU8,
+}
+
+impl TerminalState {
+    fn restore_after_panic_with(
+        &self,
+        session_thread: std::thread::ThreadId,
+        apply: &mut impl FnMut(TerminalMode, bool) -> io::Result<()>,
+    ) -> io::Result<()> {
+        // 后台任务可以捕获 panic 并继续工作，其 hook 不得让前台终端退出 raw mode。
+        if std::thread::current().id() == session_thread {
+            self.restore_with(apply)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn set_with(
+        &self,
+        mode: TerminalMode,
+        enabled: bool,
+        apply: &mut impl FnMut(TerminalMode, bool) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let flag = mode as u8;
+        // 控制序列可能在报错前已部分写出，启用失败也须尝试恢复。
+        if enabled {
+            self.active.fetch_or(flag, Ordering::SeqCst);
+        }
+        apply(mode, enabled)?;
+        if !enabled {
+            self.active.fetch_and(!flag, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+
+    fn enter_with(
+        &self,
+        mouse: bool,
+        apply: &mut impl FnMut(TerminalMode, bool) -> io::Result<()>,
+    ) -> io::Result<()> {
+        for mode in [
+            TerminalMode::Raw,
+            TerminalMode::Alternate,
+            TerminalMode::Paste,
+        ] {
+            self.set_with(mode, true, apply)?;
+        }
+        if mouse {
+            self.set_with(TerminalMode::Mouse, true, apply)?;
+        }
+        self.set_with(TerminalMode::HiddenCursor, true, apply)
+    }
+
+    fn restore_with(
+        &self,
+        apply: &mut impl FnMut(TerminalMode, bool) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let mut first_error = None;
+        // 一项失败仍恢复其他模式，失败项保留供 Drop 再试。
+        for mode in [
+            TerminalMode::HiddenCursor,
+            TerminalMode::Mouse,
+            TerminalMode::Paste,
+            TerminalMode::Alternate,
+            TerminalMode::Raw,
+        ] {
+            if self.active.load(Ordering::SeqCst) & mode as u8 != 0 {
+                if let Err(error) = self.set_with(mode, false, apply) {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+}
+
+fn apply_terminal_mode(mode: TerminalMode, enabled: bool) -> io::Result<()> {
+    let mut stdout = io::stdout();
+    match (mode, enabled) {
+        (TerminalMode::Raw, true) => enable_raw_mode(),
+        (TerminalMode::Raw, false) => disable_raw_mode(),
+        (TerminalMode::Alternate, true) => execute!(stdout, EnterAlternateScreen),
+        (TerminalMode::Alternate, false) => execute!(stdout, LeaveAlternateScreen),
+        (TerminalMode::Paste, true) => execute!(stdout, EnableBracketedPaste),
+        (TerminalMode::Paste, false) => execute!(stdout, DisableBracketedPaste),
+        (TerminalMode::Mouse, true) => execute!(stdout, EnableMouseCapture),
+        (TerminalMode::Mouse, false) => execute!(stdout, DisableMouseCapture),
+        (TerminalMode::HiddenCursor, true) => execute!(stdout, crossterm::cursor::Hide),
+        (TerminalMode::HiddenCursor, false) => execute!(stdout, crossterm::cursor::Show),
+    }
+}
+
+/// 首次改变终端前建立保障；Terminal::new 失败时也能清理。
+struct TerminalModes(Arc<TerminalState>);
+
+impl Drop for TerminalModes {
+    fn drop(&mut self) {
+        let _ = self.0.restore_with(&mut apply_terminal_mode);
+    }
+}
+
 struct TerminalGuard {
     term: Terminal<Backend>,
+    modes: TerminalModes,
 }
 
 impl TerminalGuard {
-    fn enter() -> io::Result<Self> {
-        enable_raw_mode()?;
-        let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen)?;
-        execute!(stdout, EnableBracketedPaste)?;
-        // 鼠标捕获默认不开：开了之后终端不再处理鼠标（无法选中复制），
-        // 且鼠标移动事件会淹没键盘事件。需要时按 M 键再开。
-        let backend = CrosstermBackend::new(stdout);
-        let term = Terminal::new(backend)?;
-        Ok(Self { term })
+    fn enter(state: Arc<TerminalState>) -> io::Result<Self> {
+        let modes = TerminalModes(state);
+        // 鼠标默认关闭以便选择复制，M 键开启后单独记录。
+        modes.0.enter_with(false, &mut apply_terminal_mode)?;
+        let term = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+        Ok(Self { term, modes })
+    }
+
+    fn suspend(&mut self) -> io::Result<()> {
+        self.modes.0.restore_with(&mut apply_terminal_mode)
+    }
+
+    fn resume(&mut self, mouse: bool) -> io::Result<()> {
+        self.modes.0.enter_with(mouse, &mut apply_terminal_mode)?;
+        self.term.clear()
+    }
+
+    fn set_mouse(&mut self, enabled: bool) -> io::Result<()> {
+        self.modes
+            .0
+            .set_with(TerminalMode::Mouse, enabled, &mut apply_terminal_mode)
     }
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = disable_raw_mode();
-        let _ = execute!(self.term.backend_mut(), DisableBracketedPaste);
-        // 必须关：不退出的编辑器（vim）会读到一串鼠标转义序列。
-        let _ = execute!(self.term.backend_mut(), DisableMouseCapture);
-        let _ = execute!(self.term.backend_mut(), LeaveAlternateScreen);
-        let _ = self.term.show_cursor();
+        let _ = self.suspend();
     }
 }
 
@@ -132,21 +248,35 @@ fn evlog(ev: &Event) {
 ///
 /// `svn` 由调用方构造（已 discover 过工作副本）。
 pub fn run(svn: Svn) -> Result<()> {
-    let mut guard = TerminalGuard::enter()?;
+    let state = Arc::new(TerminalState::default());
+    let session_thread = std::thread::current().id();
+    // hook 先于终端初始化生效，panic 输出前恢复全部登记模式。
+    let previous_hook = std::panic::take_hook();
+    let panic_hook: Arc<dyn Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync> =
+        Arc::from(previous_hook);
+    let hook_state = Arc::clone(&state);
+    let hook = Arc::clone(&panic_hook);
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = hook_state.restore_after_panic_with(session_thread, &mut apply_terminal_mode);
+        hook(info);
+    }));
+    // set_hook 不能在展开期间执行；先捕获清理，再还原 hook、恢复展开。
+    let outcome =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_session(svn, state)));
+    std::panic::set_hook(Box::new(move |info| panic_hook(info)));
+    match outcome {
+        Ok(result) => result,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
+fn run_session(svn: Svn, state: Arc<TerminalState>) -> Result<()> {
+    let mut guard = TerminalGuard::enter(state)?;
 
     // 开诊断时先清空日志，免得跟上一次的混在一起判读不了。
     if std::env::var_os("SVNUI_DEBUG_KEY").is_some() {
         let _ = std::fs::write("/tmp/svnui-key.log", "");
     }
-
-    // panic 兜底：默认 panic hook 会在 alternate screen 里打印，
-    // 用户看不到任何东西。这里先恢复终端再让默认 hook 输出。
-    let default_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
-        default_hook(info);
-    }));
 
     let mut app = App::with_image_picker(svn, image_support::detect())?;
 
@@ -154,22 +284,11 @@ pub fn run(svn: Svn) -> Result<()> {
         // 外部编辑器：必须先让出终端，否则 vim 在 raw mode + alternate screen 里
         // 会行为异常（方向键/退格/Ctrl-C 全乱）。让出 → 编辑 → 收回。
         if let Some((editor, path)) = app.take_editor_request() {
-            let _ = disable_raw_mode();
-            let _ = execute!(guard.term.backend_mut(), DisableMouseCapture);
-            let _ = execute!(guard.term.backend_mut(), LeaveAlternateScreen);
-            let _ = guard.term.show_cursor();
-
+            guard.suspend()?;
             let status = Command::new(&editor).arg(&path).status();
 
-            // 无论成功失败都要收回终端，否则界面就没了
-            let _ = execute!(guard.term.backend_mut(), EnterAlternateScreen);
-            let _ = enable_raw_mode();
-            // 按用户当前的开关恢复，别无脑开回来
-            if app.mouse_on() {
-                let _ = execute!(guard.term.backend_mut(), EnableMouseCapture);
-            }
-            let _ = guard.term.hide_cursor();
-            let _ = guard.term.clear();
+            // 启动失败也恢复全部模式，恢复失败则退出并由守卫清理。
+            guard.resume(app.mouse_on())?;
 
             match status {
                 Ok(st) if st.success() => {
@@ -187,21 +306,15 @@ pub fn run(svn: Svn) -> Result<()> {
 
         // M 键改过鼠标开关就在这里生效（App 够不到 backend，只记了个标记）。
         if let Some(on) = app.take_mouse_toggle() {
-            if on {
-                let _ = execute!(guard.term.backend_mut(), EnableMouseCapture);
-            } else {
-                let _ = execute!(guard.term.backend_mut(), DisableMouseCapture);
-            }
+            guard.set_mouse(on)?;
         }
 
+        // 先收后台结果，再绘制，避免已完成的预览额外等待一次 poll。
+        app.tick();
         guard.term.draw(|f| {
             let area = f.area();
             app.render(f, area);
         })?;
-
-        // 收后台任务结果（diff 预览 / 扫描 / add / update / commit）。
-        // 放在 draw 之前，这样结果能在这一帧就显示出来。
-        app.tick();
 
         // 轮询式事件读取。120ms 超时 —— 后台任务完成时靠这个 tick 刷新画面，
         // 太长会让"处理中…"到结果的切换显得迟钝。
@@ -267,4 +380,183 @@ pub fn run(svn: Svn) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod terminal_tests {
+    use super::{TerminalMode::*, *};
+
+    const ENTER: [TerminalMode; 5] = [Raw, Alternate, Paste, Mouse, HiddenCursor];
+
+    #[test]
+    fn every_initialization_failure_cleans_attempted_modes_in_reverse_order() {
+        for failed in 0..ENTER.len() {
+            let state = TerminalState::default();
+            let mut calls = Vec::new();
+            let result = state.enter_with(true, &mut |mode, enabled| {
+                calls.push((mode, enabled));
+                if mode == ENTER[failed] {
+                    Err(io::Error::other("injected initialization failure"))
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(result.is_err());
+            state
+                .restore_with(&mut |mode, enabled| {
+                    calls.push((mode, enabled));
+                    Ok(())
+                })
+                .unwrap();
+            let expected: Vec<_> = ENTER[..=failed]
+                .iter()
+                .map(|mode| (*mode, true))
+                .chain(ENTER[..=failed].iter().rev().map(|mode| (*mode, false)))
+                .collect();
+            assert_eq!(calls, expected, "failed stage {failed}");
+            assert_eq!(state.active.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[test]
+    fn cleanup_continues_after_failure_and_retries_only_failed_modes() {
+        let state = TerminalState::default();
+        state.enter_with(true, &mut |_, _| Ok(())).unwrap();
+        let mut calls = Vec::new();
+        assert!(state
+            .restore_with(&mut |mode, enabled| {
+                calls.push((mode, enabled));
+                if mode == Paste {
+                    Err(io::Error::other("injected cleanup failure"))
+                } else {
+                    Ok(())
+                }
+            })
+            .is_err());
+        assert_eq!(
+            calls,
+            vec![
+                (HiddenCursor, false),
+                (Mouse, false),
+                (Paste, false),
+                (Alternate, false),
+                (Raw, false)
+            ]
+        );
+        calls.clear();
+        state
+            .restore_with(&mut |mode, enabled| {
+                calls.push((mode, enabled));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(calls, vec![(Paste, false)]);
+        state
+            .restore_with(&mut |_, _| panic!("clean state must be a no-op"))
+            .unwrap();
+    }
+
+    #[test]
+    fn editor_round_trip_restores_paste_and_current_mouse_preference() {
+        for mouse in [false, true] {
+            let state = TerminalState::default();
+            state.enter_with(mouse, &mut |_, _| Ok(())).unwrap();
+            let mut calls = Vec::new();
+            state
+                .restore_with(&mut |mode, enabled| {
+                    calls.push((mode, enabled));
+                    Ok(())
+                })
+                .unwrap();
+            assert!(calls.contains(&(Paste, false)));
+            assert_eq!(calls.contains(&(Mouse, false)), mouse);
+            assert_eq!(state.active.load(Ordering::SeqCst), 0);
+            calls.clear();
+            state
+                .enter_with(mouse, &mut |mode, enabled| {
+                    calls.push((mode, enabled));
+                    Ok(())
+                })
+                .unwrap();
+            assert!(calls.contains(&(Paste, true)));
+            assert_eq!(calls.contains(&(Mouse, true)), mouse);
+        }
+    }
+
+    #[test]
+    fn disabled_mouse_is_not_reenabled_or_disabled_during_cleanup() {
+        let state = TerminalState::default();
+        state.enter_with(false, &mut |_, _| Ok(())).unwrap();
+        state.set_with(Mouse, true, &mut |_, _| Ok(())).unwrap();
+        state.set_with(Mouse, false, &mut |_, _| Ok(())).unwrap();
+        state
+            .restore_with(&mut |mode, _| {
+                assert_ne!(mode, Mouse);
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn interrupted_initialization_keeps_recovery_state_available() {
+        let state = TerminalState::default();
+        let result = std::panic::catch_unwind(|| {
+            let _ = state.enter_with(false, &mut |mode, _| {
+                if mode == Paste {
+                    panic!("injected initialization panic");
+                }
+                Ok(())
+            });
+        });
+        assert!(result.is_err());
+        let mut calls = Vec::new();
+        state
+            .restore_with(&mut |mode, enabled| {
+                calls.push((mode, enabled));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            calls,
+            vec![(Paste, false), (Alternate, false), (Raw, false)]
+        );
+    }
+
+    #[test]
+    fn background_panic_recovery_does_not_restore_session_modes() {
+        let state = Arc::new(TerminalState::default());
+        state.enter_with(true, &mut |_, _| Ok(())).unwrap();
+        let before = state.active.load(Ordering::SeqCst);
+        let session_thread = std::thread::current().id();
+        let background_state = Arc::clone(&state);
+        // 只调用 hook 的恢复分支，不安装全局 hook，避免污染并行测试。
+        std::thread::spawn(move || {
+            background_state
+                .restore_after_panic_with(session_thread, &mut |_, _| {
+                    panic!("background panic must not change terminal modes")
+                })
+                .unwrap();
+        })
+        .join()
+        .unwrap();
+        assert_eq!(state.active.load(Ordering::SeqCst), before);
+        let mut restored = Vec::new();
+        state
+            .restore_after_panic_with(session_thread, &mut |mode, enabled| {
+                restored.push((mode, enabled));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            restored,
+            vec![
+                (HiddenCursor, false),
+                (Mouse, false),
+                (Paste, false),
+                (Alternate, false),
+                (Raw, false)
+            ]
+        );
+        assert_eq!(state.active.load(Ordering::SeqCst), 0);
+    }
 }

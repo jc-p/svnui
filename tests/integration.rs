@@ -11,27 +11,28 @@
 //! cargo test -- --ignored            # 只跑这些
 //! ```
 //!
-//! 没有 svnadmin 时这些测试是 `#[ignore]` + 运行时跳过，不会让 CI 变红。
+//! 默认由 `#[ignore]` 排除；显式执行时工具缺失和准备失败必须报错。
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// 找 svnadmin / svn。没有返回 None，调用方应跳过测试。
-fn tool(name: &str) -> Option<PathBuf> {
-    if let Ok(p) = std::env::var(format!("SVNR_TEST_{}", name.to_uppercase())) {
-        return Some(PathBuf::from(p));
-    }
-    let out = Command::new("which").arg(name).output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    Some(PathBuf::from(String::from_utf8_lossy(&out.stdout).trim()))
+/// 显式执行集成测试即要求工具可用；不把准备失败误报为通过。
+fn tool(name: &str) -> PathBuf {
+    let path = std::env::var_os(format!("SVNR_TEST_{}", name.to_uppercase()))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(name));
+    let out = Command::new(&path)
+        .arg("--version")
+        .output()
+        .unwrap_or_else(|e| panic!("集成测试需要 {name}: {e}"));
+    assert!(out.status.success(), "集成测试工具 {name} 不可用");
+    path
 }
 
-fn svn() -> Option<PathBuf> {
+fn svn() -> PathBuf {
     tool("svn")
 }
-fn svnadmin() -> Option<PathBuf> {
+fn svnadmin() -> PathBuf {
     tool("svnadmin")
 }
 
@@ -39,8 +40,18 @@ fn run(exe: &Path, args: &[&str], cwd: &Path) -> std::io::Result<String> {
     let out = Command::new(exe)
         .args(args)
         .arg("--non-interactive")
+        .env("LC_ALL", "C")
         .current_dir(cwd)
         .output()?;
+    if !out.status.success() {
+        return Err(std::io::Error::other(format!(
+            "{} {:?} 失败 ({}): {}",
+            exe.display(),
+            args,
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        )));
+    }
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
@@ -51,22 +62,34 @@ struct Fixture {
 }
 
 impl Fixture {
-    fn new() -> Option<Self> {
-        let svnadmin = svnadmin()?;
-        let svn = svn()?;
-        let tmp = tempfile::TempDir::new().ok()?;
+    fn new() -> Self {
+        let svnadmin = svnadmin();
+        let svn = svn();
+        let tmp = tempfile::TempDir::new().expect("创建集成测试临时目录");
         let repo = tmp.path().join("repo");
         let wc = tmp.path().join("wc");
 
-        Command::new(&svnadmin).arg("create").arg(&repo).output().ok()?;
+        let created = Command::new(&svnadmin)
+            .arg("create")
+            .arg(&repo)
+            .output()
+            .expect("启动 svnadmin create");
+        assert!(
+            created.status.success(),
+            "创建测试仓库失败: {}",
+            String::from_utf8_lossy(&created.stderr)
+        );
         let url = format!("file://{}", repo.display());
-        Command::new(&svn).arg("co").arg(&url).arg(&wc).arg("--non-interactive").output().ok()?;
-
-        std::fs::write(wc.join("a.txt"), "one\n").ok()?;
-        run(&svn, &["add", "a.txt"], &wc).ok()?;
-        run(&svn, &["ci", "-m", "init"], &wc).ok()?;
-
-        Some(Self { _tmp: tmp, wc })
+        run(
+            &svn,
+            &["co", &url, wc.to_str().expect("临时路径为 UTF-8")],
+            tmp.path(),
+        )
+        .expect("检出测试工作副本");
+        std::fs::write(wc.join("a.txt"), "one\n").expect("创建初始文件");
+        run(&svn, &["add", "a.txt"], &wc).expect("添加初始文件");
+        run(&svn, &["ci", "-m", "init"], &wc).expect("提交初始文件");
+        Self { _tmp: tmp, wc }
     }
 }
 
@@ -77,14 +100,8 @@ impl Fixture {
 #[test]
 #[ignore = "需要 svn + svnadmin"]
 fn conflict_lifecycle_clears_trio_files() {
-    let f = match Fixture::new() {
-        Some(f) => f,
-        None => return,
-    };
-    let svn = match svn() {
-        Some(s) => s,
-        None => return,
-    };
+    let f = Fixture::new();
+    let svn = svn();
 
     // 本地改
     std::fs::write(f.wc.join("a.txt"), "local\n").unwrap();
@@ -92,12 +109,17 @@ fn conflict_lifecycle_clears_trio_files() {
     // 另一个工作副本改同一个文件并提交
     let wc2 = f.wc.parent().unwrap().join("wc2");
     let url = format!("file://{}", f.wc.parent().unwrap().join("repo").display());
-    Command::new(&svn).args(["co", &url, wc2.to_string_lossy().as_ref()]).arg("--non-interactive").output().unwrap();
+    run(
+        &svn,
+        &["co", &url, wc2.to_str().unwrap()],
+        f.wc.parent().unwrap(),
+    )
+    .unwrap();
     std::fs::write(wc2.join("a.txt"), "remote\n").unwrap();
     run(&svn, &["ci", "-m", "remote"], &wc2).unwrap();
 
     // 回来 update，应产生冲突
-    let _ = run(&svn, &["up", "--accept", "postpone"], &f.wc);
+    run(&svn, &["up", "--accept", "postpone"], &f.wc).expect("更新并制造冲突");
 
     let st = run(&svn, &["status"], &f.wc).unwrap();
     assert!(
@@ -135,21 +157,18 @@ fn conflict_lifecycle_clears_trio_files() {
 #[test]
 #[ignore = "需要 svn + svnadmin"]
 fn commit_produces_revision_and_clears_status() {
-    let f = match Fixture::new() {
-        Some(f) => f,
-        None => return,
-    };
-    let svn = match svn() {
-        Some(s) => s,
-        None => return,
-    };
+    let f = Fixture::new();
+    let svn = svn();
 
     std::fs::write(f.wc.join("a.txt"), "changed\n").unwrap();
     let st = run(&svn, &["status"], &f.wc).unwrap();
     assert!(st.starts_with('M'), "应先有修改状态，实际：{st}");
 
     let ci = run(&svn, &["ci", "-m", "change"], &f.wc).unwrap();
-    assert!(ci.contains("Committed revision"), "提交应回显 revision，实际：{ci}");
+    assert!(
+        ci.contains("Committed revision"),
+        "提交应回显 revision，实际：{ci}"
+    );
 
     let st2 = run(&svn, &["status"], &f.wc).unwrap();
     assert!(st2.trim().is_empty(), "提交后状态应清空，实际：{st2}");
@@ -162,14 +181,8 @@ fn commit_produces_revision_and_clears_status() {
 #[test]
 #[ignore = "需要 svn + svnadmin"]
 fn real_status_parses_without_phantom_paths() {
-    let f = match Fixture::new() {
-        Some(f) => f,
-        None => return,
-    };
-    let svn = match svn() {
-        Some(s) => s,
-        None => return,
-    };
+    let f = Fixture::new();
+    let svn = svn();
 
     std::fs::write(f.wc.join("a.txt"), "x\n").unwrap();
     std::fs::write(f.wc.join("new.txt"), "y\n").unwrap();

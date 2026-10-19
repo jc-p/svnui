@@ -2,7 +2,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::domain::{Error, LogEntry, NodeKind, RepoInfo, Result, Snapshot, StatusEntry, StatusKind};
-use crate::svn::command::{run, run_streaming, run_with_stdin, RawOutput, RunOpts};
+use crate::svn::command::{
+    run, run_preview, run_streaming, run_with_stdin, CancelToken, PreviewOutput, RawOutput, RunOpts,
+};
 use crate::svn::parser::DirEntry;
 
 use super::locator::{relative_to, svn_exe, wc_root};
@@ -77,8 +79,7 @@ impl AuthOpts {
     /// 拼成 svn 全局参数。
     ///
     /// 注意：密码走命令行参数，同主机的其他用户能从 `ps` 看到。
-    /// svn 官方也这样（`--password` 只有这一种传法），
-    /// 所以这里额外提供从 stdin 读的入口，见 `Svn::login`。
+    /// `Svn::login` 在支持的 SVN 版本上改用 stdin，旧版本保留参数兼容回退。
     fn global_args(&self, base: &[String]) -> Vec<String> {
         let mut g = base.to_vec();
         if let Some(u) = &self.username {
@@ -358,6 +359,16 @@ impl Svn {
         }
         let out = run(&self.exe, &args, &self.root, &self.opts(true))?;
         Ok(out)
+    }
+
+    /// 跟随文件选择的只读预览：可取消、有界正文，普通 CLI diff 保持完整输出契约。
+    pub fn diff_preview(&self, paths: &[PathBuf], cancel: &CancelToken) -> Result<PreviewOutput> {
+        // 与普通 diff 保持同一 SVN 目标语义：工作副本中的 symlink 是受管节点，
+        // 不能 canonicalize 末级链接后把它误判成工作副本之外的目标。
+        let owned: Vec<String> = paths.iter().map(|p| p.to_string_lossy().to_string()).collect();
+        let mut args: Vec<&str> = vec!["diff", "--force"];
+        args.extend(owned.iter().map(String::as_str));
+        run_preview(&self.exe, &args, &self.root, &self.opts(true), cancel)
     }
 
     /// `svn log --xml -v`。
@@ -714,18 +725,27 @@ impl Svn {
     /// 密码优先从 stdin 给（`--password-from-stdin`，svn 1.12+），
     /// 退而求其次才走命令行参数 —— 后者会被 `ps` 看到。
     pub fn login(&self, url: &str, auth: &AuthOpts) -> Result<RawOutput> {
-        let global = auth.global_args(&self.global);
-        let opts = RunOpts { timeout: self.timeout * 4, allow_fail: false, global: global.clone() };
-
         if let (Some(pwd), true) = (&auth.password, self.version.supports_password_from_stdin()) {
-            // 注意：不能同时给 --password 和 --password-from-stdin
-            let mut g = opts.global.clone();
-            g.retain(|a| a != "--password");
-            let stdin_opts = RunOpts { global: g, ..opts.clone() };
+            // 从源头不把密码放进 argv；只删 --password 会留下随后的密码值。
+            let public_auth = AuthOpts {
+                username: auth.username.clone(),
+                password: None,
+                no_auth_cache: auth.no_auth_cache,
+            };
+            let stdin_opts = RunOpts {
+                timeout: self.timeout * 4,
+                allow_fail: false,
+                global: public_auth.global_args(&self.global),
+            };
             let args = vec!["info".to_string(), url.to_string(), "--password-from-stdin".to_string()];
             return run_with_stdin(&self.exe, &args, &self.root, pwd, &stdin_opts);
         }
 
+        let opts = RunOpts {
+            timeout: self.timeout * 4,
+            allow_fail: false,
+            global: auth.global_args(&self.global),
+        };
         run(&self.exe, &["info", url], &self.root, &opts)
     }
 
@@ -952,3 +972,65 @@ match f() {
 }
 }
 
+
+#[cfg(all(test, unix))]
+mod auth_stdin_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn login_password_from_stdin_never_adds_password_to_argv_or_diagnostic() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("fake-svn");
+        // 只使用显式假密码；保存 argv 供断言，stdin 只保存匹配标记。
+        std::fs::write(
+            &exe,
+            r#"#!/bin/sh
+printf '%s\n' "$@" > arguments
+input=$(cat)
+if [ "$input" = 'fake-stdin-private-value' ]; then
+    printf 'matched' > stdin-result
+fi
+printf 'controlled authentication refusal\n' >&2
+exit 7
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let svn = Svn {
+            exe,
+            root: dir.path().to_path_buf(),
+            cwd: dir.path().to_path_buf(),
+            version: SvnVersion {
+                major: 1,
+                minor: 14,
+                patch: 2,
+            },
+            timeout: Duration::from_secs(2),
+            global: vec!["--non-interactive".into()],
+            trust_cert: false,
+        };
+        let auth = AuthOpts {
+            username: Some("test-user".into()),
+            password: Some("fake-stdin-private-value".into()),
+            no_auth_cache: true,
+        };
+        let error = svn
+            .login("https://example.invalid/repository", &auth)
+            .unwrap_err();
+        let argv = std::fs::read_to_string(dir.path().join("arguments")).unwrap();
+        assert!(argv.lines().any(|arg| arg == "--password-from-stdin"));
+        assert!(!argv.lines().any(|arg| arg == "--password"));
+        assert!(!argv.contains("fake-stdin-private-value"));
+        assert!(argv.contains("test-user"));
+        assert!(argv.lines().any(|arg| arg == "--no-auth-cache"));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("stdin-result")).unwrap(),
+            "matched"
+        );
+        assert!(!error.to_string().contains("fake-stdin-private-value"));
+        assert!(
+            matches!(error, Error::SvnFailed { code: 7, stderr } if stderr.contains("controlled authentication refusal"))
+        );
+    }
+}

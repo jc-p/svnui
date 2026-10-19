@@ -24,6 +24,8 @@
 //! `svn update` 要几十秒，这期间**事件循环完全不转** —— 界面冻住、
 //! 按键无响应，看起来就是"卡死"。
 
+mod history;
+
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::{Duration, Instant};
@@ -35,6 +37,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Borders, Clear, Paragraph};
 use ratatui::Frame;
 use crate::tui::image_support::ImageSupport;
+use super::preview_worker::PreviewWorker;
 
 use crate::svn::{StatusOpts, Svn};
 use crate::tui::panels::checkout::CheckoutPanel;
@@ -127,7 +130,6 @@ enum SearchFor {
 }
 
 enum BgDone {
-    Preview(u64, String, PreviewPanel),
     /// (变更条目, 工作副本根)
     Status(bool, crate::domain::Result<(Vec<crate::tui::panels::Item>, PathBuf, String)>),
     Msg(crate::domain::Result<String>),
@@ -153,7 +155,7 @@ enum BgDone {
     ///
     /// 规则候选一起带回来是为了兜底：模型没配、超时、返回怪东西时，
     /// 按 Ctrl+G 还能轮换到规则给的版本，不会变成"按了没反应"。
-    CommitSug(Vec<String>),
+    CommitSug(Vec<String>, String),
     /// 本地状态检查：(用户选择的范围, 固定的操作路径, 最新状态)。
     RevertCheck(
         String,
@@ -238,6 +240,7 @@ pub struct App {
     query: String,
 
     preview_gen: u64,
+    preview_worker: PreviewWorker,
     tx: Sender<BgDone>,
     rx: Receiver<BgDone>,
     busy: Option<String>,
@@ -256,6 +259,9 @@ pub struct App {
     sort: SortMode,
     /// 待打开的外部编辑器请求（路径）。由 `mod.rs` 拿到后让出终端。
     editor_req: Option<(String, PathBuf)>,
+    /// 编辑返回时若有扫描在途，结束后再扫描一次，避免应用编辑前快照。
+    editor_refresh_pending: bool,
+    editor_refresh_loading: bool,
     /// 工作副本根，建树要用。
     root: PathBuf,
     /// 扁平的变更列表（提交面板用）。
@@ -307,6 +313,7 @@ impl App {
             searching: None,
             query: String::new(),
             preview_gen: 0,
+            preview_worker: PreviewWorker::new()?,
             tx,
             rx,
             busy: None,
@@ -319,6 +326,8 @@ impl App {
             notice: None,
             sort: SortMode::Status,
             editor_req: None,
+            editor_refresh_pending: false,
+            editor_refresh_loading: false,
             title: "SVN".to_string(),
             root: PathBuf::new(),
             items: Vec::new(),
@@ -457,12 +466,14 @@ impl App {
     ///
     /// 文件可能已经被改了，缓存的 diff / 内容就过期了。
     pub fn refresh_preview_after_edit(&mut self) {
-        self.spawn_preview();
-        // 顺带让树上的状态标记也更新（新改动要显示出来）。
-        // 这里用同步版：编辑器刚退出，界面还没重绘，用户能容忍一次短阻塞；
-        // 用 spawn_reload 的话状态会晚一拍才出现。
-        if let Err(e) = self.reload_sync() {
-            self.notice = Some(format!("重新扫描失败：{}", e));
+        self.preview_gen = self.preview_gen.wrapping_add(1);
+        self.preview_worker.cancel();
+        self.preview = Some(PreviewPanel::notice("预览", "编辑已返回，正在重新扫描…"));
+        self.editor_refresh_pending = true;
+        self.editor_refresh_loading = true;
+        if self.busy.is_none() {
+            self.editor_refresh_pending = false;
+            self.spawn_reload();
         }
     }
 
@@ -669,7 +680,8 @@ impl App {
 
     fn spawn_preview(&mut self) {
         // 目录和空选中也使旧请求失效，避免迟到的图片覆盖当前选择。
-        self.preview_gen += 1;
+        self.preview_gen = self.preview_gen.wrapping_add(1);
+        self.preview_worker.cancel();
         let Some(node) = self.tree.selected().cloned() else {
             self.preview = None;
             return;
@@ -689,7 +701,6 @@ impl App {
         }
 
         let gen = self.preview_gen;
-        let rel = node.rel.clone();
         let abs = node.abs.clone();
         // 标题用美化后的路径：去掉工作副本根前缀、解掉 percent 编码。
         // 绝对路径会占满整个标题栏，看不出重点。
@@ -697,9 +708,11 @@ impl App {
         let root_str = self.root.to_string_lossy().to_string();
 
         let svn = self.svn.clone();
-        let tx = self.tx.clone();
         let picker = self.image_picker.clone();
-        std::thread::spawn(move || {
+        self.preview_worker.submit(gen, move |cancel| {
+            if cancel.is_cancelled() {
+                return None;
+            }
             let content = match file_preview::load(&abs) {
                 // 删除/缺失项没有本地内容，仍允许查看 SVN 的删除 diff。
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound && matches!(node.sign, 'D' | '!') => {
@@ -707,6 +720,10 @@ impl App {
                 }
                 result => result,
             };
+            // 图片/文档解析内部不可强制中断，结束后立即丢弃过期结果。
+            if cancel.is_cancelled() {
+                return None;
+            }
             let panel = match content {
                 Ok(FileContent::Disabled(reason)) => PreviewPanel::notice(name, reason),
                 Ok(FileContent::Image { pixels, bytes }) => PreviewPanel::image(name, pixels, bytes, &picker),
@@ -715,17 +732,30 @@ impl App {
                     name, &text, "未纳管 · 按 a 添加当前项，或 A 批量添加后才有 diff",
                 ),
                 Ok(FileContent::Text(text)) if matches!(node.sign, ' ' | '\0') => PreviewPanel::file(name, &text),
-                Ok(FileContent::Text(_)) => match svn.diff(&[abs], None, false) {
-                    Ok(out) => PreviewPanel::diff(name, &shorten_paths(&out.stdout, &root_str)),
+                Ok(FileContent::Text(_)) => match svn.diff_preview(&[abs], cancel) {
+                    Ok(out) => PreviewPanel::diff_with_limits(
+                        name, &shorten_paths(&out.output.stdout, &root_str),
+                        out.stdout_truncated, out.stderr_truncated,
+                    ),
+                    Err(crate::domain::Error::Cancelled) => return None,
                     Err(e) => PreviewPanel::notice(name, format!("diff 失败：{}", e)),
                 },
                 Err(e) => PreviewPanel::notice(name, format!("读取失败：{}", e)),
             };
-            let _ = tx.send(BgDone::Preview(gen, rel, panel));
+            if cancel.is_cancelled() { None } else { Some(panel) }
         });
     }
 
+    fn apply_preview(&mut self, generation: u64, panel: PreviewPanel) {
+        if generation == self.preview_gen && !self.should_quit {
+            self.preview = Some(panel);
+        }
+    }
+
     pub fn tick(&mut self) {
+        if let Some((generation, panel)) = self.preview_worker.take_result() {
+            self.apply_preview(generation, panel);
+        }
         if let Some(watch) = self.refresh_watch.as_mut() {
             watch.observe(Instant::now());
         }
@@ -742,12 +772,8 @@ impl App {
 
         while let Ok(done) = self.rx.try_recv() {
             match done {
-                BgDone::Preview(gen, _rel, panel) => {
-                    if gen == self.preview_gen {
-                        self.preview = Some(panel);
-                    }
-                }
                 BgDone::Status(automatic, Ok((items, root, title))) => {
+                    self.editor_refresh_loading = false;
                     let n = items.len();
                     self.items = items;
                     self.root = root;
@@ -770,6 +796,10 @@ impl App {
                     self.busy = None;
                     self.scan_failed = true;
                     self.notice = Some(format!("扫描失败：{}", e));
+                    if self.editor_refresh_loading {
+                        self.preview = Some(PreviewPanel::notice("预览", format!("扫描失败：{e} · 按 R 重试")));
+                        self.editor_refresh_loading = false;
+                    }
                 }
                 BgDone::Msg(Ok(msg)) => {
                     self.busy = None;
@@ -1071,7 +1101,7 @@ impl App {
                         p.set_detail(rev, lines);
                     }
                 }
-                BgDone::CommitSug(cands) => {
+                BgDone::CommitSug(cands, source) => {
                     self.busy = None;
                     if let Some(panel) = self.commit.as_mut() {
                         if cands.is_empty() {
@@ -1079,7 +1109,7 @@ impl App {
                         } else {
                             panel.set_candidates(cands);
                             let msg = panel.next_suggestion();
-                            panel.set_notice(msg);
+                            panel.set_notice(format!("{source} · {msg}"));
                         }
                     }
                 }
@@ -1108,6 +1138,11 @@ impl App {
                     }
                 }
             }
+        }
+        if self.editor_refresh_pending && self.busy.is_none() && !self.should_quit {
+            self.editor_refresh_pending = false;
+            self.editor_refresh_loading = true;
+            self.spawn_reload();
         }
         // 输入提交信息、确认危险操作、搜索时只积累事件，回到空闲主界面再刷新。
         if self.mode == Mode::Browse && self.busy.is_none()
@@ -1214,7 +1249,7 @@ impl App {
             }
         }
 
-        match self.mode {
+        let result = match self.mode {
             Mode::Browse => self.handle_browse_key(key),
             Mode::Commit => self.handle_commit_key(key),
             Mode::Diff => self.handle_diff_key(key),
@@ -1223,7 +1258,11 @@ impl App {
             Mode::Conflict => self.handle_conflict_key(key),
             Mode::Checkout => self.handle_checkout_key(key),
             Mode::Repo => self.handle_repo_key(key),
+        };
+        if self.should_quit {
+            self.preview_worker.cancel();
         }
+        result
     }
 
     /// 把查询词应用到对应目标（实时过滤）。
@@ -1559,14 +1598,21 @@ impl App {
                 let tx = self.tx.clone();
                 self.busy = Some("生成提交信息".to_string());
                 std::thread::spawn(move || {
-                    let cfg = crate::config::Config::load();
                     let items: Vec<(String, char)> = changes
                         .iter()
                         .map(|c| (c.rel.clone(), c.sign))
                         .collect();
-                    let mut out = crate::llm::suggest(&items, None, &cfg.llm).unwrap_or_default();
+                    // 配置错误与请求失败都保留原因；本地规则继续可用，不丢弃草稿。
+                    let (mut out, source) = match crate::config::Config::load_checked() {
+                        Ok(cfg) if !cfg.llm.enabled => (Vec::new(), "本地规则 · AI 未启用".into()),
+                        Ok(cfg) => match crate::llm::suggest(&items, None, &cfg.llm) {
+                            Ok(cands) => (cands, format!("AI · {}", cfg.llm.model_name())),
+                            Err(e) => (Vec::new(), format!("已回退本地规则：{e}")),
+                        },
+                        Err(e) => (Vec::new(), format!("已回退本地规则：{e}")),
+                    };
                     out.extend(crate::tui::panels::commit_gen::suggest(&changes));
-                    let _ = tx.send(BgDone::CommitSug(out));
+                    let _ = tx.send(BgDone::CommitSug(out, source));
                 });
             }
             return Ok(());
@@ -2101,78 +2147,6 @@ impl App {
         self.busy = Some(label.to_string());
         std::thread::spawn(move || {
             let _ = tx.send(BgDone::Msg(f(svn)));
-        });
-    }
-
-    /// 首次打开历史时加载多少条。
-    ///
-    /// 100 而不是 200：svn log 是**联网**操作，每多一条都要等服务器。
-    /// 首屏 100 条足够翻找，更早的靠搜索（服务端 `--search`）定位。
-    const LOG_PAGE: usize = 100;
-
-    fn open_log(&mut self) {
-        self.spawn_log_load(None, Self::LOG_PAGE, false);
-        self.mode = Mode::Log;
-    }
-
-    /// 拉日志。`search` 非空时走服务端 `--search`。
-    ///
-    /// `append`：是否把结果追加到现有列表（搜索是替换，不是追加）。
-    fn spawn_log_load(&mut self, search: Option<String>, limit: usize, append: bool) {
-        let svn = self.svn.clone();
-        let tx = self.tx.clone();
-        // 版本不够就退回本地过滤：旧 svn 不认识 --search，
-        // 直接传会报错。这种情况下至少还能搜已加载的 100 条。
-        let use_search = search.is_some() && svn.supports_log_search();
-        self.busy = Some(match (&search, use_search) {
-            (Some(kw), true) => format!("搜索“{}”…", kw),
-            (Some(_), false) => "搜索（本地）…".into(),
-            (None, _) => "读取历史".into(),
-        });
-        std::thread::spawn(move || {
-            let r = if use_search {
-                svn.log_search(limit, &[], search.as_deref())
-            } else {
-                svn.log(limit, &[])
-            };
-            let _ = tx.send(BgDone::LogLoad(r, search.clone(), append));
-        });
-    }
-
-    /// 查看某个历史版本改了什么（`svn diff -c REV`）。
-    ///
-    /// 用在日志面板里按 Enter：右侧已经能看到"改了哪些文件"（`-v` 摘要），
-    /// 但要看**具体改了什么**得拉完整 diff。
-    fn open_rev_diff(&mut self, rev: u64) {
-        let svn = self.svn.clone();
-        let tx = self.tx.clone();
-        self.busy = Some(format!("读取 r{} 的改动", rev));
-        std::thread::spawn(move || {
-            let r = svn.rev_diff(rev).map(|o| o.stdout);
-            let _ = tx.send(BgDone::RevDiff(rev, r));
-        });
-    }
-
-    fn spawn_log_detail(&mut self) {
-        let Some(rev) = self.logpanel.as_ref().and_then(|p| p.need_detail()) else {
-            return;
-        };
-        let svn = self.svn.clone();
-        let tx = self.tx.clone();
-        std::thread::spawn(move || {
-            let lines = match svn.log_rev(&rev.to_string(), true) {
-                Ok(es) => es
-                    .into_iter()
-                    .flat_map(|e| {
-                        e.paths
-                            .iter()
-                            .map(|p| format!(" {} {}", p.action, p.path))
-                            .collect::<Vec<_>>()
-                    })
-                    .collect::<Vec<_>>(),
-                Err(e) => vec![format!("读取失败：{}", e)],
-            };
-            let _ = tx.send(BgDone::LogDetail(rev, lines));
         });
     }
 
@@ -3372,7 +3346,11 @@ fn humanize_error(e: &crate::domain::Error) -> (String, String) {
         ),
         Error::Timeout(n) => (
             format!("操作超时（{} 秒）", n),
-            "仓库太大或服务器太慢。可以先跑 svnui tui 时避开高峰，或让管理员放宽超时。".into(),
+            "检查网络或缩小查询范围。若刚执行提交、更新等写操作，请先核验仓库和工作副本结果，再决定是否重试。".into(),
+        ),
+        Error::OutputLimit { stream, limit } => (
+            "SVN 输出超过安全上限".into(),
+            format!("{} 超过 {} 字节，未使用不完整的查询结果。请缩小查询范围后重试。", stream, limit),
         ),
         Error::SvnNotFound => (
             "找不到 svn 命令".into(),
@@ -3701,6 +3679,30 @@ mod refresh_tests {
     }
 
     #[test]
+    #[ignore = "需要 svn + svnadmin；验证生成回退提示与人工草稿保护"]
+    fn commit_generation_shows_source_without_overwriting_existing_draft() {
+        let (_tmp, mut app) = temporary_app();
+        app.mode = Mode::Commit;
+        for draft in [None, Some("人工填写的提交信息".to_string())] {
+            app.commit = Some(CommitPanel::new(
+                vec!["a.txt".into()], draft.clone(), vec![Change::new("a.txt", 'M')],
+            ));
+            app.busy = Some("生成提交信息".into());
+            app.tx.send(BgDone::CommitSug(
+                vec!["fix: 完善配置".into()], "已回退本地规则：测试限流".into(),
+            )).unwrap();
+            app.tick();
+            assert!(!app.is_busy());
+            assert_eq!(app.commit.as_ref().unwrap().message(), draft.unwrap_or_else(|| "fix: 完善配置".into()));
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 40)).unwrap();
+            terminal.draw(|f| { let area = f.area(); app.render(f, area); }).unwrap();
+            let text: String = terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
+            let text: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+            assert!(text.contains("已回退本地规则：测试限流"));
+        }
+    }
+
+    #[test]
     #[ignore = "需要 svn + svnadmin；仅操作临时本地仓库"]
     fn unversioned_files_are_visible_before_add_and_committable_after_add() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3819,6 +3821,42 @@ mod refresh_tests {
             app.tick();
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    #[test]
+    #[ignore = "需要 svn + svnadmin；编辑返回扫描在后台执行且不丢失在途后的刷新"]
+    fn editor_return_scans_asynchronously_and_defers_while_busy() {
+        let (_tmp, mut app) = temporary_app();
+        std::fs::write(app.root.join("a.txt"), "edited\n").unwrap();
+        app.refresh_preview_after_edit();
+        assert!(app.is_busy());
+        assert!(app.items.is_empty(), "调用时不能同步应用扫描结果");
+        wait_for_scan(&mut app);
+        assert!(app.items.iter().any(|i| i.rel == "a.txt"));
+
+        app.busy = Some("已有任务".into());
+        std::fs::write(app.root.join("new.txt"), "new\n").unwrap();
+        app.refresh_preview_after_edit();
+        assert!(app.editor_refresh_pending);
+        assert_eq!(app.busy.as_deref(), Some("已有任务"));
+        app.busy = None;
+        app.tick();
+        assert!(app.is_busy());
+        assert!(!app.editor_refresh_pending);
+        wait_for_scan(&mut app);
+        assert!(app.items.iter().any(|i| i.rel == "new.txt"));
+
+        // 缺失 cwd 确定触发命令失败；移走 .svn 时 SVN 可能仅警告并以 0 退出。
+        app.refresh_watch = None;
+        let wc = app.root.clone();
+        let hidden = wc.with_file_name("wc-hidden-for-test");
+        std::fs::rename(&wc, &hidden).unwrap();
+        app.refresh_preview_after_edit();
+        wait_for_scan(&mut app);
+        std::fs::rename(&hidden, &wc).unwrap();
+        assert!(app.scan_failed);
+        assert!(!app.editor_refresh_loading);
+        assert!(app.notice.as_ref().unwrap().contains("扫描失败"));
     }
 
     #[test]
@@ -4117,9 +4155,52 @@ mod refresh_tests {
         let old_gen = app.preview_gen;
         app.tree.set_filter(Some("no-matching-file".into()));
         app.spawn_preview();
-        app.tx.send(BgDone::Preview(old_gen, "picture.png".into(), PreviewPanel::image("old", image::DynamicImage::new_rgb8(8, 8), 0, &ImageSupport::halfblocks()))).unwrap();
+        app.apply_preview(old_gen, PreviewPanel::image("old", image::DynamicImage::new_rgb8(8, 8), 0, &ImageSupport::halfblocks()));
         app.tick();
         assert!(app.preview.is_none());
+    }
+
+    #[test]
+    #[ignore = "需要 svn + svnadmin；验证目录、空选择和退出取消后台预览"]
+    fn preview_invalidations_cancel_running_and_pending_requests() {
+        let (_tmp, mut app) = temporary_app();
+        std::fs::create_dir(app.root.join("folder")).unwrap();
+        app.tree.load_dir("").unwrap();
+        app.tree.set_mode(TreeMode::All);
+        for target in ["empty", "directory", "quit"] {
+            let generation = app.preview_gen;
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            app.preview_worker.submit(generation, move |cancel| {
+                started_tx.send(cancel.clone()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+                Some(PreviewPanel::file("stale", "stale result"))
+            });
+            let token = started_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            app.preview_worker.submit(generation, |_| panic!("pending request must be removed"));
+            match target {
+                "empty" => {
+                    app.tree.set_filter(Some("no-matching-file".into()));
+                    app.spawn_preview();
+                    assert!(app.preview.is_none());
+                    app.tree.set_filter(None);
+                }
+                "directory" => {
+                    select_path(&mut app, "folder");
+                    app.spawn_preview();
+                    assert_eq!(app.preview.as_ref().unwrap().kind(), PreviewKind::Notice);
+                }
+                "quit" => {
+                    app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)).unwrap();
+                    assert!(app.should_quit());
+                }
+                _ => unreachable!(),
+            }
+            assert!(token.is_cancelled(), "{target} must cancel in-flight preview");
+            release_tx.send(()).unwrap();
+            app.apply_preview(generation, PreviewPanel::file("stale", "stale result"));
+            assert_ne!(app.preview.as_ref().map(PreviewPanel::kind), Some(PreviewKind::File));
+        }
     }
 
     fn select_path(app: &mut App, rel: &str) {

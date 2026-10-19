@@ -35,9 +35,13 @@ pub enum Error {
     #[error("failed to parse svn output: {0}")]
     Parse(String),
 
-    /// 超时。一定已经 kill 掉子进程，不会有孤儿进程残留。
+    /// 超时。直接子进程已回收；普通命令不承诺清理后代，写操作须核验实际结果。
     #[error("svn command timed out after {0}s")]
     Timeout(u64),
+
+    /// 需要完整解析的输出超过资源限额；调用方不得消费半份结果。
+    #[error("svn {stream} exceeded the {limit} byte output limit")]
+    OutputLimit { stream: &'static str, limit: usize },
 
     #[error("operation cancelled")]
     Cancelled,

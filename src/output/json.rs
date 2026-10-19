@@ -26,6 +26,7 @@ pub fn kind_of(e: &crate::domain::Error) -> &'static str {
         Error::NotWorkingCopy(_) => "not-working-copy",
         Error::Locked(_) => "locked",
         Error::Timeout(_) => "timeout",
+        Error::OutputLimit { .. } => "output-limit",
         Error::Cancelled => "cancelled",
         Error::SvnFailed { .. } => "svn-failed",
         // 带人话解释的 svn 失败：对外仍归类为 svn-failed，

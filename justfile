@@ -16,11 +16,14 @@ all: install-bin
 
 # 离线单测：不依赖 svn、不依赖网络，CI 可跑
 test:
-	cargo test --offline
+	cargo test --offline --locked
 
 # 全量（含需要真 svn 的集成测试）
-test-all:
-	cargo test
+test-svn:
+	command -v svn && command -v svnadmin
+	cargo test --offline --locked -- --ignored
+
+test-all: test test-svn
 
 # 快速跑一遍，不等 clippy 的慢检查
 check:
@@ -85,6 +88,6 @@ clean:
 	cargo clean
 	rm -rf tests/tmp
 
-.PHONY: default build install-bin all test test-all check lint fmt pre \
+.PHONY: default build install-bin all test test-svn test-all check lint fmt pre \
         gen-fixtures bench plugin plugin-force plugin-check \
         daemon-start daemon-stop clean

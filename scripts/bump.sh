@@ -1,105 +1,39 @@
 #!/usr/bin/env bash
-# 改版本号 + 提交 + 打 tag。
-#
-#   ./scripts/bump.sh 0.2.0
-#
-# tag 统一不带 v 前缀，跟 dist.sh、formula 里的 download 路径保持一致。
-# 差一个 v 就是 404，这个坑踩过三次。
-#
-# 打完 tag 后手动 push（留一步给你反悔）：
-#   git push origin main && git push origin 0.2.0
-#
-# push 之后 GitHub Actions 会自动：
-#   构建两个架构 → 创建 Release → 更新 homebrew tap
-# 本地发布则跑：./scripts/dist.sh
-
+# 修改 package/lock 版本并提交、创建本地 tag；不联网、不构建、不推送。
 set -euo pipefail
-
-NEW="${1:-}"
-if [ -z "$NEW" ]; then
-  echo "用法: $0 <新版本号>   例如: $0 0.2.0"
-  exit 1
+cd "$(dirname "$0")/.."
+NEW="${1:-}"; NEW="${NEW#v}"
+[[ "${NEW}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] || { echo '需要版本号，例如 0.4.2' >&2; exit 1; }
+[ -z "$(git status --porcelain)" ] || { echo '工作区不干净，请先完成当前改动' >&2; exit 1; }
+if git show-ref --verify --quiet "refs/tags/${NEW}"; then
+  echo "tag ${NEW} 已存在，未修改任何文件" >&2; exit 1
 fi
-
-# 允许 "v0.2.0" 和 "0.2.0" 两种写法
-NEW="${NEW#v}"
-
-# 只允许 数字.数字.数字（可带 -rc.1 这类后缀）
-if ! echo "$NEW" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
-  echo "✗ 版本号格式不对: $NEW"
-  echo "  需要形如 0.2.0 或 0.2.0-rc.1"
-  exit 1
-fi
-
-if [ -n "$(git status --porcelain)" ]; then
-  echo "✗ 工作区不干净，先提交或 stash："
-  git status --short
-  exit 1
-fi
-
-OLD="$(python3 -c "
-import re,sys
-for line in open('Cargo.toml',encoding='utf-8'):
-    m = re.match(r'^version\s*=\s*\"(.*)\"\s*$', line)
-    if m:
-        print(m.group(1)); sys.exit(0)
-print('')
-")"
-
-if [ -z "$OLD" ]; then
-  echo "✗ 没在 Cargo.toml 里找到 version"
-  exit 1
-fi
-
-if [ "$OLD" = "$NEW" ]; then
-  echo "✗ 版本号没变（当前就是 $OLD）"
-  exit 1
-fi
-
-echo "版本: $OLD → $NEW"
-
-# 只替换 [package] 段之后的第一个 version。
-# 依赖块里也有很多 version = "..."，所以不能全局替换。
-python3 - "$OLD" "$NEW" <<'PY'
-import re, sys, pathlib
-
-old, new = sys.argv[1], sys.argv[2]
-p = pathlib.Path("Cargo.toml")
-lines = p.read_text(encoding="utf-8").split("\n")
-
-in_package = False
-done = False
-for i, line in enumerate(lines):
-    if re.match(r'^\s*\[', line):
-        in_package = line.strip() == "[package]"
-        continue
-    if in_package and not done:
-        m = re.match(r'^(\s*version\s*=\s*")(.*)("\s*)$', line)
-        if m:
-            lines[i] = f"{m.group(1)}{new}{m.group(3)}"
-            done = True
-
-if not done:
-    sys.exit("✗ 没找到 [package] 段里的 version，未做任何修改")
-
-p.write_text("\n".join(lines), encoding="utf-8")
+BACKUP="$(git rev-parse HEAD)"
+python3 - "${NEW}" <<'PY'
+import pathlib, re, sys
+version = sys.argv[1]
+toml = pathlib.Path('Cargo.toml')
+lock = pathlib.Path('Cargo.lock')
+text, locked = toml.read_text(), lock.read_text()
+package = re.search(r'(?ms)^\[package\]\s*\n(.*?)(?=^\[|\Z)', text)
+if not package:
+    raise SystemExit('未找到 [package]')
+old = re.search(r'(?m)^version\s*=\s*"([^"]+)"', package[1])
+if not old or old[1] == version:
+    raise SystemExit('版本未变化或未找到 package version')
+entries = locked.split('[[package]]')
+matches = [i for i, entry in enumerate(entries) if re.search(r'(?m)^name = "svnui"$', entry)]
+if len(matches) != 1 or not re.search(r'(?m)^version = "' + re.escape(old[1]) + r'"$', entries[matches[0]]):
+    raise SystemExit('Cargo.lock 源版本不一致；未修改')
+new_package = package[1][:old.start(1)] + version + package[1][old.end(1):]
+text = text[:package.start(1)] + new_package + text[package.end(1):]
+entries[matches[0]] = re.sub(r'(?m)^version = "[^"]+"$', lambda _: f'version = "{version}"', entries[matches[0]], count=1)
+# 所有解析完成后才落盘；失败保留文件，调用方明确处理，不自动 reset。
+toml.write_text(text)
+lock.write_text('[[package]]'.join(entries))
 PY
-
-# 让 Cargo.lock 跟着更新（version 变了不刷新 lock 会有警告）
-cargo check --quiet 2>/dev/null || cargo metadata --format-version 1 >/dev/null
-
-git add Cargo.toml
-# Cargo.lock 未必存在（库项目、或被 .gitignore 忽略），
-# 直接 git add 会 fatal: pathspec 不匹配，整个脚本挂掉
-[ -f Cargo.lock ] && git add Cargo.lock
-git commit -m "chore: bump version to $NEW"
-git tag "$NEW"
-
-echo ""
-echo "✓ 已提交并打好 tag $NEW"
-echo ""
-echo "接下来（这一步会触发发布，确认无误再执行）："
-echo "  git push origin main && git push origin $NEW"
-echo ""
-echo "反悔："
-echo "  git tag -d $NEW && git reset --hard HEAD~1"
+trap 'echo "版本步骤失败；保留现场。修改前提交: ${BACKUP}；请检查 git status，不要自动重写历史" >&2' ERR
+git add Cargo.toml Cargo.lock
+git commit -m "chore: bump version to ${NEW}" -m 'AIGC: release helper'
+git tag "${NEW}"
+echo "版本提交与本地 tag 已创建: ${NEW}；尚未推送"

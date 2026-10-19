@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main, 'codex/**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare Rust and SVN
+        run: |
+          rustup toolchain install stable --profile minimal
+          sudo apt-get update -qq
+          sudo apt-get install -y subversion
+          command -v svn
+          command -v svnadmin
+      - uses: Swatinem/rust-cache@v2
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
+      - name: Unit and fixture tests
+        run: cargo test --offline --locked
+      - name: Real SVN regressions (ignored tests are intentional)
+        run: cargo test --offline --locked -- --ignored
+      - name: Feature boundaries
+        run: |
+          cargo check --offline --locked --no-default-features --all-targets
+          cargo check --offline --locked --no-default-features --features tui --all-targets
+      - name: Release script regressions
+        run: |
+          bash -n scripts/dist.sh scripts/release.sh scripts/bump.sh
+          python3 -B -m unittest discover -s tests -p release_scripts.py

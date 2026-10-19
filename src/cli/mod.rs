@@ -272,14 +272,17 @@ pub enum Cmd {
         since: Option<u64>,
     },
 
-    /// LLM 配置自检：当前会用哪条路径生成提交信息、能不能连上。
+    /// LLM 配置示例与自检：查看实际生效的预设、模型及连通性。
     ///
-    /// 配置写错时 TUI 只静默回退本地规则，看着和"没接上"一样 ——
-    /// 这个命令把"到底生效没"说清楚。
+    /// 不依赖 SVN 工作副本；--test 才发送请求，失败返回非零退出码。
     Llm {
         /// 实发一个最小请求验证连通性（会消耗少量 token）。
-        #[arg(long)]
+        #[arg(long, conflicts_with = "preset")]
         test: bool,
+
+        /// 输出 zhipu / ollama / deepseek 配置示例；不写文件、不联网。
+        #[arg(long)]
+        preset: Option<crate::config::LlmProvider>,
     },
 
     /// 配置文件状态与初始化。
@@ -344,6 +347,14 @@ pub fn run(mut cli: Cli) -> i32 {
         return 2;
     }
     
+    // 配置示例和模型自检不使用 SVN，不能被工作副本或 SVN 安装状态阻断。
+    if let Some(Cmd::Llm { test, preset }) = cli.cmd.as_ref() {
+        return match llm_report(*test, *preset) {
+            Ok(text) => { println!("{text}"); 0 }
+            Err(e) => { emit_err(&cli, &e); e.exit_code() }
+        };
+    }
+
     let start = cli.start_dir();
 
     // 这些命令不需要工作副本：
@@ -407,18 +418,20 @@ fn emit_err(cli: &Cli, e: &crate::domain::Error) {
 }
 
 /// LLM 自检输出。不联网时只描述配置；`--test` 才实发请求。
-fn llm_report(test: bool) -> String {
-    let cfg = crate::config::Config::load();
+fn llm_report(test: bool, preset: Option<crate::config::LlmProvider>) -> crate::domain::Result<String> {
+    if let Some(provider) = preset {
+        return Ok(crate::config::LlmConfig::preset_example(provider));
+    }
+    let explain = |summary| crate::domain::Error::Explained { summary, detail: String::new() };
+    let cfg = crate::config::Config::load_checked().map_err(explain)?;
     let mut out = crate::llm::describe(&cfg.llm);
 
     if test {
         out.push_str("\n\n");
-        match crate::llm::ping(&cfg.llm) {
-            Ok(s) => out.push_str(&s),
-            Err(e) => out.push_str(&format!("连通性测试失败：{}", e)),
-        }
+        out.push_str(&crate::llm::ping(&cfg.llm)
+            .map_err(|e| explain(format!("连通性测试失败：{e}")))?);
     }
-    out
+    Ok(out)
 }
 
 /// 配置文件自检。`--init` 写入默认配置，`--path` 只打路径。
@@ -492,7 +505,7 @@ fn dispatch(cli: &Cli, svn: &crate::svn::Svn, tty: bool) -> Result<String, crate
         Cmd::Info => query::info(cli, svn),
         Cmd::Diff { stat, rev, page, paths } => query::diff(cli, svn, *stat, rev.as_deref(), *page, paths),
         Cmd::Conflicts => rescue::conflicts(cli, svn, tty),
-        Cmd::Llm { test } => Ok(llm_report(*test)),
+        Cmd::Llm { test, preset } => llm_report(*test, *preset),
         Cmd::Config { init, force, path } => config_report(*init, *force, *path),
 
         Cmd::Add { paths } => mutate::add(svn, paths),

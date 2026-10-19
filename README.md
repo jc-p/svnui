@@ -331,6 +331,41 @@ Ghostty/Kitty 使用 Kitty 图片协议，iTerm2/WezTerm/Rio 使用 iTerm2 图�
 
 ---
 
+## AI 生成提交信息
+
+提交面板按 `Ctrl+G` 生成可编辑候选，再按一次轮换候选。生成不会自动提交，已有编辑内容不会被覆盖。默认未启用 AI 时使用本地规则。
+
+先查看配置示例（不联网、不写文件，也不要求 SVN 工作副本）：
+
+```bash
+svnui llm --preset zhipu
+svnui llm --preset ollama
+```
+
+将所需示例合并到 `~/.config/svnui/config.toml` 的 `[llm]` 段；也支持 `SVNUI_CONFIG` 或 `XDG_CONFIG_HOME`。不要重复添加同名段。最小配置：
+
+```toml
+[llm]
+enabled = true
+provider = "zhipu" # 或 "ollama"
+base_url = ""
+model = ""
+send_diff = false
+```
+
+- `zhipu`：预设 `glm-4.7-flash` 与智谱 OpenAI 兼容地址。官网目前将其列为[免费模型](https://docs.bigmodel.cn/cn/guide/models/free/glm-4.7-flash)，调用仍需申请 API Key；可用性、限流和费用以服务商当前政策为准。将 Key 放入 `SVNUI_LLM_KEY` 环境变量，不要写入配置或提交到仓库。
+- `ollama`：预设 `http://localhost:11434/v1`、`qwen2.5-coder:3b`，不需要 Key，也不发送 Authorization。需自行准备 Ollama 服务并下载模型（例如 `ollama pull qwen2.5-coder:3b`）；冷启动较慢时建议 `timeout_secs = 60`。工具不自动安装或启动服务。协议见 [Ollama 文档](https://docs.ollama.com/openai)。
+- `deepseek`：兼容既有默认选择，需要 Key。其他兼容服务继续通过 `base_url`、`model` 覆盖，不必新增 SDK。
+
+**显式地址和模型优先于预设。** 切换 `provider` 时，要清空旧的 `base_url` / `model`，或改成你要的覆盖值。模型覆盖示例：`model = "你的本地模型名称"`。
+
+```bash
+svnui llm        # 查看实际生效的预设、地址、模型和 Key 状态
+svnui llm --test # 发送一个最小请求；失败返回非零退出码
+```
+
+云端测试需要先在当前终端设置 Key；模型服务未启动、Key 缺失、认证失败、模型不存在、限流或超时都会给出提示。不会自动切换付费模型。测试不会发送工作副本内容；当前提交面板生成仅发送勾选文件的路径与状态，不读取或发送 diff 正文。生成失败保留本地规则候选，并在面板中显示回退原因。
+
 ## 缓存
 
 `svn status` 在大仓库上是秒级到几十秒级。缓存的目标是**命中时一次 svn 都不跑**。
