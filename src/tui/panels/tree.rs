@@ -15,7 +15,7 @@ use std::collections::HashMap;
 
 use ratatui::{
     text::{Line, Span},
-    widgets::{Borders, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation},
+    widgets::{Borders, List, ListItem, ListState, Paragraph, ScrollbarOrientation},
     Frame,
 };
 
@@ -766,7 +766,10 @@ impl TreePanel {
                 "目录为空，按 R 重新扫描"
             };
             let block = theme::block().borders(Borders::ALL)
-                .title(if self.mode == TreeMode::Changed { " 变更 " } else { " 文件树 " })
+                .title(theme::focus_title(
+                    if self.mode == TreeMode::Changed { " 变更 " } else { " 文件树 " },
+                    focused,
+                ))
                 .border_style(if focused { theme::Theme::border_active() } else { theme::Theme::border() });
             f.render_widget(Paragraph::new(message).style(theme::Theme::dim()).block(block), area);
             return;
@@ -835,7 +838,7 @@ impl TreePanel {
             .block(
                 theme::block()
                     .borders(Borders::ALL)
-                    .title(title)
+                    .title(theme::focus_title(title, focused))
                     .border_style(if focused { theme::Theme::border_active() } else { theme::Theme::border() }),
             )
             .highlight_style(theme::Theme::selected());
@@ -847,7 +850,7 @@ impl TreePanel {
             let mut sb = ratatui::widgets::ScrollbarState::new(self.visible.len())
                 .position(self.state.selected().unwrap_or(0));
             f.render_stateful_widget(
-                Scrollbar::new(ScrollbarOrientation::VerticalRight),
+                theme::scrollbar(ScrollbarOrientation::VerticalRight),
                 area,
                 &mut sb,
             );

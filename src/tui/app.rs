@@ -33,7 +33,6 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Borders, Clear, Paragraph};
 use ratatui::Frame;
@@ -3526,20 +3525,20 @@ impl App {
         }
 
         if let Some(panel) = self.commit.as_mut() {
-            panel.render(f, centered_rect(80, 85, area));
+            panel.render(f, theme::centered(area, 80, 85, 30, 8));
         }
         if let Some(panel) = self.diff.as_mut() {
             if panel.kind() != PreviewKind::Image || (!self.show_help && !self.show_notice) {
-                panel.render(f, centered_rect(92, 92, area));
+                panel.render(f, theme::centered(area, 92, 92, 30, 8));
             }
         }
         if let Some(panel) = self.logpanel.as_mut() {
-            panel.render(f, centered_rect(92, 88, area));
+            panel.render(f, theme::centered(area, 92, 88, 30, 8));
         }
 
         // 日志：加载中 / 失败 / 正常，三种状态都要有明确画面
         if self.mode == Mode::Log && self.logpanel.is_none() {
-            let rect = centered_rect(60, 40, area);
+            let rect = theme::centered(area, 60, 40, 30, 8);
             f.render_widget(Clear, rect);
 
             // 失败优先于"加载中"：错误已经有了，别再转圈
@@ -3547,7 +3546,7 @@ impl App {
                 let mut lines = vec![
                     Line::from(Span::styled(
                         format!(" {}", summary),
-                        Style::default().fg(Color::LightRed),
+                        theme::Theme::danger(),
                     )),
                     Line::from(""),
                 ];
@@ -3567,9 +3566,7 @@ impl App {
                         theme::block()
                             .borders(Borders::ALL)
                             .title(" 读取提交历史失败 ")
-                            .border_style(
-                                Style::default().fg(Color::LightRed),
-                            ),
+                            .border_style(theme::Theme::danger()),
                     ),
                     rect,
                 );
@@ -3590,7 +3587,7 @@ impl App {
             panel.render(f, area, &root);
         }
         if self.mode == Mode::Conflict && self.conflict.is_none() {
-            let rect = centered_rect(60, 25, area);
+            let rect = theme::centered(area, 60, 25, 30, 8);
             f.render_widget(Clear, rect);
             loading::Loading::new("扫描冲突", self.busy_ms())
                 .detail(Some("正在检查工作副本的冲突标记"))
@@ -3613,10 +3610,10 @@ impl App {
         // 仓库浏览：整屏浮层（要显示层级和详情，弹出框尺寸不够）
         if self.mode == Mode::Repo {
             match self.repo.as_mut() {
-                Some(p) => p.render(f, centered_rect(92, 90, area)),
+                Some(p) => p.render(f, theme::centered(area, 92, 90, 30, 8)),
                 None => {
                     // panel 还没建好（理论上不会），至少别黑屏
-                    let rect = centered_rect(60, 25, area);
+                    let rect = theme::centered(area, 60, 25, 30, 8);
                     f.render_widget(Clear, rect);
                     loading::Loading::new("连接仓库", self.busy_ms())
                         .detail(Some("正在读取远端目录"))
@@ -3626,7 +3623,7 @@ impl App {
         }
 
         if self.show_help {
-            HelpPanel::render(f, centered_rect(70, 80, area));
+            HelpPanel::render(f, theme::centered(area, 70, 80, 30, 8));
         }
         if self.show_notice {
             if let Some(panel) = self.notice_panel.as_mut() {
@@ -4276,39 +4273,12 @@ fn copy_to_clipboard(text: &str) -> crate::domain::Result<()> {
     })
 }
 
-fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
-    let popup = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(r)[1];
-
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(popup)[1]
-}
-
-/// 同 `centered_rect`，但保证至少 `min_h` 行。
+/// 同 `theme::centered`，但带一个最小高度。
 ///
-/// 按百分比算出来的高度在矮终端上会不够，而 checkout 面板的字段是
-/// 固定 3 行一块（Border 上下各 1 + 内容 1），压一点就整块消失。
-/// 这里在百分比结果不够时竖向撑到 min_h，横向不动。
+/// checkout 面板的字段是固定 3 行一块（Border 上下各 1 + 内容 1），
+/// 按百分比算出来的高度在矮终端上会压掉整块 —— 所以这里给下限。
 fn centered_rect_min(percent_x: u16, percent_y: u16, min_h: u16, r: Rect) -> Rect {
-    let out = centered_rect(percent_x, percent_y, r);
-    if out.height >= min_h || r.height <= out.height {
-        return out;
-    }
-    let h = min_h.min(r.height);
-    let y = r.y + (r.height - h) / 2;
-    Rect { y, height: h, ..out }
+    theme::centered(r, percent_x, percent_y, 30, min_h)
 }
 
 #[cfg(test)]
@@ -4476,6 +4446,7 @@ mod layout_tests {
 #[cfg(test)]
 mod refresh_tests {
     use super::*;
+    use ratatui::style::Color;
     use std::path::Path;
     use std::process::Command;
 

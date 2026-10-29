@@ -21,9 +21,8 @@ use std::collections::HashMap;
 
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Style},
     text::{Line, Span},
-    widgets::{Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar,
+    widgets::{Borders, Clear, List, ListItem, ListState, Paragraph,
               ScrollbarOrientation},
     Frame,
 };
@@ -516,7 +515,7 @@ impl RepoPanel {
         if let Some(n) = &self.notice {
             crumb_spans.push(Span::styled(
                 format!("   {}", n),
-                Style::default().fg(Color::LightYellow),
+                theme::Theme::warning(),
             ));
         }
         f.render_widget(Paragraph::new(Line::from(crumb_spans)), rows[0]);
@@ -551,7 +550,7 @@ impl RepoPanel {
             .iter()
             .map(|e| {
                 let (mark, style) = if e.is_dir {
-                    ("▸ ", Style::default().fg(Color::LightBlue))
+                    ("▸ ", theme::Theme::dir())
                 } else {
                     ("  ", theme::Theme::text())
                 };
@@ -612,7 +611,7 @@ impl RepoPanel {
             let mut sb = ratatui::widgets::ScrollbarState::new(self.entries.len())
                 .position(self.state.selected().unwrap_or(0));
             f.render_stateful_widget(
-                Scrollbar::new(ScrollbarOrientation::VerticalRight),
+                theme::scrollbar(ScrollbarOrientation::VerticalRight),
                 inner,
                 &mut sb,
             );
@@ -630,7 +629,7 @@ impl RepoPanel {
         } else if let Some((summary, detail)) = &self.error {
             lines.push(Line::from(Span::styled(
                 format!(" {}", summary),
-                Style::default().fg(Color::LightRed),
+                theme::Theme::danger(),
             )));
             lines.push(Line::from(""));
             for l in detail.lines() {

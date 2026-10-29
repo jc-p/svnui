@@ -16,7 +16,7 @@
 
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Borders, Clear, List, ListItem, ListState, Paragraph},
     Frame,
@@ -193,19 +193,8 @@ impl ConflictPanel {
         self.side
     }
 
-    fn centered(area: Rect) -> Rect {
-        let w = (area.width * 85 / 100).max(40).min(area.width);
-        let h = (area.height * 85 / 100).max(10).min(area.height);
-        Rect {
-            x: area.x + (area.width.saturating_sub(w)) / 2,
-            y: area.y + (area.height.saturating_sub(h)) / 2,
-            width: w,
-            height: h,
-        }
-    }
-
     pub fn render(&mut self, f: &mut Frame, area: Rect, root: &std::path::Path) {
-        let pop = Self::centered(area);
+        let pop = theme::centered(area, 85, 85, 40, 10);
         f.render_widget(Clear, pop);
 
         let n = self.files.len();
@@ -213,11 +202,11 @@ impl ConflictPanel {
             .borders(Borders::ALL)
             .title(Line::from(Span::styled(
                 format!(" 解决冲突（{} 个） ", n),
-                Style::default()
-                    .fg(Color::LightRed)
-                    .add_modifier(Modifier::BOLD),
+                theme::Theme::danger_bold(),
             )))
-            .border_style(Style::default().fg(Color::LightRed));
+            // 边框只上色不加粗：加粗会把整圈圆角线糊成一坨，
+            // 危险感由标题的加粗红字承担就够了。
+            .border_style(theme::Theme::danger());
 
         let inner = block.inner(pop);
         f.render_widget(block, pop);
@@ -241,11 +230,7 @@ impl ConflictPanel {
         f.render_stateful_widget(
             List::new(items)
                 .block(theme::block().borders(Borders::ALL).title(" 冲突文件 "))
-                .highlight_style(
-                    Style::default()
-                        .bg(Color::DarkGray)
-                        .add_modifier(Modifier::BOLD),
-                ),
+                .highlight_style(theme::Theme::selected()),
             cols[0],
             &mut self.state,
         );
@@ -265,9 +250,7 @@ impl ConflictPanel {
             f.render_widget(
                 Paragraph::new(Line::from(Span::styled(
                     " 树冲突 · 无需三路对比 ",
-                    Style::default()
-                        .fg(Color::LightRed)
-                        .add_modifier(Modifier::BOLD),
+                    theme::Theme::danger_bold(),
                 ))),
                 rows[0],
             );
@@ -288,9 +271,7 @@ impl ConflictPanel {
                 .enumerate()
                 .flat_map(|(i, t)| {
                     let style = if i == active {
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD)
+                        theme::Theme::hotkey()
                     } else {
                         theme::Theme::dim()
                     };
@@ -321,11 +302,11 @@ impl ConflictPanel {
             Line::from(vec![
                 Span::styled(" j/k ", theme::Theme::dim()),
                 Span::styled("选文件  ", theme::Theme::dim()),
-                Span::styled("Enter ", Style::default().fg(Color::Yellow)),
+                Span::styled("Enter ", theme::Theme::hotkey()),
                 Span::styled("保留现状（推荐）  ", theme::Theme::dim()),
-                Span::styled("r ", Style::default().fg(Color::Yellow)),
+                Span::styled("r ", theme::Theme::hotkey()),
                 Span::styled("恢复服务器版本  ", theme::Theme::dim()),
-                Span::styled("m ", Style::default().fg(Color::Yellow)),
+                Span::styled("m ", theme::Theme::hotkey()),
                 Span::styled("坚持我的删除  ", theme::Theme::dim()),
                 Span::styled("Esc ", theme::Theme::dim()),
                 Span::styled("返回", theme::Theme::dim()),
@@ -336,11 +317,11 @@ impl ConflictPanel {
                 Span::styled("选文件  ", theme::Theme::dim()),
                 Span::styled("1/2/3 ", theme::Theme::dim()),
                 Span::styled("仅切换预览  ", theme::Theme::dim()),
-                Span::styled("m ", Style::default().fg(Color::Yellow)),
+                Span::styled("m ", theme::Theme::hotkey()),
                 Span::styled("用我的  ", theme::Theme::dim()),
-                Span::styled("t ", Style::default().fg(Color::Yellow)),
+                Span::styled("t ", theme::Theme::hotkey()),
                 Span::styled("用服务器的  ", theme::Theme::dim()),
-                Span::styled("Enter ", Style::default().fg(Color::Yellow)),
+                Span::styled("Enter ", theme::Theme::hotkey()),
                 Span::styled("保留当前  ", theme::Theme::dim()),
                 Span::styled("Esc ", theme::Theme::dim()),
                 Span::styled("返回", theme::Theme::dim()),
@@ -356,16 +337,12 @@ impl ConflictPanel {
 /// 它没有可合并的内容，三份对比毫无意义，所以这里直接把
 ///「怎么选、选了会怎样」写清楚 —— 而不是让人在三栏里瞎按。
 fn tree_conflict_body() -> Vec<Line<'static>> {
-    let key = Style::default()
-        .fg(Color::Yellow)
-        .add_modifier(Modifier::BOLD);
+    let key = theme::Theme::hotkey();
     let bold = Style::default().add_modifier(Modifier::BOLD);
     vec![
         Line::from(Span::styled(
             "这是一个树冲突（T）",
-            Style::default()
-                .fg(Color::LightRed)
-                .add_modifier(Modifier::BOLD),
+            theme::Theme::danger_bold(),
         )),
         Line::from(""),
         Line::from("你本地删除或移动了这个路径，而服务器上它同时被修改了。"),
@@ -400,15 +377,45 @@ fn tree_conflict_body() -> Vec<Line<'static>> {
 }
 
 /// 冲突标记着色。
+///
+/// 两侧用成对的 `danger_bold()` / `conflict_theirs()`：三路对比翻页后
+/// 靠位置记哪边是谁很容易搞反，颜色必须自带身份。
 fn colorize(l: &str) -> Line<'static> {
     let style = if l.starts_with("<<<<<<<") {
-        Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD)
+        theme::Theme::danger_bold()
     } else if l.starts_with("=======") {
-        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        theme::Theme::hotkey()
     } else if l.starts_with(">>>>>>>") {
-        Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD)
+        theme::Theme::conflict_theirs()
     } else {
-        theme::Theme::status_bar()
+        // ⚠️ 不能借 `status_bar()`：那是"黑字青底"的顶栏样式，
+        //    铺在正文上会把整块冲突内容刷成一片青。正文就用正文色。
+        theme::Theme::text()
     };
     Line::from(Span::styled(l.to_string(), style))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 三路对比翻页后靠位置记哪边是谁会搞反，两个标记必须自带身份。
+    #[test]
+    fn conflict_markers_carry_which_side_they_are() {
+        let fg_of = |line: &str| colorize(line).spans[0].style.fg;
+        let mine = fg_of("<<<<<<< .mine");
+        let theirs = fg_of(">>>>>>> .r10");
+        assert_eq!(mine, theme::Theme::danger_bold().fg);
+        assert_eq!(theirs, theme::Theme::conflict_theirs().fg);
+        assert_ne!(mine, theirs, "两侧撞色就分不出哪份是谁的");
+        assert_eq!(fg_of("======="), theme::Theme::hotkey().fg);
+    }
+
+    /// 正文不能带底色：一整片青底会把内容压得读不出来。
+    #[test]
+    fn conflict_body_has_no_background() {
+        let style = colorize("fn main() {}").spans[0].style;
+        assert_eq!(style.bg, None);
+        assert_eq!(style.fg, theme::Theme::text().fg);
+    }
 }

@@ -3,9 +3,9 @@
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
+    widgets::{Borders, Clear, Paragraph, ScrollbarOrientation, ScrollbarState},
     Frame,
 };
 
@@ -54,13 +54,15 @@ impl Level {
     }
 
     pub fn style(self) -> Style {
-        let color = match self {
-            Self::Info => Color::Cyan,
-            Self::Success => Color::Green,
-            Self::Warning => Color::Yellow,
-            Self::Error => Color::LightRed,
+        // 与确认面板的危险等级共用同一套色阶（见 theme 的严重度色阶）：
+        // 否则同一个红在确认框里读作"危险"，在提示条里读作"普通失败"。
+        let base = match self {
+            Self::Info => theme::Theme::info(),
+            Self::Success => theme::Theme::success(),
+            Self::Warning => theme::Theme::caution(),
+            Self::Error => theme::Theme::danger(),
         };
-        Style::default().fg(color).add_modifier(Modifier::BOLD)
+        base.add_modifier(Modifier::BOLD)
     }
 }
 
@@ -296,7 +298,7 @@ impl NoticePanel {
             .map(|s| Line::from(s.as_str()))
             .collect::<Vec<_>>();
         f.render_widget(
-            Paragraph::new(lines).style(Style::default().fg(Color::White)),
+            Paragraph::new(lines).style(theme::Theme::body()),
             body,
         );
         if self.rows.len() > self.viewport && inner.width > 1 {
@@ -304,7 +306,7 @@ impl NoticePanel {
                 .position(self.scroll)
                 .viewport_content_length(self.viewport);
             f.render_stateful_widget(
-                Scrollbar::new(ScrollbarOrientation::VerticalRight),
+                theme::scrollbar(ScrollbarOrientation::VerticalRight),
                 Rect::new(inner.x, inner.y, inner.width, body.height),
                 &mut state,
             );
@@ -350,6 +352,7 @@ fn wrap_text(text: &str, width: u16) -> Vec<String> {
 mod tests {
     use super::*;
     use crossterm::event::KeyModifiers;
+    use ratatui::style::Color;
     use ratatui::{backend::TestBackend, Terminal};
 
     #[test]

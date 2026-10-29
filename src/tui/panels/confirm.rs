@@ -303,9 +303,7 @@ impl ConfirmPanel {
     /// `a` 全选 / `n` 全不选。
     pub fn set_all_picks(&mut self, on: bool) {
         if let Some(p) = self.picks.as_mut() {
-            for v in &mut p.on {
-                *v = on;
-            }
+            p.on.fill(on);
         }
     }
 
@@ -380,13 +378,13 @@ impl ConfirmPanel {
         self.scroll = self.scroll.saturating_sub(n as usize);
     }
 
+    /// 危险等级 → 强调色。
+    ///
+    /// 取自 theme 的严重度色阶，不在这里另写一份：
+    /// 确认框的"红"和提示条错误的"红"必须是同一个红，否则用户
+    /// 得靠"这条信息出现在屏幕哪个位置"来判断严重程度。
     fn accent(&self) -> Color {
-        match self.danger() {
-            Danger::Safe => Color::Cyan,
-            Danger::Low => Color::Yellow,
-            Danger::Medium => Color::LightYellow,
-            Danger::High => Color::LightRed,
-        }
+        danger_color(self.danger())
     }
 
     /// 条目展开成显示行：`(所属条目下标, 文本)`。
@@ -444,27 +442,15 @@ impl ConfirmPanel {
         ])
     }
 
-    /// 居中弹框，最大 70% 宽 / 80% 高。
-    fn centered(area: Rect, pct_w: u16, pct_h: u16) -> Rect {
-        let w = (area.width * pct_w / 100).max(30).min(area.width);
-        let h = (area.height * pct_h / 100).max(8).min(area.height);
-        Rect {
-            x: area.x + (area.width.saturating_sub(w)) / 2,
-            y: area.y + (area.height.saturating_sub(h)) / 2,
-            width: w,
-            height: h,
-        }
-    }
-
     pub fn render(&mut self, f: &mut Frame, area: Rect) {
         let adding = matches!(self.action, ConfirmAction::Add(_));
         let reverting = matches!(self.action, ConfirmAction::Revert(_));
         let workflow = matches!(self.action, ConfirmAction::Workflow(_));
         let detailed = adding || reverting || workflow;
         let pop = if detailed {
-            Self::centered(area, 90, 90)
+            theme::centered(area, 90, 90, 30, 8)
         } else {
-            Self::centered(area, 70, 80)
+            theme::centered(area, 70, 80, 30, 8)
         };
         f.render_widget(Clear, pop);
 
@@ -727,6 +713,22 @@ impl ConfirmPanel {
         };
         f.render_widget(Paragraph::new(keys).alignment(Alignment::Left), chunks[3]);
     }
+}
+
+/// 危险等级 → 强调色。
+///
+/// 取自 theme 的严重度色阶，不在这里另写一份：确认框的"红"和提示条
+/// 错误的"红"必须是同一个红，否则用户得靠"这条信息出现在屏幕哪个位置"
+/// 来判断严重程度，而位置是会随布局改动的。
+pub(crate) fn danger_color(d: Danger) -> Color {
+    let style = match d {
+        Danger::Safe => theme::Theme::info(),
+        Danger::Low => theme::Theme::caution(),
+        Danger::Medium => theme::Theme::warning(),
+        Danger::High => theme::Theme::danger(),
+    };
+    // 色阶每一格都设了前景色；取不到就退回普通前景，不用默认色。
+    style.fg.unwrap_or(Color::Gray)
 }
 
 /// 按终端列宽预先换行，详细确认框据此分配说明和清单高度。

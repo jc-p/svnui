@@ -5,10 +5,9 @@
 
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
-    style::{Color, Style},
     text::{Line, Span},
     widgets::{
-        Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar,
+        Borders, Clear, List, ListItem, ListState, Paragraph,
         ScrollbarOrientation, ScrollbarState,
     },
     Frame,
@@ -239,7 +238,7 @@ impl LogPanel {
                     // 深灰叠深灰 = 选中行上日期直接消失。
                     Span::styled(
                         e.date.get(..10).unwrap_or(&e.date).to_string(),
-                        Style::default().fg(Color::White),
+                        theme::Theme::body(),
                     ),
                     Span::raw(" "),
                     Span::styled(
@@ -284,7 +283,7 @@ impl LogPanel {
             let mut sb = ScrollbarState::new(self.visible.len())
                 .position(self.state.selected().unwrap_or(0));
             f.render_stateful_widget(
-                Scrollbar::new(ScrollbarOrientation::VerticalRight),
+                theme::scrollbar(ScrollbarOrientation::VerticalRight),
                 cols[0],
                 &mut sb,
             );
@@ -383,7 +382,7 @@ impl LogPanel {
         );
         if detail_len > inner_h {
             f.render_stateful_widget(
-                Scrollbar::new(ScrollbarOrientation::VerticalRight),
+                theme::scrollbar(ScrollbarOrientation::VerticalRight),
                 cols[1],
                 &mut sb_state,
             );

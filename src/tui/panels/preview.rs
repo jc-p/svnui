@@ -15,9 +15,8 @@
 
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
-    style::Style,
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
+    widgets::{Block, Borders, Clear, Paragraph, ScrollbarOrientation, ScrollbarState},
     Frame,
 };
 use ratatui_image::{protocol::StatefulProtocol, StatefulImage};
@@ -367,7 +366,7 @@ impl PreviewPanel {
         };
         let block = theme::block()
             .borders(Borders::ALL)
-            .title(format!(" {} · {} ", label, self.title))
+            .title(format!(" {} · {} ", theme::focus_title(label, focused), self.title))
             .title_bottom(if focused { " 预览操作 · Tab/Esc 返回文件树 " } else { " Tab 激活预览 " })
             .border_style(if focused { theme::Theme::border_active() } else { theme::Theme::border() });
         self.paint(f, area, block);
@@ -473,9 +472,6 @@ impl PreviewPanel {
             content,
         );
 
-        // 明确重置背景及文字样式，避免滑块继承新增/删除行的颜色。
-        let thumb = Style::reset().patch(theme::Theme::text());
-        let track = Style::reset().patch(theme::Theme::border());
         if bar_v {
             // ScrollbarState 的最后位置是 content_length - 1；这里传可滚动位置数，
             // 再单独传可视高度，保证正文到底时滑块也贴到轨道末端。
@@ -483,10 +479,7 @@ impl PreviewPanel {
                 .viewport_content_length(visible_h as usize)
                 .position(self.scroll as usize);
             f.render_stateful_widget(
-                Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                    .thumb_symbol("┃").track_symbol(Some("│"))
-                    .begin_symbol(None).end_symbol(None)
-                    .thumb_style(thumb).track_style(track),
+                theme::scrollbar(ScrollbarOrientation::VerticalRight),
                 self.v_bar_area,
                 &mut state,
             );
@@ -496,10 +489,7 @@ impl PreviewPanel {
                 .viewport_content_length(visible_w as usize)
                 .position(self.h_scroll as usize);
             f.render_stateful_widget(
-                Scrollbar::new(ScrollbarOrientation::HorizontalBottom)
-                    .thumb_symbol("━").track_symbol(Some("─"))
-                    .begin_symbol(None).end_symbol(None)
-                    .thumb_style(thumb).track_style(track),
+                theme::scrollbar(ScrollbarOrientation::HorizontalBottom),
                 self.h_bar_area,
                 &mut state,
             );
@@ -644,9 +634,7 @@ fn colorize_diff(l: &str) -> Line<'static> {
         theme::Theme::added()
     } else if l.starts_with('-') {
         theme::Theme::deleted()
-    } else if l.starts_with("@@") {
-        theme::Theme::props()
-    } else if l.starts_with("===") || l.starts_with("Index:") {
+    } else if l.starts_with("@@") || l.starts_with("===") || l.starts_with("Index:") {
         theme::Theme::props()
     } else {
         theme::Theme::dim()

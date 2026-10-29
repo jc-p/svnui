@@ -26,7 +26,6 @@
 
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::Style,
     text::{Line, Span},
     widgets::{Borders, Clear, List, ListItem, Paragraph},
     Frame,
@@ -232,20 +231,8 @@ impl CommitPanel {
         self.scroll = self.scroll.saturating_sub(1);
     }
 
-    /// 居中弹框。
-    fn centered(area: Rect) -> Rect {
-        let w = (area.width * 70 / 100).max(40).min(area.width);
-        let h = (area.height * 70 / 100).max(10).min(area.height);
-        Rect {
-            x: area.x + (area.width.saturating_sub(w)) / 2,
-            y: area.y + (area.height.saturating_sub(h)) / 2,
-            width: w,
-            height: h,
-        }
-    }
-
     pub fn render(&mut self, f: &mut Frame, area: Rect) {
-        let pop = Self::centered(area);
+        let pop = theme::centered(area, 70, 70, 40, 10);
         f.render_widget(Clear, pop);
 
         let n = self.files.len();
@@ -279,7 +266,7 @@ impl CommitPanel {
             .map(|s| {
                 ListItem::new(Line::from(Span::styled(
                     format!("  {}", s),
-                    Style::default().fg(ratatui::style::Color::Gray),
+                    theme::Theme::text(),
                 )))
             })
             .collect();
@@ -305,12 +292,12 @@ impl CommitPanel {
         let line = match &self.hint {
             Some(h) => Line::from(Span::styled(
                 format!(" {}", h),
-                Style::default().fg(ratatui::style::Color::LightRed),
+                theme::Theme::danger(),
             )),
             None => match &self.notice {
                 Some(n) => Line::from(Span::styled(
                     format!(" {}", n),
-                    Style::default().fg(ratatui::style::Color::LightGreen),
+                    theme::Theme::success(),
                 )),
                 None => Line::from(vec![
                     Span::styled(" Ctrl+S ", theme::Theme::title()),
