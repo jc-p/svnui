@@ -20,6 +20,13 @@
 
 use crate::config::LlmConfig;
 
+/// 响应体上限由 ureq 的 `into_string()` 兜住（10MB 级）。
+///
+/// 提交信息就几行，够用了；真正要防的是服务端出问题时返回一个 HTML
+/// 错误页或无限流 —— 有上限就不会把它全读进内存再报"不是 JSON"。
+/// 单次重试的最长等待（含服务端指定的 Retry-After）。
+const MAX_RETRY_WAIT: std::time::Duration = std::time::Duration::from_secs(8);
+
 /// 一次改动：`(相对路径, 状态符号)`。
 ///
 /// 用元组而不是引入 `commit_gen::Change`：那个类型在 `tui` feature 下，
@@ -52,9 +59,8 @@ pub fn suggest(items: &[Item], diff: Option<&str>, cfg: &LlmConfig) -> Result<Ve
 
     let resp = send_request(cfg, &url, body)?;
 
-    let v: serde_json::Value = resp
-        .into_json()
-        .map_err(|e| format!("响应不是 JSON：{}", e))?;
+    let v: serde_json::Value =
+        serde_json::from_str(&resp).map_err(|e| format!("响应不是 JSON：{}", e))?;
 
     let content = v
         .get("choices")
@@ -92,8 +98,7 @@ pub fn ping(cfg: &LlmConfig) -> Result<String, String> {
     let resp = send_request(cfg, &url, body)?;
     let ms = t0.elapsed().as_millis();
 
-    let v: serde_json::Value = resp
-        .into_json()
+    let v: serde_json::Value = serde_json::from_str(&resp)
         .map_err(|e| format!("响应不是 JSON（base_url 是不是指错了？）：{}", e))?;
 
     let content = v
@@ -114,13 +119,43 @@ pub fn ping(cfg: &LlmConfig) -> Result<String, String> {
 }
 
 /// 两条调用路径共享认证与错误诊断，避免自检通过但生成采用另一套配置。
-fn send_request(
-    cfg: &LlmConfig,
-    url: &str,
-    mut body: serde_json::Value,
-) -> Result<ureq::Response, String> {
+///
+/// 返回**响应正文文本**（已按上限截断），由调用方自己解析 JSON ——
+/// 重试要能重发同一份 body，解析留在循环外面更清楚。
+fn send_request(cfg: &LlmConfig, url: &str, body: serde_json::Value) -> Result<String, String> {
+    let mut attempt = 0u32;
+    loop {
+        match send_once(cfg, url, body.clone()) {
+            Ok(text) => return Ok(text),
+            // 只重试"稍等一下就好"的两类：限流和服务端错误。
+            // 认证失败、404、连不上 —— 重试多少次结果都一样，
+            // 只会让用户多等几倍时间才看到同一句提示。
+            Err(Fail::Retryable(msg, hint)) if attempt < cfg.retry => {
+                // 服务端说了等多久就听它的；没说就指数退避 0.5s → 1s → 2s。
+                let wait = hint
+                    .unwrap_or_else(|| backoff(attempt))
+                    .min(MAX_RETRY_WAIT);
+                std::thread::sleep(wait);
+                attempt += 1;
+                let _ = &msg;
+            }
+            Err(Fail::Retryable(msg, _)) => return Err(msg),
+            Err(Fail::Fatal(msg)) => return Err(msg),
+        }
+    }
+}
+
+/// 失败分为"再试一次可能就好"和"再试也一样"两类。
+enum Fail {
+    /// 附带服务端建议的等待（来自 `Retry-After`），没有就由外层退避。
+    Retryable(String, Option<std::time::Duration>),
+    Fatal(String),
+}
+
+/// 发一次请求并读完响应体。
+fn send_once(cfg: &LlmConfig, url: &str, mut body: serde_json::Value) -> Result<String, Fail> {
     if cfg.endpoint().trim_end_matches('/').ends_with("/chat/completions") {
-        return Err("base_url 不要带 /chat/completions；工具会自动补齐该路径".into());
+        return Err(Fail::Fatal("base_url 不要带 /chat/completions；工具会自动补齐该路径".into()));
     }
     let mut req = ureq::post(url)
         .set("Content-Type", "application/json")
@@ -130,10 +165,10 @@ fn send_request(
             .ok()
             .filter(|v| !v.trim().is_empty())
             .ok_or_else(|| {
-                format!(
+                Fail::Fatal(format!(
                     "API Key 未设置或为空：{}；设置后重新启动 svnui",
                     cfg.api_key_env
-                )
+                ))
             })?;
         req = req.set("Authorization", &format!("Bearer {}", key.trim()));
     }
@@ -141,14 +176,57 @@ fn send_request(
     if cfg.model_name() == "glm-4.7-flash" {
         body["thinking"] = serde_json::json!({"type": "disabled"});
     }
-    req.send_json(body).map_err(|err| match err {
-        ureq::Error::Status(401 | 403, _) => "认证失败或模型无权限，请检查 API Key 和账号权限".into(),
-        ureq::Error::Status(429, _) => "请求限流或额度不足，请稍后重试并检查服务商额度；不会自动切换付费模型".into(),
-        ureq::Error::Status(404, _) => "接口或模型不存在，请检查 base_url 和 model；本地模型可用 ollama list 查看".into(),
-        ureq::Error::Status(code, _) => format!("模型服务返回 HTTP {code}，请检查服务状态"),
-        ureq::Error::Transport(_) if !cfg.requires_key() => "无法连接 Ollama 或请求超时，请确认本地服务已启动、模型已下载，并检查地址和 timeout_secs".into(),
-        ureq::Error::Transport(_) => "模型请求连接失败或超时，请检查网络、接口地址和 timeout_secs".into(),
-    })
+    match req.send_json(body) {
+        Ok(resp) => resp
+            .into_string()
+            .map_err(|e| Fail::Fatal(format!("读取响应失败：{e}"))),
+        Err(err) => Err(classify(err, cfg)),
+    }
+}
+
+/// 把 ureq 的错误翻译成人话，并判断值不值得重试。
+///
+/// 429/5xx 的等待优先听服务端的 `Retry-After` —— 它比我猜的准。
+/// 没有就指数退避（0.5s → 1s → 2s），上限 8 秒：后台线程睡久一点
+/// 不影响界面，但不能把一次 Ctrl+G 拖成一分钟。
+fn classify(err: ureq::Error, cfg: &LlmConfig) -> Fail {
+    match err {
+        ureq::Error::Status(401 | 403, _) => {
+            Fail::Fatal("认证失败或模型无权限，请检查 API Key 和账号权限".into())
+        }
+        ureq::Error::Status(429, resp) => Fail::Retryable(
+            "请求限流或额度不足，请稍后重试并检查服务商额度；不会自动切换付费模型".into(),
+            retry_after(&resp),
+        ),
+        ureq::Error::Status(404, _) => {
+            Fail::Fatal("接口或模型不存在，请检查 base_url 和 model；本地模型可用 ollama list 查看".into())
+        }
+        ureq::Error::Status(code, resp) if code >= 500 => Fail::Retryable(
+            format!("模型服务返回 HTTP {code}（服务端故障）"),
+            retry_after(&resp),
+        ),
+        ureq::Error::Status(code, _) => {
+            Fail::Fatal(format!("模型服务返回 HTTP {code}，请检查服务状态"))
+        }
+        ureq::Error::Transport(_) if !cfg.requires_key() => Fail::Fatal(
+            "无法连接 Ollama 或请求超时，请确认本地服务已启动、模型已下载，并检查地址和 timeout_secs".into(),
+        ),
+        ureq::Error::Transport(_) => {
+            Fail::Fatal("模型请求连接失败或超时，请检查网络、接口地址和 timeout_secs".into())
+        }
+    }
+}
+
+/// 读服务端的 `Retry-After`（秒）。它比我猜的准。
+fn retry_after(resp: &ureq::Response) -> Option<std::time::Duration> {
+    let raw = resp.header("Retry-After")?;
+    let secs: u64 = raw.trim().parse().ok()?;
+    Some(std::time::Duration::from_secs(secs))
+}
+
+/// 第 `attempt` 次重试前等多久：0.5s → 1s → 2s …
+fn backoff(attempt: u32) -> std::time::Duration {
+    std::time::Duration::from_millis(500 * 2u64.saturating_pow(attempt))
 }
 
 /// 当前 LLM 配置的文字说明（不联网，只说清"会怎么走"）。
@@ -163,7 +241,7 @@ pub fn describe(cfg: &LlmConfig) -> String {
     };
 
     format!(
-        "LLM 状态\n  预设: {}\n  启用: {}\n  地址: {}\n  模型: {}\n  Key 环境变量: {}（{}）\n  发送 diff: {}（{}）\n  超时: {} 秒\n\n{}",
+        "LLM 状态\n  预设: {}\n  启用: {}\n  地址: {}\n  模型: {}\n  Key 环境变量: {}（{}）\n  发送 diff: {}（{}）\n  超时: {} 秒\n  重试: {} 次（仅限流/服务端故障）\n\n{}",
         cfg.provider.name(),
         cfg.enabled,
         cfg.endpoint(),
@@ -172,11 +250,12 @@ pub fn describe(cfg: &LlmConfig) -> String {
         key_state,
         cfg.send_diff,
         if cfg.send_diff {
-            "调用方提供时可携带正文；当前 TUI 仅发送路径和状态"
+            "开启：会携带 diff 正文（受 max_diff_bytes 限制）"
         } else {
-            "只发文件路径和状态"
+            "关闭：只发文件路径和状态（代码不会出网）"
         },
         cfg.timeout_secs,
+        cfg.retry,
         if cfg.enabled {
             "用 svnui llm --test 实发一个请求验证连通性"
         } else {
@@ -390,5 +469,27 @@ mod tests {
         let items: Vec<Item> = (0..60).map(|i| (format!("f{}.rs", i), 'M')).collect();
         let p = build_prompt(&items, None, &cfg());
         assert!(p.contains("另外 10 个文件"));
+    }
+
+    /// 退避要指数增长但不能失控：三次重试最多 0.5 + 1 + 2 = 3.5 秒，
+    /// 再叠上单次超时也还在"后台等得起"的范围里。
+    #[test]
+    fn backoff_grows_exponentially_and_stays_bounded() {
+        assert_eq!(backoff(0).as_millis(), 500);
+        assert_eq!(backoff(1).as_millis(), 1000);
+        assert_eq!(backoff(2).as_millis(), 2000);
+        // 配置里 retry 填个荒唐值也不该睡上几年。
+        for attempt in [8u32, 16, 32] {
+            assert!(backoff(attempt).min(MAX_RETRY_WAIT) <= MAX_RETRY_WAIT);
+        }
+    }
+
+    /// 只有"临时故障"才值得重试：认证、404、连不上重试多少次都一样。
+    #[test]
+    fn disabled_or_bad_config_never_reaches_the_network() {
+        let cfg = LlmConfig::default();
+        assert!(!cfg.enabled, "默认关闭：没配好就别发请求");
+        assert_eq!(suggest(&[], None, &cfg).unwrap_err(), "未启用（llm.enabled = false）");
+        assert_eq!(cfg.retry, 2, "默认重试两次");
     }
 }

@@ -117,6 +117,13 @@ pub struct LlmConfig {
     /// 提交信息语言：`zh` / `en`。
     pub lang: String,
 
+    /// 限流（429）和服务端错误（5xx）的重试次数，**默认 2**。
+    ///
+    /// 只重试这两种：它们是"稍等一下就好"的临时故障。
+    /// 连接失败/超时不重试 —— 那多半是地址或网络配错了，
+    /// 重试三次只是让用户多等三倍时间才看到同一句提示。
+    pub retry: u32,
+
     /// 追加到提示词末尾的要求。比如团队要求"结尾带任务号"，
     /// 写在这里比改代码省事。
     pub extra_prompt: String,
@@ -134,6 +141,7 @@ impl Default for LlmConfig {
             send_diff: false,
             max_diff_bytes: 20_000,
             lang: "zh".to_string(),
+            retry: 2,
             extra_prompt: String::new(),
         }
     }
@@ -314,6 +322,10 @@ max_diff_bytes = 20000
 
 # 提交信息语言：zh / en
 lang = "zh"
+
+# 限流（429）和服务端错误（5xx）的重试次数。0 = 不重试。
+# 连接失败和超时不重试：那多半是地址配错了，重试只会让人多等。
+retry = 2
 
 # 追加要求。比如团队规定结尾带任务号，写这里比改代码省事。
 extra_prompt = ""

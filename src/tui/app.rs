@@ -1849,6 +1849,8 @@ impl App {
                 }
 
                 let tx = self.tx.clone();
+                let svn = self.svn.clone();
+                let paths = self.commit_paths.clone();
                 self.busy = Some("生成提交信息".to_string());
                 std::thread::spawn(move || {
                     let items: Vec<(String, char)> = changes
@@ -1858,10 +1860,23 @@ impl App {
                     // 配置错误与请求失败都保留原因；本地规则继续可用，不丢弃草稿。
                     let (mut out, source) = match crate::config::Config::load_checked() {
                         Ok(cfg) if !cfg.llm.enabled => (Vec::new(), "本地规则 · AI 未启用".into()),
-                        Ok(cfg) => match crate::llm::suggest(&items, None, &cfg.llm) {
-                            Ok(cands) => (cands, format!("AI · {}", cfg.llm.model_name())),
-                            Err(e) => (Vec::new(), format!("已回退本地规则：{e}")),
-                        },
+                        Ok(cfg) => {
+                            // `send_diff` 是隐私开关，打开才读 diff 正文。
+                            // 以前这里恒传 None —— 开关开了也不发，
+                            // 等于配置里写着一件事、代码做着另一件。
+                            let diff = if cfg.llm.send_diff && !paths.is_empty() {
+                                svn.diff(&paths, None, false)
+                                    .ok()
+                                    .map(|o| o.stdout)
+                                    .filter(|s| !s.trim().is_empty())
+                            } else {
+                                None
+                            };
+                            match crate::llm::suggest(&items, diff.as_deref(), &cfg.llm) {
+                                Ok(cands) => (cands, format!("AI · {}", cfg.llm.model_name())),
+                                Err(e) => (Vec::new(), format!("已回退本地规则：{e}")),
+                            }
+                        }
                         Err(e) => (Vec::new(), format!("已回退本地规则：{e}")),
                     };
                     out.extend(crate::tui::panels::commit_gen::suggest(&changes));
