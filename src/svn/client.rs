@@ -364,10 +364,30 @@ impl Svn {
 
     /// 跟随文件选择的只读预览：可取消、有界正文，普通 CLI diff 保持完整输出契约。
     pub fn diff_preview(&self, paths: &[PathBuf], cancel: &CancelToken) -> Result<PreviewOutput> {
-        // 与普通 diff 保持同一 SVN 目标语义：工作副本中的 symlink 是受管节点，
-        // 不能 canonicalize 末级链接后把它误判成工作副本之外的目标。
+        self.diff_preview_ctx(paths, None, cancel)
+    }
+
+    /// 带上下文行数的 diff 预览。
+    ///
+    /// `context` 为 `None` 或等于 svn 默认（3）时不加任何参数 ——
+    /// `svn diff -x` 会同时喂给内部 diff 和外部 `diff-cmd`，
+    /// 默认路径上多传一个参数就多一处失败可能，所以只在用户真的改过
+    /// 默认值时才用（对应配置 `preview.context_lines`）。
+    pub fn diff_preview_ctx(
+        &self,
+        paths: &[PathBuf],
+        context: Option<usize>,
+        cancel: &CancelToken,
+    ) -> Result<PreviewOutput> {
         let owned: Vec<String> = paths.iter().map(|p| p.to_string_lossy().to_string()).collect();
+        let unified = context
+            .filter(|n| *n != 3)
+            .map(|n| format!("-U{}", n.min(100)));
         let mut args: Vec<&str> = vec!["diff", "--force"];
+        if let Some(u) = unified.as_deref() {
+            args.push("-x");
+            args.push(u);
+        }
         args.extend(owned.iter().map(String::as_str));
         run_preview(&self.exe, &args, &self.root, &self.opts(true), cancel)
     }

@@ -114,6 +114,16 @@ impl SortMode {
             SortMode::Name => "文件名",
         }
     }
+
+    /// 按配置里的名字取排序方式。认不出的名字退回 `Status` ——
+    /// 配置文件是手写的，拼错一个字母不该让界面起不来。
+    fn from_config(name: &str) -> Self {
+        match name.trim().to_lowercase().as_str() {
+            "path" => SortMode::Path,
+            "name" | "filename" => SortMode::Name,
+            _ => SortMode::Status,
+        }
+    }
 }
 
 /// 搜索输入用在哪。
@@ -271,6 +281,12 @@ pub struct App {
     show_notice: bool,
     title: String,
     sort: SortMode,
+    /// 启动时读一次的配置。
+    ///
+    /// 之前只在读 `ui.mouse` 时 load 一次，其余字段（`ui.sort`、
+    /// `log.page_size`、`preview.context_lines`）定义了却没人读 ——
+    /// 配置文件里改了没反应，比没有这个配置项更骗人。
+    cfg: crate::config::Config,
     /// 待打开的外部编辑器请求（路径）。由 `mod.rs` 拿到后让出终端。
     editor_req: Option<(String, PathBuf)>,
     /// 编辑返回时若有扫描在途，结束后再扫描一次，避免应用编辑前快照。
@@ -299,8 +315,11 @@ impl App {
         repo_url: Option<&str>,
     ) -> crate::domain::Result<Self> {
         let (tx, rx) = channel();
+        let cfg = crate::config::Config::load();
         // ⚠️ 必须在构造 Self 之前取：svn 马上要 move 进去，之后借不到了
-        let self_trust = svn.trust_cert;
+        // 配置文件里的 `trust_cert` 与命令行 `--trust-cert` 是同一个开关的
+        // 两个入口：内网自签名证书每次都要敲 `--trust-cert` 太烦，配一次就好。
+        let self_trust = svn.trust_cert || cfg.svn.trust_cert;
 
         // ⚠️ 必须在构造 Self 之前取：下面 `svn` 会 move 进去，之后就借不到了
         let start_cwd = svn.cwd.clone();
@@ -332,7 +351,7 @@ impl App {
             // 默认关闭：开启后终端不再处理鼠标，选中文本复制会失效，
             // 而且鼠标移动会持续产生事件、把键盘事件挤到队列后面（表现为"敲键没反应"）。
             // 需要拖拽滚动条时按 M 打开。
-            mouse_on: crate::config::Config::load().ui.mouse,
+            mouse_on: cfg.ui.mouse,
             mouse_pending: None,
             drag: None,
             searching: None,
@@ -351,10 +370,11 @@ impl App {
             notice: None,
             notice_panel: None,
             show_notice: false,
-            sort: SortMode::Status,
+            sort: SortMode::from_config(&cfg.ui.sort),
             editor_req: None,
             editor_refresh_pending: false,
             editor_refresh_loading: false,
+            cfg,
             title: "SVN".to_string(),
             root: PathBuf::new(),
             items: Vec::new(),
@@ -787,6 +807,7 @@ impl App {
 
         let svn = self.svn.clone();
         let picker = self.image_picker.clone();
+        let context = self.cfg.preview.context_lines;
         self.preview_worker.submit(gen, move |cancel| {
             if cancel.is_cancelled() {
                 return None;
@@ -810,7 +831,7 @@ impl App {
                     name, &text, "未纳管 · 按 a 添加当前项，或 A 批量添加后才有 diff",
                 ),
                 Ok(FileContent::Text(text)) if matches!(node.sign, ' ' | '\0') => PreviewPanel::file(name, &text),
-                Ok(FileContent::Text(_)) => match svn.diff_preview(&[abs], cancel) {
+                Ok(FileContent::Text(_)) => match svn.diff_preview_ctx(&[abs], Some(context), cancel) {
                     Ok(out) => PreviewPanel::diff_with_limits(
                         name, &shorten_paths(&out.output.stdout, &root_str),
                         out.stdout_truncated, out.stderr_truncated,
@@ -895,7 +916,7 @@ impl App {
                     // 提交完历史里要能立刻看到这一版：svn log 默认从工作副本
                     // revision 往回列，混合 revision 下会漏掉刚提交的条目。
                     if self.mode == Mode::Log {
-                        self.spawn_log_load(None, Self::LOG_PAGE, false);
+                        self.spawn_log_load(None, self.log_page(), false);
                     }
                     self.notice = Some(Notice::new(msg));
                     self.spawn_reload();
@@ -1355,7 +1376,7 @@ impl App {
                     // 必须补一次服务端搜索，否则永远够不到更早的提交。
                     if target == SearchFor::Log && !self.query.trim().is_empty() {
                         let kw = self.query.clone();
-                        self.spawn_log_load(Some(kw), Self::LOG_PAGE, false);
+                        self.spawn_log_load(Some(kw), self.log_page(), false);
                     }
                     return Ok(());
                 }
@@ -2093,7 +2114,7 @@ impl App {
             // 更早/更精确的定位靠 / 搜索（走服务端 --search）。
             KeyCode::Char('n') | KeyCode::Char('N') => {
                 let have = panel.len();
-                self.spawn_log_load(None, have + Self::LOG_PAGE, false);
+                self.spawn_log_load(None, have + self.log_page(), false);
                 return Ok(());
             }
             // R：反向合并回到选中版本。

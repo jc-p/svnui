@@ -12,5 +12,5 @@ pub mod workflow;
 
 pub use client::{StatusOpts, Svn};
 pub use command::{run, run_with_stdin, RawOutput, RunOpts};
-pub use locator::{relative_to, svn_exe, wc_root};
+pub use locator::{relative_to, set_svn_exe_from_config, svn_exe, wc_root};
 pub use version::SvnVersion;

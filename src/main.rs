@@ -20,5 +20,9 @@ fn main() {
         }
     }
 
+    // 配置里指定了 svn 路径就用它（找 svn 之前必须设置好，之后会被缓存）。
+    let cfg = svnui::config::Config::load();
+    svnui::svn::locator::set_svn_exe_from_config(&cfg.svn.svn_path);
+
     std::process::exit(svnui::cli::run(cli));
 }

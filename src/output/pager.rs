@@ -38,9 +38,34 @@ impl PagerKind {
 ///
 /// 优先级：`SVNR_PAGER` 环境变量 → delta → bat → less → None。
 pub fn detect() -> PagerKind {
+    detect_preferred(None)
+}
+
+/// 按偏好探测分页器（对应配置 `preview.pager`）。
+///
+/// 优先级：**环境变量 > 配置 > 自动探测**。环境变量赢，是因为
+/// "这次换个 pager" 是临时想法，不该去改配置文件。
+///
+/// 配置里指定了却没装那个程序时，回退到自动探测而不是直接不分页 ——
+/// 指定了 `delta` 但没装，比"什么都没配"还难用（用户以为分页坏了）。
+pub fn detect_preferred(preferred: Option<&str>) -> PagerKind {
     if std::env::var_os("SVNR_PAGER").is_some() {
         // 用户显式指定，视为可用。
         return PagerKind::Less;
+    }
+    if let Some(want) = preferred.map(|s| s.trim().to_lowercase()) {
+        if want == "none" {
+            return PagerKind::None;
+        }
+        for (exe, kind) in [
+            ("delta", PagerKind::Delta),
+            ("bat", PagerKind::Bat),
+            ("less", PagerKind::Less),
+        ] {
+            if want == exe && which(exe).is_some() {
+                return kind;
+            }
+        }
     }
     for (exe, kind) in [("delta", PagerKind::Delta), ("bat", PagerKind::Bat), ("less", PagerKind::Less)] {
         if which(exe).is_some() {
@@ -75,11 +100,18 @@ fn which(name: &str) -> Option<std::path::PathBuf> {
 /// 分页器不存在/被中断（用户按 `q`）时**退回直接打印**，绝不丢内容。
 /// 这是刻意的：宁可刷屏也不能让 diff 消失。
 pub fn page(content: &str) -> std::io::Result<()> {
+    page_with(content, None)
+}
+
+/// 按偏好的分页器输出（`preview.pager` 配置）。
+///
+/// `preferred` 为 `None` 或 `auto` 时与 [`page`] 完全一致。
+pub fn page_with(content: &str, preferred: Option<&str>) -> std::io::Result<()> {
     if content.is_empty() {
         return Ok(());
     }
 
-    let kind = detect();
+    let kind = detect_preferred(preferred);
 
     let cmd = match kind {
         PagerKind::None => None,
@@ -179,6 +211,22 @@ mod tests {
     fn short_content_is_not_paged() {
         // 3 行 < 阈值 10，应走 print_plain（不启动任何子进程）
         assert!(page_if_long("a\nb\nc\n", 10).is_ok());
+    }
+
+    /// 配置钉死的分页器：装了就用，没装就回退自动探测。
+    #[test]
+    fn preferred_pager_is_used_when_available_and_falls_back_otherwise() {
+        // "none" 是明确要求不分页，探测结果再好也不能覆盖它。
+        assert_eq!(detect_preferred(Some("none")), PagerKind::None);
+        assert_eq!(detect_preferred(Some("  NONE ")), PagerKind::None);
+        // 不认识的名字（含默认 auto）走自动探测，结果必是四种之一。
+        match detect_preferred(Some("auto")) {
+            PagerKind::Delta | PagerKind::Bat | PagerKind::Less | PagerKind::None => {}
+        }
+        // 指了个没装的程序（几乎不可能叫这个名字）同样回退，不会变成 None 之外的异常。
+        match detect_preferred(Some("definitely-not-installed-pager")) {
+            PagerKind::Delta | PagerKind::Bat | PagerKind::Less | PagerKind::None => {}
+        }
     }
 
     #[test]

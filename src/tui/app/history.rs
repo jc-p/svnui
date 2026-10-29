@@ -7,10 +7,16 @@ impl App {
     ///
     /// 100 而不是 200：svn log 是**联网**操作，每多一条都要等服务器。
     /// 首屏 100 条足够翻找，更早的靠搜索（服务端 `--search`）定位。
-    pub(super) const LOG_PAGE: usize = 100;
+    /// 每次加载多少条提交。来自配置 `log.page_size`（默认 100）。
+    ///
+    /// `svn log` 是联网操作：拉太多要等服务器，拉太少要反复翻页。
+    /// 上下限卡在 10..=2000 —— 配置写错也不至于一次拉十万条。
+    pub(super) fn log_page(&self) -> usize {
+        self.cfg.log.page_size.clamp(10, 2000)
+    }
 
     pub(super) fn open_log(&mut self) {
-        self.spawn_log_load(None, Self::LOG_PAGE, false);
+        self.spawn_log_load(None, self.log_page(), false);
         self.mode = Mode::Log;
     }
 

@@ -390,6 +390,11 @@ impl Cli {
 
 /// 分发。**出口层**：把领域错误翻译成人类可读提示 + 退出码。
 pub fn run(mut cli: Cli) -> i32 {
+    // 配置文件里的 `trust_cert` 与命令行 `--trust-cert` 等价：
+    // 内网自签名证书每次都敲参数太烦，配一次就行。
+    if !cli.trust_cert && crate::config::Config::load().svn.trust_cert {
+        cli.trust_cert = true;
+    }
     // 不带子命令 → 进 TUI（主形态）
     #[cfg(feature = "tui")]
     if cli.cmd.is_none() {

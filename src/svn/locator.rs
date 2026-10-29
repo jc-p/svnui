@@ -26,6 +26,26 @@ pub fn svn_exe_forced() -> Option<PathBuf> {
     which("svn")
 }
 
+/// 由配置文件指定 svn 可执行文件（对应 `svn.svn_path`）。
+///
+/// 优先级**低于**环境变量：配置是"这台机器一直这么用"，
+/// 环境变量是"这一次换个二进制试试"，临时的应该赢。
+///
+/// 路径不存在就忽略 —— 配错了不该让 svnui 起不来，
+/// 回退到 `PATH` 查找还能正常干活。
+pub fn set_svn_exe_from_config(path: &str) {
+    if path.trim().is_empty() {
+        return;
+    }
+    if env::var_os("SVNR_SVN").is_some() {
+        return;
+    }
+    let p = PathBuf::from(path.trim());
+    if p.is_file() {
+        let _ = SVN_EXE.set(Some(p));
+    }
+}
+
 fn which(name: &str) -> Option<PathBuf> {
     let paths = env::var_os("PATH")?;
     let exe_name = if cfg!(windows) { format!("{name}.exe") } else { name.to_string() };

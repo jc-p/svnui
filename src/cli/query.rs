@@ -204,7 +204,9 @@ pub fn diff(
 
     // 分页器接管时直接返回空串：内容已经写进 pager，再 println 就重复了。
     if force_page || out.stdout.lines().count() > 40 {
-        let _ = crate::output::page(&out.stdout);
+        // 分页器按配置选：`auto` 走探测，也可以钉死 delta / bat / less / none。
+        let cfg = crate::config::Config::load();
+        let _ = crate::output::page_with(&out.stdout, Some(&cfg.preview.pager));
         return Ok(String::new());
     }
 
