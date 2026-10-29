@@ -123,6 +123,10 @@ impl LogPanel {
         self.entries.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
     pub fn selected_rev(&self) -> Option<u64> {
         self.state
             .selected()
