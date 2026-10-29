@@ -3023,15 +3023,21 @@ impl App {
 
     pub fn render(&mut self, f: &mut Frame, area: Rect) {
         self.sync_notice();
+        // 矮到一定程度时任何布局都会把某一块压成 0 行，画出半个界面
+        // 比明说"窗口太小"更让人困惑（表现为"按了没反应"）。
+        if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
+            render_too_small(f, area);
+            return;
+        }
         let (_, keys) = self.footer_hint();
-        let footer_rows = wrap_hints(keys, area.width.saturating_sub(2) as usize);
-        // 保留主体空间；底栏最多三行内容，极矮窗口只用一行。
-        let max_rows = area.height.saturating_sub(8).clamp(1, 3) as usize;
-        let footer_height = footer_rows.len().min(max_rows).max(1) as u16 + 2;
+        // 底栏固定一行内容：按键放不下就收进 ? 面板，不再靠增高底栏
+        // 吃掉主体 —— 主体才是这个界面存在的理由。
+        let (footer_row, footer_truncated) = fit_hints(keys, area.width.saturating_sub(4) as usize);
+        let footer_height = 3;
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(2),
+                Constraint::Length(1),
                 Constraint::Min(3),
                 Constraint::Length(u16::from(self.notice.is_some())),
                 Constraint::Length(footer_height),
@@ -3040,7 +3046,7 @@ impl App {
 
         self.render_top(f, chunks[0]);
         self.render_body(f, chunks[1]);
-        self.render_bottom(f, chunks[3], footer_rows);
+        self.render_bottom(f, chunks[3], vec![footer_row], footer_truncated);
 
         if let Some(notice) = &self.notice {
             let rect = chunks[2];
@@ -3209,32 +3215,60 @@ impl App {
         }
     }
 
+    /// 顶栏：一行三段，各自截断。
+    ///
+    /// 之前是两行、用 `Paragraph` 直接拼 `Span`：既不 wrap 也不 truncate，
+    /// 窄窗口下右侧内容被 buffer 静默裁掉 —— 而最右边放的正是仓库标题
+    /// （分支@版本号），最重要的上下文最先消失。
+    ///
+    /// 现在按重要性分配宽度：左段（仓库标识）永不压缩，中段（状态计数）
+    /// 先让位，右段（任务/刷新态）其次。
     fn render_top(&mut self, f: &mut Frame, area: Rect) {
-        let watch = if self.refresh_watch.is_some() {
-            "自动刷新"
+        let title = Span::styled(
+            format!(" {} ", tail_of(&self.title, 40)),
+            theme::Theme::title(),
+        );
+
+        // 右段：任务态优先（正在做什么比"多久前刷新的"重要）。
+        let right: Vec<Span> = if let Some(busy) = &self.busy {
+            let ms = self
+                .busy_start
+                .map(|t| t.elapsed().as_millis())
+                .unwrap_or(0);
+            let detail = self.busy_prog.as_ref().map(|(n, last)| {
+                if last.is_empty() {
+                    format!("{} 项", n)
+                } else {
+                    format!("{} 项 …{}", n, tail_of(last, 24))
+                }
+            });
+            loading::Loading::new(busy.as_str(), ms)
+                .detail(detail.as_deref())
+                .spans()
         } else {
-            "手动刷新"
+            let watch = if self.refresh_watch.is_some() {
+                "自动刷新"
+            } else {
+                "手动刷新"
+            };
+            let age = self
+                .last_refresh
+                .map(|t| format!(" · {}秒前", t.elapsed().as_secs()))
+                .unwrap_or_default();
+            vec![Span::styled(format!(" {}{} ", watch, age), theme::Theme::dim())]
         };
-        let age = self
-            .last_refresh
-            .map(|t| format!(" · {}秒前", t.elapsed().as_secs()))
-            .unwrap_or_default();
-        let mut header = vec![Span::styled(
-            format!(" {}{} ", watch, age),
-            theme::Theme::dim(),
-        )];
+
+        // 中段：状态计数 → 已勾选 → 过滤 → 排序。
+        let mut mid: Vec<Span> = Vec::new();
         if self.scan_failed {
-            header.push(Span::styled(" 扫描失败 · R 重试 ", theme::for_sign('C')));
+            mid.push(Span::styled(" 扫描失败 · R 重试 ", theme::for_sign('C')));
         }
         if let Some(error) = self.watch_error.as_ref() {
-            header.push(Span::styled(
-                format!(" 监听不可用：{} · R 刷新 ", tail_of(error, 32)),
+            mid.push(Span::styled(
+                format!(" 监听不可用：{} ", tail_of(error, 24)),
                 theme::for_sign('!'),
             ));
         }
-
-        let mut spans = Vec::new();
-
         let mut counts: Vec<(char, usize)> = Vec::new();
         for sign in ['C', 'T', '!', 'D', 'R', 'A', 'M', '?'] {
             let n = self.items.iter().filter(|i| i.sign == sign).count();
@@ -3243,15 +3277,17 @@ impl App {
             }
         }
         if counts.is_empty() {
-            let text = if self.scan_failed {
-                " 上次扫描无变更 "
-            } else {
-                " 工作副本干净 "
-            };
-            spans.push(Span::styled(text, theme::Theme::clean()));
+            mid.push(Span::styled(
+                if self.scan_failed {
+                    " 上次扫描无变更 "
+                } else {
+                    " 工作副本干净 "
+                },
+                theme::Theme::clean(),
+            ));
         } else {
             for (sign, n) in counts {
-                spans.push(Span::styled(
+                mid.push(Span::styled(
                     format!(
                         " {}{} ",
                         match sign {
@@ -3271,61 +3307,43 @@ impl App {
                 ));
             }
         }
-
-        spans.push(Span::styled(
+        mid.push(Span::styled(
             format!(" 已勾选{} ", self.tree.checked_count()),
             theme::Theme::checked(),
         ));
-
-        // 搜索中：顶栏显示当前过滤
-        if let Some(f) = self.tree.filter() {
-            if !f.is_empty() {
-                spans.push(Span::styled(
-                    format!(" 过滤：{} ", f),
+        if let Some(filter) = self.tree.filter() {
+            if !filter.is_empty() {
+                mid.push(Span::styled(
+                    format!(" 过滤：{} ", filter),
                     theme::Theme::props(),
                 ));
             }
         }
-
-        spans.push(Span::styled(
+        mid.push(Span::styled(
             format!(" 排序：{} ", self.sort.label()),
             theme::Theme::dim(),
         ));
 
-        if let Some(busy) = &self.busy {
-            // 帧号只由"过了多少毫秒"推出来，不存计数器 —— 理由见 loading 模块。
-            let ms = self
-                .busy_start
-                .map(|t| t.elapsed().as_millis())
-                .unwrap_or(0);
+        // 宽度分配：左段先拿，右段次之，剩下的全给中段。
+        let total = area.width as usize;
+        let title_w = display_width(title.content.as_ref()).min(total);
+        let right_w = spans_width(&right).min(total.saturating_sub(title_w));
+        let mid_w = total.saturating_sub(title_w).saturating_sub(right_w);
 
-            // 检出才有：已落盘条目数 + 最后一项（别的后台任务没这个信息）。
-            // 拼成 detail 交给组件，顶栏不再自己拼动画。
-            let detail = self.busy_prog.as_ref().map(|(n, last)| {
-                if last.is_empty() {
-                    format!("{} 项", n)
-                } else {
-                    format!("{} 项 …{}", n, tail_of(last, 24))
-                }
-            });
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(title_w as u16),
+                Constraint::Length(mid_w as u16),
+                Constraint::Length(right_w as u16),
+            ])
+            .split(area);
 
-            // 之前这里是手写的拼接，还用过静止的 `⟳`（跟色块没区别）。
-            // 现在交给统一的 loading 组件：别处（整屏等待框）调用同一份
-            // 帧计算，动起来必然是同一个节奏。
-            header.extend(
-                loading::Loading::new(busy.as_str(), ms)
-                    .detail(detail.as_deref())
-                    .spans(),
-            );
-        }
-
-        header.push(Span::styled(
-            format!(" {} ", tail_of(&self.title, 40)),
-            theme::Theme::status_bar(),
-        ));
+        f.render_widget(Paragraph::new(Line::from(title)), chunks[0]);
+        f.render_widget(Paragraph::new(Line::from(truncate_spans(&mid, mid_w))), chunks[1]);
         f.render_widget(
-            Paragraph::new(vec![Line::from(header), Line::from(spans)]),
-            area,
+            Paragraph::new(Line::from(truncate_spans(&right, right_w))),
+            chunks[2],
         );
     }
 
@@ -3460,11 +3478,17 @@ impl App {
         }
     }
 
-    fn render_bottom(&mut self, f: &mut Frame, area: Rect, rows: Vec<String>) {
+    fn render_bottom(
+        &mut self,
+        f: &mut Frame,
+        area: Rect,
+        rows: Vec<String>,
+        truncated: bool,
+    ) {
         let (title, _) = self.footer_hint();
-        let visible_rows = area.height.saturating_sub(2) as usize;
-        let title = if rows.len() > visible_rows {
-            format!("{} · ? 帮助 ", title.trim_end())
+        // 底栏只有一行：内容放不下时不再增高，改用标题提示"还有更多键位"。
+        let title = if truncated {
+            format!("{} · 更多键位按 ? ", title.trim_end())
         } else {
             title.to_string()
         };
@@ -3476,7 +3500,7 @@ impl App {
         f.render_widget(
             Paragraph::new(
                 rows.into_iter()
-                    .take(visible_rows)
+                    .take(area.height.saturating_sub(2) as usize)
                     .map(Line::from)
                     .collect::<Vec<_>>(),
             )
@@ -3488,57 +3512,149 @@ impl App {
 }
 
 /// 宽窗口保持左右布局；窄窗口上下排列，空间不足时保留完整文件树。
+/// 主体分栏。判据是**最小可用尺寸**，不是单纯的宽度。
+///
+/// 旧规则有两个错配：
+/// - `width >= 100 && height >= 6` → 100 列宽但只有 6 行高时也横排，两块各 6 行，横向布局毫无意义
+/// - `40 <= width < 100` → 99 列 × 40 行这种宽窗口被迫上下堆叠，白白浪费横向空间
+/// - 比例恒定 40/60，不随宽度变化：140 列时左栏 56 列，路径照样要截断
 fn body_regions(area: Rect) -> (Rect, Option<Rect>) {
-    let direction = if area.width >= 100 && area.height >= 6 {
-        Direction::Horizontal
-    } else if area.width >= 40 && area.height >= 12 {
-        Direction::Vertical
-    } else {
-        return (area, None);
-    };
-    let regions = Layout::default()
-        .direction(direction)
-        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
-        .split(area);
-    (regions[0], Some(regions[1]))
+    // 左右分栏：文件树固定 40 列（再宽也只是让路径少截几个字），
+    // 剩下的全给预览 —— 预览才是越宽越有用的那一块。
+    if area.width >= 88 && area.height >= 8 {
+        let left = (area.width * 45 / 100).clamp(28, 40);
+        let regions = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(left), Constraint::Min(20)])
+            .split(area);
+        return (regions[0], Some(regions[1]));
+    }
+    // 上下分栏：上栏（文件树）6~12 行，矮窗口优先保证下面还能看见预览。
+    if area.width >= 40 && area.height >= 14 {
+        let top = (area.height * 45 / 100).clamp(6, 12);
+        let regions = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(top), Constraint::Min(4)])
+            .split(area);
+        return (regions[0], Some(regions[1]));
+    }
+    (area, None)
 }
 
-/// 优先保持“按键 + 含义”为一组；组本身过长时才按显示宽度拆开，兼容中文。
-fn wrap_hints(keys: &str, width: usize) -> Vec<String> {
-    if width == 0 {
-        return Vec::new();
-    }
-    let mut rows = Vec::new();
-    let mut line = String::new();
-    let mut used = 0;
-    for group in keys.split("   ").filter(|g| !g.is_empty()) {
-        let group_width = Line::from(group).width();
-        if !line.is_empty() && used + 3 + group_width > width {
-            rows.push(std::mem::take(&mut line));
-            used = 0;
-        }
-        if !line.is_empty() {
-            line.push_str("   ");
-            used += 3;
-        }
-        for ch in group.chars() {
-            let cells = Line::from(ch.to_string()).width();
-            if cells > width {
-                continue;
-            }
-            if used + cells > width {
-                rows.push(std::mem::take(&mut line));
-                used = 0;
-            }
-            line.push(ch);
-            used += cells;
-        }
-    }
-    if !line.is_empty() {
-        rows.push(line);
-    }
-    rows
+/// 终端再小就没有可用的界面了：顶栏 1 + 主体 3 + 底栏 3。
+const MIN_HEIGHT: u16 = 7;
+/// 窄于这个宽度连一个文件路径都显示不全。
+const MIN_WIDTH: u16 = 24;
+
+/// 字符串占多少显示列（中文 2 列）。
+fn display_width(s: &str) -> usize {
+    Line::from(s).width()
 }
+
+fn spans_width(spans: &[Span]) -> usize {
+    spans.iter().map(|s| s.width()).sum()
+}
+
+/// 按显示宽度截断；截断处补一个 `…`。
+fn fit(s: &str, width: usize) -> String {
+    if display_width(s) <= width {
+        return s.to_string();
+    }
+    // 给 `…` 留一列；连一列都没有就只能整段丢弃。
+    let room = match width.checked_sub(1) {
+        Some(0) | None => return String::new(),
+        Some(r) => r,
+    };
+    let mut out = String::new();
+    let mut used = 0;
+    for ch in s.chars() {
+        let w = display_width(&ch.to_string());
+        if used + w > room {
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
+    out.push('…');
+    out
+}
+
+/// 把一组 Span 截断到不超过 `width` 列。放不下的整段丢掉，不折行。
+fn truncate_spans<'a>(spans: &[Span<'a>], width: usize) -> Vec<Span<'a>> {
+    let mut out: Vec<Span> = Vec::new();
+    let mut used = 0;
+    for sp in spans {
+        let w = sp.width();
+        if used + w <= width {
+            out.push(sp.clone());
+            used += w;
+        } else {
+            let rest = width.saturating_sub(used);
+            let cut = fit(&sp.content, rest);
+            if !cut.is_empty() {
+                out.push(Span::styled(cut, sp.style));
+            }
+            break;
+        }
+    }
+    out
+}
+
+/// 底栏一行放得下哪些按键；第二个返回值表示有没有被裁掉。
+///
+/// 规则：**逃生键优先**。`? 帮助` 和 `q 退出` 永远保留 ——
+/// 放不下的中间项可以按 ? 查，但"怎么退出"不能靠猜。
+/// 裁掉了就在底栏标题上标一句，否则用户以为这就是全部键位。
+fn fit_hints(keys: &str, width: usize) -> (String, bool) {
+    let mut groups: Vec<&str> = keys.split("   ").filter(|g| !g.is_empty()).collect();
+    if groups.is_empty() || width == 0 {
+        return (String::new(), false);
+    }
+    // 尾部的逃生键预留出来，先不参与填充。
+    let mut tail: Vec<&str> = Vec::new();
+    while let Some(last) = groups.last() {
+        if last.trim() == "? 帮助" || last.trim() == "q 退出" || last.trim() == "Esc 返回" {
+            tail.insert(0, groups.pop().unwrap());
+        } else {
+            break;
+        }
+    }
+    let tail_text = tail.join("   ");
+    let reserved = if tail_text.is_empty() {
+        0
+    } else {
+        display_width(&tail_text) + 3
+    };
+    let total_groups = groups.len();
+    let mut out: Vec<String> = Vec::new();
+    let mut used = 0;
+    for g in groups {
+        let w = display_width(g);
+        let need = if out.is_empty() { w } else { w + 3 };
+        // 给尾部逃生键留位置。
+        if used + need + reserved > width {
+            break;
+        }
+        out.push(g.to_string());
+        used += need;
+    }
+    let shown = out.len();
+    out.extend(tail.iter().map(|t| t.to_string()));
+    (out.join("   "), shown < total_groups)
+}
+
+/// 窗口过小：说清楚要多少空间，而不是画一个被压成 0 行的界面。
+fn render_too_small(f: &mut Frame, area: Rect) {
+    let msg = format!(" 窗口太小（{}×{}），至少需要 {}×{}  ", area.width, area.height, MIN_WIDTH, MIN_HEIGHT);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            fit(&msg, area.width as usize),
+            theme::Theme::title(),
+        ))),
+        area,
+    );
+}
+
 
 /// 把 svn 输出里的绝对路径前缀去掉，让 diff 更好读。
 ///
@@ -3887,20 +4003,73 @@ mod layout_tests {
         }
     }
 
+    /// 99 列 × 40 行是旧规则的盲区：宽度够横排，却因为 < 100 被塞成上下堆叠。
     #[test]
-    fn hints_wrap_by_display_width_without_losing_keys_or_chinese() {
-        let keys = "未纳管 · A 添加全部新增项   Enter 打开   R 刷新   ? 帮助   q 退出";
-        let compact = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
-        for width in [10, 18, 28, 38, 78, 138] {
-            let rows = wrap_hints(keys, width);
-            assert!(rows
-                .iter()
-                .all(|row| Line::from(row.as_str()).width() <= width));
-            assert_eq!(compact(&rows.join("")), compact(keys));
-        }
-        assert_eq!(wrap_hints("R 刷新   ? 帮助", 10), vec!["R 刷新", "? 帮助"]);
-        assert!(wrap_hints(keys, 0).is_empty());
+    fn near_full_width_windows_split_into_columns() {
+        let (tree, preview) = body_regions(Rect::new(0, 0, 99, 40));
+        let preview = preview.expect("99 列应当左右分栏");
+        assert_eq!(tree.y, preview.y, "同高同起 = 左右分栏");
+        assert_eq!(tree.right(), preview.x);
     }
+
+    /// 宽但极矮：横向分栏会把两块都压成几行，不如只留文件树。
+    #[test]
+    fn short_windows_do_not_split_horizontally() {
+        let (_, preview) = body_regions(Rect::new(0, 0, 140, 7));
+        assert!(preview.is_none(), "140×7 不该分栏");
+    }
+
+    /// 文件树宽度不随终端无限膨胀：再宽也只是让路径少截几个字，
+    /// 多出来的列给预览更有用。
+    #[test]
+    fn tree_column_stops_growing_past_its_useful_width() {
+        let (narrow, _) = body_regions(Rect::new(0, 0, 90, 30));
+        let (wide, _) = body_regions(Rect::new(0, 0, 200, 30));
+        assert_eq!(narrow.width, wide.width);
+    }
+
+    #[test]
+    fn footer_keeps_escape_keys_when_space_runs_out() {
+        let keys = "Space 勾选   C 提交   r 撤销改动   Enter 改动   E 编辑   R 刷新   ? 帮助   q 退出";
+        for width in [12, 20, 34, 60, 200] {
+            let (row, _truncated) = fit_hints(keys, width);
+            assert!(
+                Line::from(row.as_str()).width() <= width.max(display_width("? 帮助   q 退出")),
+                "宽度 {width} 放不下：{row}"
+            );
+            // 逃生键在任何宽度下都不能被挤掉。
+            assert!(row.contains("? 帮助"), "宽度 {width} 丢了帮助键：{row}");
+            assert!(row.contains("q 退出"), "宽度 {width} 丢了退出键：{row}");
+        }
+        // 窄=确实裁掉了（提示才有意义），宽=完整保留。
+        let (_, narrow_truncated) = fit_hints(keys, 20);
+        let (_, wide_truncated) = fit_hints(keys, 200);
+        assert!(narrow_truncated);
+        assert!(!wide_truncated);
+    }
+
+    #[test]
+    fn fit_truncates_by_display_width_not_char_count() {
+        assert_eq!(fit("abc", 10), "abc");
+        // 4 列里留 1 列给省略号，中文按 2 列算 → 只放得下一个"未"。
+        assert_eq!(fit("未纳管文件", 4), "未…");
+        assert_eq!(fit("未纳管文件", 5), "未纳…");
+        // 一列都放不下时整段丢弃，不留半个字符。
+        assert_eq!(fit("未纳管", 1), "");
+    }
+
+    #[test]
+    fn spans_are_truncated_as_a_whole_not_wrapped() {
+        let spans = vec![
+            Span::raw("冲突1"),
+            Span::raw("修改3"),
+            Span::raw("未纳管1"),
+        ];
+        let out = truncate_spans(&spans, 8);
+        assert!(spans_width(&out) <= 8);
+        assert_eq!(out.len(), 2);
+    }
+
 }
 
 #[cfg(test)]
