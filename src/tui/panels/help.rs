@@ -20,6 +20,23 @@ struct Group {
 
 const GROUPS: &[Group] = &[
     Group {
+        title: "按键约定",
+        keys: &[
+            (
+                "大写 = 同一动作的另一档",
+                "小写管当前项 / 默认档，大写管更大范围或另一种代价（a 当前 · A 全部；u 最新 · U 指定版本；d 连本地一起删 · D 只移出版本控制）",
+            ),
+            (
+                "同一个键在哪都同一件事",
+                "R 在任何界面都是刷新；r 在任何界面都是「丢弃本地改动」（历史里=回退到选中版本，冲突面板=用服务器版本）",
+            ),
+            (
+                "破坏性动作一定有确认框",
+                "不看 Shift 大小写，只看框里的清单和危险级；高危边框是红的，需要按 Y",
+            ),
+        ],
+    },
+    Group {
         title: "导航",
         keys: &[
             ("Tab / Shift+Tab", "切换文件树与内嵌预览焦点（高亮边框）"),
@@ -52,7 +69,7 @@ const GROUPS: &[Group] = &[
             ("H", "工作副本体检：冲突、锁、缺失"),
             ("V", "远端仓库浏览：直接看服务器上的目录树（可复制 URL / 就地检出）"),
             ("B", "分支工作流：F1 创建分支 / F2 标签 / F3 switch / F4 合并预演"),
-            ("R / F5", "立即扫描并保留位置（空闲主界面也会自动刷新）"),
+            ("R / F5", "刷新：主界面重新扫描并保留位置；历史面板重拉提交记录（空闲主界面也会自动刷新）"),
             ("Esc", "清空文件过滤；无过滤时退出"),
         ],
     },
@@ -69,8 +86,9 @@ const GROUPS: &[Group] = &[
         keys: &[
             ("a", "添加当前未纳管文件；选中目录时列出可裁剪清单（Space 剔除不要的）"),
             ("A", "批量添加：列出全部未纳管项，可裁剪；有搜索时默认预选匹配项"),
-            ("r", "丢弃本地改动：勾选项优先，否则当前文件/目录；先列范围及后果，Y 执行、Enter 取消"),
-            ("D", "svn delete：从版本控制删除（目录是递归的；可切「保留本地文件」开关）"),
+            ("r", "丢弃本地改动：勾选项优先，否则当前文件/目录；先列范围及后果，Y 执行、Enter 取消（历史面板里＝回退到选中版本）"),
+            ("d", "svn delete：连本地文件一起删（目录是递归的）—— 高危，不可撤销"),
+            ("D", "svn delete：只移出版本控制、本地文件留着 —— 中危；两种都能在框里再切开关"),
             ("u", "svn update：先查远端更新，有冲突风险会预警"),
             ("U", "svn update -r 版本号：更新到指定版本（可填 1234 或 1200:1234）"),
             ("X", "冲突解决：三路对比，选一份直接 resolve"),
@@ -100,7 +118,7 @@ const GROUPS: &[Group] = &[
             ("子面板内（只在对应面板里生效）：", ""),
             ("X 冲突面板", "Enter 保留现状 / m 用我的 / t 用服务器的 / 1 2 3 仅切换预览"),
             ("V 仓库面板", "Enter 进目录 / ← 上级 / o 检出 / Y 复制路径 / Shift+Y 复制本目录"),
-            ("L 历史面板", "Enter 看该版本改了什么 / d 设对比基准 / D 与基准做区间对比 / R 回退到选中版本 / / 搜索"),
+            ("L 历史面板", "Enter 看该版本改了什么 / d 设对比基准 / D 与基准做区间对比 / r 回退到选中版本 / R 刷新 / N 加载更早 / / 搜索"),
             ("确认框内", "Tab 切开关 / Space 切开关或裁剪项 / 版本号可直接键入 / Backspace 删除"),
             ("确认框清单", "j/k 移动光标 / Space 剔除或加回 / Ctrl+A 全选 / Ctrl+R 清空；Y 只执行选中的"),
             ("M", "开关鼠标（开=可拖滚动条；关=可用鼠标选中文本复制）"),
@@ -162,5 +180,53 @@ impl HelpPanel {
             Paragraph::new(ratatui::text::Text::from(lines)).block(block),
             area,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn group(title: &str) -> &'static Group {
+        GROUPS.iter().find(|g| g.title == title).expect(title)
+    }
+
+    fn desc_of(title: &str, key: &str) -> &'static str {
+        group(title)
+            .keys
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, d)| *d)
+            .expect(key)
+    }
+
+    /// R 在任何界面都是刷新，不能同时是"回退到某一版"这种不可逆动作 ——
+    /// 跟着主界面的手感按 R 想刷新，弹出来的是回退确认框，代价太大。
+    #[test]
+    fn shift_r_is_never_the_destructive_action() {
+        for g in GROUPS {
+            for (key, desc) in g.keys {
+                assert!(
+                    !desc.contains("R 回退"),
+                    "R 只能是刷新，却在「{}」里变成了回退：{key} {desc}",
+                    g.title
+                );
+            }
+        }
+    }
+
+    /// d/D 必须是两档，不能还是同一句话。
+    ///
+    /// 完全等价的假重载比不绑大写更糟：用户按大写期待"范围更大"，
+    /// 结果什么都没变，于是怀疑大写另有含义而不敢按。
+    #[test]
+    fn lowercase_and_uppercase_keys_are_two_different_rungs() {
+        assert_ne!(
+            desc_of("改动", "d"),
+            desc_of("改动", "D"),
+            "d/D 说明完全一样 —— 又退回到假重载了"
+        );
+        assert!(desc_of("改动", "d").contains("高危"));
+        assert!(desc_of("改动", "D").contains("中危"));
     }
 }

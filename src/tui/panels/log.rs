@@ -266,7 +266,7 @@ impl LogPanel {
             .title(title)
             .title_bottom(
                 Line::from(
-                    " j/k 移动 | d 设对比基准 | D 区间对比 | R 回退到此版本 | / 搜索 | N 加载更早 | Esc 返回 ",
+                    " j/k 移动 | d 设对比基准 | D 区间对比 | r 回退到此版本 | R 刷新 | / 搜索 | N 加载更早 | Esc 返回 ",
                 )
                     .alignment(Alignment::Right),
             )

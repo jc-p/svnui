@@ -1763,7 +1763,14 @@ impl App {
             KeyCode::Char('x') | KeyCode::Char('X') => self.open_conflict(),
 
             // D = svn delete（大写，和小写 d 的 vim 翻页习惯区分开）
-            KeyCode::Char('d') | KeyCode::Char('D') => self.do_delete(),
+            // d：连本地文件一起删（svn rm 的默认语义）。
+            // D：只移出版本控制，本地文件留着。
+            //
+            // 原来 d/D 完全等价 —— 用户按大写期待"范围更大"（像 a/A、u/U
+            // 那样），结果什么都没变。这种假重载比干脆不绑大写更糟：
+            // 它让人以为大写另有含义，反而不敢按。
+            KeyCode::Char('d') => self.do_delete(false),
+            KeyCode::Char('D') => self.do_delete(true),
 
             // /：搜索文件名
             KeyCode::Char('/') => {
@@ -2272,7 +2279,19 @@ impl App {
                     _ => {}
                 }
             }
-            KeyCode::Char('r') | KeyCode::Char('R') => return self.do_revert_to_rev(),
+            // 回退到选中版本 —— **只绑小写 r**。
+            //
+            // 主界面里 R 是"刷新"：同一个键在两个面板里一个无害、
+            // 一个不可逆，只差一个 Shift。跟着主界面的手感按 R 想刷新，
+            // 弹出来的却是"回退到这一版"，代价太大。
+            // r 在主界面本来就是 revert，语义也接得上。
+            KeyCode::Char('r') => return self.do_revert_to_rev(),
+            // R 在任何界面都是刷新：历史面板里就是重拉一遍提交记录。
+            KeyCode::Char('R') => {
+                self.open_log();
+                // 直接返回：重拉后没必要再取一次选中版本的 diff。
+                return Ok(());
+            }
             KeyCode::Char('j') | KeyCode::Down => panel.move_down(),
             KeyCode::Char('k') | KeyCode::Up => panel.move_up(),
             _ => {}
@@ -3240,7 +3259,9 @@ impl App {
     ///    确认文案里必须说清楚，不能只写"删除 docs/"。
     /// 3. **默认同时删本地文件**（`svn rm` 的语义）。
     ///    这是不可逆的，所以走确认面板。
-    fn do_delete(&mut self) {
+    ///
+    /// `keep_local`：`D`（只移出版本控制）传 true，`d`（连本地一起删）传 false。
+    fn do_delete(&mut self, keep_local: bool) {
         // ⚠️ 先在不可变借用里取值再断开：
         //    下面要给 self.notice / self.confirm 赋值（可变借用），
         //    持有 tree 的不可变借用会冲突。
@@ -3273,10 +3294,12 @@ impl App {
         let show = pretty_path(&rel, &self.root, 70);
         // 后果写在开关上而不是正文里：开关一动，危险级和 Y 键文案跟着变，
         // 不会出现「正文说会删本地文件，但用户已经打开了保留开关」的错位。
+        // 用 D 进来时开关已经打开，正文就不能再说"默认连本地一起删" ——
+        // 正文和开关各说一套，用户会以为准的是正文。
         let message = if is_dir {
-            format!("将递归删除目录 {} 及其下所有文件：\n默认连本地文件一起删；打开下面开关可只移出版本控制。", show)
+            format!("将递归删除目录 {} 及其下所有文件：\n{}", show, delete_consequence(keep_local))
         } else {
-            format!("将从版本控制删除 {}：\n默认连本地文件一起删；打开下面开关可只移出版本控制。", show)
+            format!("将从版本控制删除 {}：\n{}", show, delete_consequence(keep_local))
         };
 
         self.confirm = Some(ConfirmPanel::new(
@@ -3291,11 +3314,11 @@ impl App {
             // CLI 的 `remove --keep-local` 在 TUI 里原本恒为 false。
             // 开关默认关闭（= svn rm 的默认语义，连本地文件一起删），
             // 危险级随之从 中危 升到 高危 —— 边框会先变红。
-            ConfirmAction::Delete(vec![abs], false),
+            ConfirmAction::Delete(vec![abs], keep_local),
         )
         .with_toggles(vec![Toggle::with_danger(
             "保留本地文件（只移出版本控制）",
-            false,
+            keep_local,
             Danger::Medium,
             Danger::High,
         )]));
@@ -3864,7 +3887,7 @@ impl App {
                 };
                 (what, "↑↓ 滚动   H/L 左右   < > 翻页   0 回最左   Esc 返回")
             }
-            Mode::Log => (" 历史 ", "↑↓ 选版本   R 回退到此版本   / 搜索   Esc 返回"),
+            Mode::Log => (" 历史 ", "↑↓ 选版本   r 回退到此版本   R 刷新   / 搜索   Esc 返回"),
             // 必须和确认面板内部的 Y/N 一致。
             // 之前这里写"Enter 确认 Esc 取消"，跟面板里的"Y/N"是两套说法，
             // 用户按 Esc 以为能退出，实际被送回上一层 —— 两边矛盾最害人。
@@ -4130,6 +4153,18 @@ fn humanize_error(e: &crate::domain::Error) -> (String, String) {
             }
         }
         other => (other.to_string(), "".to_string()),
+    }
+}
+
+/// `svn rm` 的后果说明。
+///
+/// 开关开着和关着是两种完全不同的代价（中危 / 高危），正文必须跟着开关走：
+/// 正文说"会删本地文件"而开关已经是"保留"，用户会不知道该信哪个。
+fn delete_consequence(keep_local: bool) -> &'static str {
+    if keep_local {
+        "只移出版本控制，本地文件保留（提交后生效）。"
+    } else {
+        "连本地文件一起删除 —— 不可撤销；打开下面开关可只移出版本控制。"
     }
 }
 
@@ -5378,4 +5413,18 @@ mod refresh_tests {
         assert!(!app.items.iter().any(|item| item.rel == "group"), "目录属性改动也应撤销");
     }
 
+}
+
+#[cfg(test)]
+mod consequence_tests {
+    use super::*;
+
+    /// 确认框的正文必须跟着开关走：开关已经是"保留本地文件"，
+    /// 正文就不能还说"连本地文件一起删"，否则用户不知道该信哪个。
+    #[test]
+    fn delete_message_follows_the_toggle() {
+        assert!(delete_consequence(false).contains("连本地文件一起删除"));
+        assert!(delete_consequence(true).contains("本地文件保留"));
+        assert!(!delete_consequence(true).contains("一起删除"));
+    }
 }
