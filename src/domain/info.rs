@@ -35,11 +35,6 @@ impl RepoInfo {
         }
         None
     }
-
-    /// 是否位于 trunk（很多团队的提交策略依赖这个判断）。
-    pub fn is_trunk(&self) -> bool {
-        self.branch_name().as_deref() == Some("trunk")
-    }
 }
 
 #[cfg(test)]

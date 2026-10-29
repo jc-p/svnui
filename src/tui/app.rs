@@ -1812,8 +1812,13 @@ impl App {
         // 按下去发现变成提交了，正在写的东西直接飞走 —— 太危险。
         //
         // 提交用 Ctrl+S（和"写完了保存"一个语义）。
-        // F2 曾经也接，但同一个动作两个入口只会让人记不住，已去掉。
-        // 另外 Ctrl+Enter / Alt+Enter 也接（部分终端能投递修饰位，收不到也不影响）。
+        //
+        // F2 / Ctrl+Enter / Alt+Enter 看着像"同一个动作四个入口"，
+        // 但它们不是界面上的装饰，是**兼容性兜底**：
+        // - Ctrl+S 会被开了 IXON（软件流控）的终端吞掉，按了没反应；
+        // - Alt+Enter 只有部分终端投递修饰位，收不到也不影响别的；
+        // - F2 是给人最直观的"确认"键。
+        // 全部都留着 —— 少留任何一个，都会有人在某个终端上按了没反应。
         let wants_commit = matches!(
             (key.code, key.modifiers),
             (KeyCode::Char('s'), KeyModifiers::CONTROL)

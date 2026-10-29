@@ -66,12 +66,20 @@ svnui diff --page                 # 强制分页
 ```
 分页器降级链：`delta` → `bat` → `less -R` → 直接打印，`SVNR_PAGER` 可覆盖。
 
+### `svnui blame`
+逐行追溯作者与版本：`svnui blame src/main.rs`。联网操作（要问服务器）。
+TUI 里对应主界面 `Ctrl+B`。
+
 ### `svnui conflicts`
 列出所有冲突，区分 **文本冲突 / 属性冲突 / 树冲突**。
 
 ### `svnui doctor`
 六项体检：锁 / 冲突 / 缺失 / 阻碍 / `.mine` 残留 / 未版本化计数。
 `--json` 有 `healthy` 字段。
+
+### `svnui preview`
+不进工作副本也能看：预览本地文件，或直接浏览 SVN 目录 URL（相对路径基于 `--cwd` 或当前目录）。
+大文件与压缩包有上限（见 README 预览区小节）。
 
 ---
 
@@ -81,9 +89,13 @@ svnui diff --page                 # 强制分页
 
 | 级 | 命令 | TTY | 非 TTY |
 |---|---|---|---|
+| Safe | `status` `diff` `log` `info` | 直接执行 | 直接执行 |
 | Low | `add`、cleanup（仅解锁） | 直接执行 | 直接执行 |
-| Medium | `commit` `update` `resolve` `remove` | 确认 | **必须 `--yes`** |
+| Medium | `commit` `update` `resolve` `remove` `purge-mine` `branch` `tag` `switch` | 确认 | **必须 `--yes`** |
 | High | `revert`、cleanup `--remove-*` | 确认 | **一律拒绝** |
+
+分级由 `policy::danger_of` 统一判定，确认框标题写出等级、边框颜色跟着等级走。
+`blame` / `preview` / `probe` / `merge-preview` 是只读命令，policy 里按 Safe 处理。
 
 > yazi 侧因为有 `ya.confirm` 自己的确认弹框，调 CLI 时**一律带 `--yes`**，
 > 把确认交给 TUI 层做一次，不要让用户被问两遍。
@@ -116,6 +128,49 @@ svnui cleanup --remove-unversioned             # ⚠️ 永久删除未版本化
 
 `--remove-unversioned` 会删掉你刚写了一半还没 add 的新文件，
 执行前**强制列出将被删除的清单**并二次确认。
+
+### `svnui purge-mine`
+清理解决冲突后 svn 没删干净的 `.mine` / `.rOLD` / `.rNEW`：
+
+```bash
+svnui purge-mine --dry-run   # 先看清单
+svnui purge-mine --yes       # 非交互下必须显式 --yes
+```
+
+两条**绝不越界**的规则：父文件仍在冲突中时不动（那三个是唯一的现场证据），
+父文件本身未版本化的也不动（那是用户自己的 `xxx.mine`）。
+`svnui doctor` 报「有残留」时就用它清。
+
+---
+
+## 分支工作流
+
+```bash
+svnui branch '^/branches/feature-a' -m 'msg' --dry-run   # ^/ 表示仓库根
+svnui tag '^/tags/v1.0' -r HEAD -m 'msg' --yes
+svnui switch '^/branches/feature-a' --yes
+svnui merge-preview '^/trunk' -r 12:18
+```
+
+`branch` / `tag` / `switch` 是 Medium（非 TTY 必须 `--yes`），`merge-preview` 是只读。
+创建分支和标签会**立即提交仓库副本**，不含本地未提交改动；切换要求工作副本干净。
+`merge-preview` 始终走 SVN 原生 `--dry-run`，不会改动工作副本。
+
+---
+
+## 其他入口
+
+```bash
+svnui                      # 不带子命令 → 进 TUI
+svnui tui
+svnui llm --preset zhipu   # 打印配置示例（不联网）
+svnui llm --test           # 连通性自检，失败返回非零
+svnui config --init        # 写一份带注释的默认配置
+svnui install-yazi --check # 只看会装到哪，不写盘
+```
+
+> ⚠️ `svnui llm --test` 会真的发一个请求到模型服务。`send_diff` 为 true 时，
+> TUI 里 `Ctrl+G` 生成提交信息会把 diff 正文发给模型 —— 这是隐私开关，默认关。
 
 ---
 

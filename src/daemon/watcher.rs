@@ -12,7 +12,6 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -130,31 +129,6 @@ pub fn drain_after_debounce(pending: &Pending) -> HashSet<PathBuf> {
         Err(e) => e.into_inner(),
     };
     std::mem::take(&mut *set)
-}
-
-/// 事件通道的轻量封装。当前 watcher 直接写 pending，
-/// 这个类型保留给未来需要把 watcher 挪到独立线程时用。
-pub struct EventBus {
-    #[allow(dead_code)]
-    tx: Sender<PathBuf>,
-    #[allow(dead_code)]
-    rx: Receiver<PathBuf>,
-}
-
-#[allow(dead_code)]
-impl EventBus {
-    pub fn new() -> Self {
-        let (tx, rx) = channel();
-        Self { tx, rx }
-    }
-
-    /// 非阻塞取一批事件。没有就返回空。
-    pub fn take_batch(&self, _timeout: Duration) -> Vec<PathBuf> {
-        match self.rx.recv_timeout(Duration::from_millis(1)) {
-            Ok(p) => vec![p],
-            Err(RecvTimeoutError::Timeout) | Err(RecvTimeoutError::Disconnected) => Vec::new(),
-        }
-    }
 }
 
 #[cfg(test)]

@@ -208,17 +208,6 @@ impl Theme {
     pub fn author() -> Style {
         Style::default().fg(Color::LightBlue)
     }
-
-    /// 仓库标识（分支名@版本号）。
-    pub fn identity() -> Style {
-        Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
-    }
-
-    /// 分隔/结构线（表头、分隔行）—— 比正文更暗，不抢内容。
-    pub fn separator() -> Style {
-        Style::default().fg(Color::DarkGray)
-    }
-
     /// 空状态：标题与说明。
     ///
     /// 空不是错误 —— 用暗淡色而不是红色，避免"没有数据"看起来像"出事了"。

@@ -100,13 +100,6 @@ impl<'a> Loading<'a> {
         self.detail = d;
         self
     }
-
-    /// 关掉计时（空间紧张时用）。
-    pub fn without_elapsed(mut self) -> Self {
-        self.with_elapsed = false;
-        self
-    }
-
     /// 拼成一行，给顶栏这类条状区域。
     ///
     /// 返回 `Vec<Span>` 而不是单个 `Span`：三段各有自己的颜色，

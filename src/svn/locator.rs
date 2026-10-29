@@ -20,12 +20,6 @@ pub fn svn_exe() -> Option<&'static PathBuf> {
     })
     .as_ref()
 }
-
-/// 强制忽略缓存重新查找（测试或 `SVNR_SVN` 变更时用）。
-pub fn svn_exe_forced() -> Option<PathBuf> {
-    which("svn")
-}
-
 /// 由配置文件指定 svn 可执行文件（对应 `svn.svn_path`）。
 ///
 /// 优先级**低于**环境变量：配置是"这台机器一直这么用"，
