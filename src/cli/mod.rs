@@ -309,6 +309,18 @@ pub enum Cmd {
         yes: bool,
     },
 
+    /// 清理已解决冲突残留的 `.mine` / `.rOLD` / `.rNEW` 文件。
+    ///
+    /// 冲突解决后 svn 本该自动清掉这三个文件，偶尔会留下；
+    /// `doctor` 报出来的残留就是用这个清。仍在冲突中的文件**不动** ——
+    /// 那三个文件是唯一的现场证据。
+    PurgeMine {
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+
     /// 工作副本体检：锁 / 冲突 / 缺失 / 阻碍 / .mine 残留。
     Doctor,
 
@@ -632,6 +644,7 @@ fn dispatch(cli: &Cli, svn: &crate::svn::Svn, tty: bool) -> Result<String, crate
         Cmd::Cleanup { remove_unversioned, remove_ignored, vacuum_pristines, dry_run, yes } => {
             rescue::cleanup(svn, *remove_unversioned, *remove_ignored, *vacuum_pristines, *dry_run, *yes, tty)
         }
+        Cmd::PurgeMine { dry_run, yes } => rescue::purge_mine(cli, svn, *dry_run, *yes, tty),
         Cmd::Doctor => rescue::doctor(cli, svn, tty),
 
         // 注意：这里匹配的是 `&cli.cmd`，字段都是引用，必须 clone 成 owned 值。

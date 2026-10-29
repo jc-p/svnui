@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use crate::domain::{Error, StatusKind};
+use crate::domain::{Error, StatusEntry, StatusKind};
 use crate::policy::{cleanup_danger, danger_of, judge, render_targets, Op, Verdict};
 use crate::svn::Svn;
 
@@ -157,6 +157,144 @@ pub fn cleanup(
     Ok("清理完成".to_string())
 }
 
+/// `a.txt.mine` → (`a.txt`, "mine")；`.r<版本号>` 同理。不是三件套后缀返回 `None`。
+///
+/// 只认这两种后缀：目录里还有别的文件，而这**是删文件的操作** ——
+/// 宁可漏一个，不能错删一个。
+fn split_trio_suffix(name: &str) -> Option<(&str, &str)> {
+    let (base, suffix) = name.rsplit_once('.')?;
+    if base.is_empty() || suffix.is_empty() {
+        return None;
+    }
+    // `.rOLD` / `.rNEW` 是文档里的叫法，磁盘上实际是 `.r<版本号>`。
+    let is_rev =
+        suffix.len() > 1 && suffix.starts_with('r') && suffix[1..].chars().all(|c| c.is_ascii_digit());
+    if suffix == "mine" || is_rev {
+        Some((base, suffix))
+    } else {
+        None
+    }
+}
+
+/// 工作副本里残留的冲突三件套（绝对路径）。
+///
+/// 三件套 svn 从不纳入版本控制，所以它们一定以"未版本化 / 被忽略"的形态
+/// 出现在 status 里 —— 因此要**从它们自己找**，而不是从父文件找：
+/// 父文件一旦干净（冲突已解决、改动已提交）就不出现在 status 里，
+/// 而那恰恰是最常见的残留场景。从父文件找会把这类全漏掉 ——
+/// 之前 `doctor` 就这么写，结果在有残留的干净仓库上一路报"健康"。
+///
+/// 两条排除规则：
+/// - 父文件**仍在冲突中** → 那三个文件是唯一的现场证据，删了没法比对
+/// - 父文件本身也未版本化 → 那是用户自己的 `xxx.mine`，不是冲突残留
+fn residual_files(root: &std::path::Path, entries: &[StatusEntry]) -> Vec<PathBuf> {
+    let conflicted: std::collections::HashSet<&str> = entries
+        .iter()
+        .filter(|e| e.is_conflicted())
+        .map(|e| e.path.as_str())
+        .collect();
+    let unversioned: std::collections::HashSet<&str> = entries
+        .iter()
+        .filter(|e| e.text == StatusKind::Unversioned || e.text == StatusKind::Ignored)
+        .map(|e| e.path.as_str())
+        .collect();
+
+    let mut out = Vec::new();
+    for e in entries {
+        if e.text != StatusKind::Unversioned && e.text != StatusKind::Ignored {
+            continue;
+        }
+        let Some(name) = e.path.file_name() else {
+            continue;
+        };
+        let Some((base_name, _)) = split_trio_suffix(name) else {
+            continue;
+        };
+        let base = e.path.with_file_name(base_name);
+        if conflicted.contains(base.as_str()) || unversioned.contains(base.as_str()) {
+            continue;
+        }
+        out.push(root.join(&e.path));
+    }
+    out.sort();
+    out
+}
+
+/// 清理已解决冲突残留的三件套文件。
+///
+/// `doctor` 一直在报告 `.mine 残留 N 项`，但从来没给过清理手段 ——
+/// 用户只能自己 `rm`。这里补上，并且只动**已经不在冲突态**的路径：
+/// 还在冲突的文件，三件套是唯一的现场证据，删了就没法三路比对了。
+pub fn purge_mine(
+    cli: &super::Cli,
+    svn: &Svn,
+    dry_run: bool,
+    yes: bool,
+    tty: bool,
+) -> Result<String, Error> {
+    let opts = crate::svn::StatusOpts { include_ignored: true, ..Default::default() };
+    let entries = svn.status(&opts)?;
+
+    let files = residual_files(&svn.root, &entries);
+
+    if files.is_empty() {
+        if cli.json {
+            return Ok(crate::output::ok(&serde_json::json!({
+                "purged": [],
+                "failed": [],
+            })));
+        }
+        return Ok("没有冲突残留，无需清理".to_string());
+    }
+
+    let targets: Vec<String> = files
+        .iter()
+        .map(|f| {
+            f.strip_prefix(&svn.root)
+                .unwrap_or(f.as_path())
+                .display()
+                .to_string()
+        })
+        .collect();
+
+    // 中危：会删文件，但删的都是 svn 自己该清掉的临时副本，且可重建。
+    match guard(Op::PurgeMine, danger_of(Op::PurgeMine), &targets, dry_run, yes, tty)? {
+        Some(text) if !text.is_empty() => return Ok(text),
+        Some(_) => {}
+        None => return Ok(String::new()),
+    }
+
+    let mut purged = Vec::new();
+    let mut failed = Vec::new();
+    for f in &files {
+        match std::fs::remove_file(f) {
+            Ok(()) => purged.push(
+                f.strip_prefix(&svn.root)
+                    .unwrap_or(f.as_path())
+                    .display()
+                    .to_string(),
+            ),
+            Err(e) => failed.push(format!("{}（{}）", f.display(), e)),
+        }
+    }
+    crate::cache::invalidate_for(&svn.root);
+
+    if cli.json {
+        return Ok(crate::output::ok(&serde_json::json!({
+            "purged": purged,
+            "failed": failed,
+        })));
+    }
+    let mut out = format!("已清理 {} 个残留文件", purged.len());
+    if !failed.is_empty() {
+        out.push_str(&format!("，{} 个失败：", failed.len()));
+        for f in &failed {
+            out.push_str(&format!("\n  {f}"));
+        }
+    }
+    Ok(out)
+}
+
 /// 体检报告。yazi 的 `vh` 键走这个。
 pub fn doctor(cli: &super::Cli, svn: &Svn, tty: bool) -> Result<String, Error> {
     let opts = crate::svn::StatusOpts { include_ignored: true, ..Default::default() };
@@ -168,18 +306,17 @@ pub fn doctor(cli: &super::Cli, svn: &Svn, tty: bool) -> Result<String, Error> {
     let obstructed: Vec<_> = entries.iter().filter(|e| e.text == StatusKind::Obstructed).collect();
     let unversioned: Vec<_> = entries.iter().filter(|e| e.text == StatusKind::Unversioned).collect();
 
-    // .mine 残留：文件已不在冲突态，但 .mine 还在磁盘上。
-    let mut residual = Vec::new();
-    for e in &entries {
-        if e.is_conflicted() || e.text == StatusKind::Unversioned {
-            continue;
-        }
-        let p = svn.root.join(&e.path);
-        let mine = PathBuf::from(format!("{}.mine", p.display()));
-        if mine.exists() {
-            residual.push(e.path.to_string());
-        }
-    }
+    // 冲突三件套残留。与 purge-mine 共用同一份判定：这里报"有残留"，
+    // purge-mine 就必须能清掉，两边各算一套会互相打脸。
+    let residual: Vec<String> = residual_files(&svn.root, &entries)
+        .iter()
+        .map(|p| {
+            p.strip_prefix(&svn.root)
+                .unwrap_or(p.as_path())
+                .display()
+                .to_string()
+        })
+        .collect();
 
     let healthy = locked.is_empty()
         && conflicts.is_empty()
@@ -226,7 +363,33 @@ pub fn doctor(cli: &super::Cli, svn: &Svn, tty: bool) -> Result<String, Error> {
         out.push_str("\n有锁 → 先跑 `svnui cleanup`\n");
     }
     if !residual.is_empty() {
-        out.push_str("\n有 .mine 残留 → 可安全跑 `svnui cleanup` 后手动删除，或检查是否已解决\n");
+        out.push_str("\n有冲突残留 → `svnui purge-mine` 可安全清掉（仍冲突的文件不会动）\n");
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 这是删文件的操作，宁可漏一个也不能错删一个 —— 所以只认
+    /// `.mine` 和 `.r<数字>` 两种后缀。
+    #[test]
+    fn only_real_conflict_trio_suffixes_match() {
+        assert_eq!(split_trio_suffix("a.txt.mine"), Some(("a.txt", "mine")));
+        assert_eq!(split_trio_suffix("a.txt.r1"), Some(("a.txt", "r1")));
+        assert_eq!(split_trio_suffix("a.txt.r24"), Some(("a.txt", "r24")));
+
+        // 近似但不等价的一律不算
+        for name in ["a.txt.merge", "a.txt.r", "a.txt.r1x", "a.txt.bak", "a.txt.", ".mine", "a.txt"] {
+            assert_eq!(split_trio_suffix(name), None, "{name} 不该被当成三件套");
+        }
+    }
+
+    /// 目录里有别的文件时不误伤：三件套是按**后缀**认的，不是按前缀扫的。
+    #[test]
+    fn sibling_files_are_never_treated_as_leftovers() {
+        assert!(split_trio_suffix("b.txt.mine").is_some()); // 它自己确实是 .mine
+        assert_eq!(split_trio_suffix("b.txt.mine").unwrap().0, "b.txt");
+    }
 }
