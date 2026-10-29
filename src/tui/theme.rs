@@ -3,8 +3,10 @@
 //! 刻意和 同一套语义色 保持同一套语义色，
 //! 这样在 两种界面 之间来回切换时不会觉得"换了套皮肤"。
 
+use ratatui::layout::Alignment;
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::widgets::{Block, BorderType};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, BorderType, Paragraph};
 
 /// 所有面板共用圆角边框；标题、颜色和边框范围仍由各面板决定。
 pub fn block<'a>() -> Block<'a> {
@@ -117,6 +119,31 @@ impl Theme {
         Style::default().fg(Color::White)
     }
 
+    /// 提交作者。
+    ///
+    /// 以前直接借 `modified()`（"M 修改"的黄）显示作者名 —— 语义串台：
+    /// 黄色在状态列里代表"文件被改过"，挪到作者列就成了"这个人有改动"。
+    pub fn author() -> Style {
+        Style::default().fg(Color::LightBlue)
+    }
+
+    /// 仓库标识（分支名@版本号）。
+    pub fn identity() -> Style {
+        Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+    }
+
+    /// 分隔/结构线（表头、分隔行）—— 比正文更暗，不抢内容。
+    pub fn separator() -> Style {
+        Style::default().fg(Color::DarkGray)
+    }
+
+    /// 空状态：标题与说明。
+    ///
+    /// 空不是错误 —— 用暗淡色而不是红色，避免"没有数据"看起来像"出事了"。
+    pub fn empty_title() -> Style {
+        Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)
+    }
+
     /// 输入框正文（聚焦中）—— 白字加粗，和未聚焦的框拉开差别。
     ///
     /// 只有边框变色不够：四个框排在一起时，用户要盯着边框找焦点。
@@ -126,6 +153,21 @@ impl Theme {
             .fg(Color::White)
             .add_modifier(Modifier::BOLD)
     }
+}
+
+/// 空状态：居中的标题 + 若干提示行。
+///
+/// 空**不是**错误 —— 用暗淡色而不是红色，否则"这个目录是空的"
+/// 看起来跟"读取失败"一样。各面板复用同一个，别一家写一个说法。
+pub fn empty_state<'a>(title: &'a str, hints: &[&'a str]) -> Paragraph<'a> {
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(format!(" {title} "), Theme::empty_title())),
+    ];
+    for hint in hints {
+        lines.push(Line::from(Span::styled(format!(" {hint} "), Theme::dim())));
+    }
+    Paragraph::new(lines).alignment(Alignment::Center)
 }
 
 /// 按状态符号取颜色。

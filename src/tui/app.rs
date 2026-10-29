@@ -1128,12 +1128,15 @@ impl App {
                                     .lines()
                                     .take(5000)
                                     .map(|l| {
+                                        // 走 theme 的语义色，不在这里另起一套：
+                                        // 同一个"新增"在文件树是 added()，
+                                        // 在 diff 里也必须是同一个绿。
                                         let st = if l.starts_with('+') && !l.starts_with("+++") {
-                                            Style::default().fg(Color::Green)
+                                            theme::Theme::added()
                                         } else if l.starts_with('-') && !l.starts_with("---") {
-                                            Style::default().fg(Color::Red)
+                                            theme::Theme::deleted()
                                         } else if l.starts_with("@@") {
-                                            Style::default().fg(Color::Cyan)
+                                            theme::Theme::props()
                                         } else if l.starts_with("Index:") {
                                             theme::Theme::title()
                                         } else {

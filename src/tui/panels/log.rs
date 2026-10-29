@@ -219,7 +219,7 @@ impl LogPanel {
                     Span::raw(" "),
                     Span::styled(
                         format!("{:<12}", truncate(&e.author, 12)),
-                        theme::Theme::modified(),
+                        theme::Theme::author(),
                     ),
                 ]))
             })
@@ -265,13 +265,11 @@ impl LogPanel {
                 .borders(Borders::ALL)
                 .title(format!(" 提交历史（搜索：{}）", self.filter.as_deref().unwrap_or("")))
                 .border_style(theme::Theme::border_active());
+            let inner = block.inner(cols[0]);
+            f.render_widget(block, cols[0]);
             f.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    " 没有匹配的提交。按 / 换个关键词",
-                    theme::Theme::dim(),
-                )))
-                .block(block),
-                cols[0],
+                theme::empty_state("没有匹配的提交", &["按 / 换个关键词"]),
+                inner,
             );
             return;
         }

@@ -586,24 +586,34 @@ impl RepoPanel {
             format!(" 仓库 {} 项 ", self.entries.len())
         };
 
-        let list = List::new(items)
-            .block(
-                theme::block()
-                    .borders(Borders::ALL)
-                    .title(title)
-                    .border_style(theme::Theme::border_active()),
-            )
-            .highlight_style(theme::Theme::selected());
+        let block = theme::block()
+            .borders(Borders::ALL)
+            .title(title)
+            .border_style(theme::Theme::border_active());
+        let inner = block.inner(area);
+        f.render_widget(block, area);
 
-        f.render_stateful_widget(list, area, &mut self.state);
+        // 空目录要明说，不能只留一个空框 —— 空框和"加载失败"长得一样。
+        if self.entries.is_empty() {
+            let hints: &[&str] = if self.loading {
+                &["正在读取远端目录"]
+            } else {
+                &["上一级可能有内容（← 返回）", "也可以按 o 直接检出本目录"]
+            };
+            f.render_widget(theme::empty_state("这个目录是空的", hints), inner);
+            return;
+        }
 
-        let visible_h = area.height.saturating_sub(2) as usize;
+        let list = List::new(items).highlight_style(theme::Theme::selected());
+        f.render_stateful_widget(list, inner, &mut self.state);
+
+        let visible_h = inner.height as usize;
         if self.entries.len() > visible_h {
             let mut sb = ratatui::widgets::ScrollbarState::new(self.entries.len())
                 .position(self.state.selected().unwrap_or(0));
             f.render_stateful_widget(
                 Scrollbar::new(ScrollbarOrientation::VerticalRight),
-                area,
+                inner,
                 &mut sb,
             );
         }
