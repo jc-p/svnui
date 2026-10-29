@@ -95,7 +95,10 @@ pub fn ping(cfg: &LlmConfig) -> Result<String, String> {
     });
 
     let t0 = std::time::Instant::now();
-    let resp = send_request(cfg, &url, body)?;
+    // 自检**不重试**：这是诊断命令，用户要的是"为什么连不上"的精确答案。
+    // 重试一次 429 只会把"限流"这句准确的诊断，盖成第二次请求失败后的
+    // "无法连接"—— 还白白多等一两秒。
+    let resp = send_probe(cfg, &url, body)?;
     let ms = t0.elapsed().as_millis();
 
     let v: serde_json::Value = serde_json::from_str(&resp)
@@ -118,11 +121,34 @@ pub fn ping(cfg: &LlmConfig) -> Result<String, String> {
     ))
 }
 
+/// 生成类请求：允许重试（`cfg.retry` 次）。
+///
+/// 一次提交信息生成失败，重发一次的代价很低，值得等。
+fn send_request(cfg: &LlmConfig, url: &str, body: serde_json::Value) -> Result<String, String> {
+    send_with_retry(cfg, url, body, cfg.retry)
+}
+
+/// 诊断类请求：**不重试**。
+///
+/// `svnui llm --test` 是拿来看"到底哪一步错了"的。重试会把第一次拿到的
+/// 精确诊断（限流 / 认证失败 / 模型不存在）换成第二次失败后的含糊说法，
+/// 还让用户多等一两秒 —— 诊断要快、要准，重试在这里是帮倒忙。
+fn send_probe(cfg: &LlmConfig, url: &str, body: serde_json::Value) -> Result<String, String> {
+    send_with_retry(cfg, url, body, 0)
+}
+
 /// 两条调用路径共享认证与错误诊断，避免自检通过但生成采用另一套配置。
 ///
 /// 返回**响应正文文本**（已按上限截断），由调用方自己解析 JSON ——
 /// 重试要能重发同一份 body，解析留在循环外面更清楚。
-fn send_request(cfg: &LlmConfig, url: &str, body: serde_json::Value) -> Result<String, String> {
+///
+/// `attempts` 是最多重试几次；传 0 就是发一次就回。
+fn send_with_retry(
+    cfg: &LlmConfig,
+    url: &str,
+    body: serde_json::Value,
+    attempts: u32,
+) -> Result<String, String> {
     let mut attempt = 0u32;
     loop {
         match send_once(cfg, url, body.clone()) {
@@ -130,7 +156,7 @@ fn send_request(cfg: &LlmConfig, url: &str, body: serde_json::Value) -> Result<S
             // 只重试"稍等一下就好"的两类：限流和服务端错误。
             // 认证失败、404、连不上 —— 重试多少次结果都一样，
             // 只会让用户多等几倍时间才看到同一句提示。
-            Err(Fail::Retryable(msg, hint)) if attempt < cfg.retry => {
+            Err(Fail::Retryable(msg, hint)) if attempt < attempts => {
                 // 服务端说了等多久就听它的；没说就指数退避 0.5s → 1s → 2s。
                 let wait = hint
                     .unwrap_or_else(|| backoff(attempt))
