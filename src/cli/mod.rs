@@ -324,6 +324,24 @@ pub enum Cmd {
     /// 工作副本体检：锁 / 冲突 / 缺失 / 阻碍 / .mine 残留。
     Doctor,
 
+    /// 工作副本清单：这台机器上已知的 svn 项目（登记 + 打开过的）。
+    ///
+    /// 不需要工作副本 —— 它就是用来管理"有哪些副本"的，
+    /// 要求先在一个副本里才能跑就成了循环依赖。
+    Projects {
+        /// 登记一个工作副本；不给值就登记当前目录。
+        #[arg(long, value_name = "PATH", num_args = 0..=1, default_missing_value = ".")]
+        add: Option<std::path::PathBuf>,
+
+        /// 从清单里移除一个工作副本。
+        #[arg(long, value_name = "PATH")]
+        remove: Option<std::path::PathBuf>,
+
+        /// 显示完整路径（不把 home 缩成 `~`）。
+        #[arg(long)]
+        full: bool,
+    },
+
     /// 列出所有冲突。
     Conflicts,
 
@@ -431,6 +449,24 @@ pub fn run(mut cli: Cli) -> i32 {
 
     let start = cli.start_dir();
 
+    // 项目清单不依赖 SVN：它是"这台机器上有哪些仓库"的登记簿，
+    // 就算 svn 没装、当前也不在任何副本里，也应该能增删查 ——
+    // 否则新机器上根本没法先把项目配好。
+    if let Some(Cmd::Projects { add, remove, full }) = cli.cmd.as_ref() {
+        return match projects_report(add.as_deref(), remove.as_deref(), *full, &start) {
+            Ok(text) => {
+                if !text.is_empty() {
+                    println!("{text}");
+                }
+                0
+            }
+            Err(e) => {
+                emit_err(&cli, &e);
+                e.exit_code()
+            }
+        };
+    }
+
     // URL 保持原字符串，不能与本地目录拼接；本地预览仍绕过 SVN 探测。
     #[cfg(feature = "tui")]
     if let Some(Cmd::Preview { path }) = cli.cmd.as_ref() {
@@ -530,6 +566,74 @@ fn llm_report(test: bool, preset: Option<crate::config::LlmProvider>) -> crate::
     Ok(out)
 }
 
+/// `svnui projects`：列出 / 登记 / 移除工作副本。
+fn projects_report(
+    add: Option<&std::path::Path>,
+    remove: Option<&std::path::Path>,
+    full: bool,
+    cwd: &std::path::Path,
+) -> crate::domain::Result<String> {
+    // `--add` 不带值时 clap 补的是 "."，这里换成真正的当前目录。
+    let resolve = |p: &std::path::Path| -> std::path::PathBuf {
+        if p == std::path::Path::new(".") {
+            cwd.to_path_buf()
+        } else {
+            p.to_path_buf()
+        }
+    };
+    let as_err = crate::domain::Error::Parse;
+
+    if let Some(p) = add {
+        return crate::projects::add(&resolve(p), None).map_err(as_err);
+    }
+    if let Some(p) = remove {
+        return crate::projects::remove(&resolve(p)).map_err(as_err);
+    }
+
+    let items = crate::projects::list(&crate::config::Config::load());
+    if items.is_empty() {
+        // 空状态必须说清下一步 —— 只打"0 个"用户不知道怎么开始。
+        return Ok(
+            "还没有已知的工作副本。\n\n\
+             登记当前目录：  svnui projects --add\n\
+             登记指定目录：  svnui projects --add ~/work/foo\n\n\
+             在 TUI 里打开过的仓库会自动记进这个列表。"
+                .to_string(),
+        );
+    }
+
+    let mut out = format!("已知工作副本 {} 个\n\n", items.len());
+    for p in &items {
+        let path = if full {
+            p.path.display().to_string()
+        } else {
+            crate::projects::short_path(&p.path)
+        };
+        // 标明来源：没登记过的项目出现在列表里会让人困惑。
+        let source = match p.source {
+            crate::projects::Source::Registered => "登记",
+            crate::projects::Source::History => "打开过",
+        };
+        let state = match p.state {
+            crate::projects::State::Ready => "",
+            crate::projects::State::NotWorkingCopy => "  ← 不是工作副本（还没检出？）",
+            crate::projects::State::Missing => "  ← 目录已不在磁盘上",
+        };
+        out.push_str(&format!("  {}  {}  {}{}\n", pad_col(&p.name, 18), pad_col(&path, 42), source, state));
+    }
+    Ok(out)
+}
+
+/// 左对齐补空格。按字符数算，不用字节 —— 中文路径按字节补会歪。
+fn pad_col(s: &str, width: usize) -> String {
+    let n = s.chars().count();
+    if n >= width {
+        format!("{s} ")
+    } else {
+        format!("{s}{}", " ".repeat(width - n))
+    }
+}
+
 /// 配置文件自检。`--init` 写入默认配置，`--path` 只打路径。
 fn config_report(
     init: bool,
@@ -605,6 +709,9 @@ fn dispatch(cli: &Cli, svn: &crate::svn::Svn, tty: bool) -> Result<String, crate
         Cmd::Diff { stat, rev, page, paths } => query::diff(cli, svn, *stat, rev.as_deref(), *page, paths),
         Cmd::Conflicts => rescue::conflicts(cli, svn, tty),
         Cmd::Llm { test, preset } => llm_report(*test, *preset),
+        // 正常不会走到这里（SVN 探测前已分发）。留着是为了穷尽匹配，
+        // 万一将来挪了顺序，行为仍然是"列出清单"而不是崩掉。
+        Cmd::Projects { .. } => projects_report(None, None, false, &cli.start_dir()),
         Cmd::Config { init, force, path } => config_report(*init, *force, *path),
 
         Cmd::Add { paths } => mutate::add(svn, paths),

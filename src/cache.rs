@@ -21,6 +21,7 @@
 //! 与缓存年龄无关。所以 TTL 在这里只是安全阀，不是正确性保障。
 
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -315,6 +316,66 @@ fn now_secs() -> u64 {
 /// 缓存文件、socket、pid 三者前缀一致，便于排查。
 pub fn hash_root(root: &Path) -> String {
     hash_path(root)
+}
+
+/// 缓存里留下过痕迹的所有工作副本根。
+///
+/// 这是"这台机器上用过哪些仓库"唯一现成的出处 —— 缓存文件名是路径哈希，
+/// **反推不出路径**，只能打开文件读里面的 `root` 字段。
+///
+/// **只读每个文件的头部**：缓存存的是全树指纹，大仓库能有几 MB，
+/// 而 `root` 是 `CachedDoc` 的第二个字段，必然落在开头。为了拿一个
+/// 字符串去解析整个 JSON 不划算 —— 这个列表要在打开项目面板时瞬时拿到。
+///
+/// 扫不到就跳过（当作不知道这个项目），不报错：这个来源只是"顺带想起来
+/// 的"，漏一个不影响显式登记的项目。
+pub fn known_roots() -> Vec<PathBuf> {
+    /// 只读这么多字节。4KB 足够覆盖开头的几个短字段。
+    const HEAD_BYTES: u64 = 4096;
+
+    let Some(dir) = cache_dir() else {
+        return Vec::new();
+    };
+    let Ok(read) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::new();
+    for entry in read.flatten() {
+        let p = entry.path();
+        if p.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(mut f) = std::fs::File::open(&p) else {
+            continue;
+        };
+        let mut buf = Vec::new();
+        // 截断可能切在多字节字符中间，from_utf8_lossy 会替换成 U+FFFD；
+        // 反正要找的字段在开头，不受影响。
+        if f.by_ref().take(HEAD_BYTES).read_to_end(&mut buf).is_err() {
+            continue;
+        }
+        if let Some(root) = head_root(&String::from_utf8_lossy(&buf)) {
+            out.push(PathBuf::from(root));
+        }
+    }
+    out
+}
+
+/// 从 JSON 头部抠出 `root` 字段的值。
+///
+/// 刻意不用 serde：只要一个字符串，不值得反序列化整个文档。
+/// 路径里带引号或反斜杠的极端情况直接放弃 —— 那是"少想起一个项目"，
+/// 而不是"给出一条错的项目"。
+fn head_root(head: &str) -> Option<String> {
+    let rest = head.split_once("\"root\"")?.1.trim_start();
+    let rest = rest.strip_prefix(':')?.trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let value = &rest[..rest.find('"')?];
+    if value.is_empty() || value.contains('\\') {
+        return None;
+    }
+    Some(value.to_string())
 }
 
 fn hash_path(root: &Path) -> String {

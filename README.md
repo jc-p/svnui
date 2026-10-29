@@ -407,6 +407,7 @@ svnui merge-preview '^/trunk' -r 12:18
 | `checkout` | 检出（唯一不需要先有工作副本的命令） |
 | `login` / `auth` | 凭据验证 / 列出已缓存凭据 |
 | `preview` | 独立预览本地文件或浏览 SVN URL，无需进入工作副本 |
+| `projects` | 已知工作副本清单：列出 / `--add` 登记 / `--remove` 移除（打开过的仓库会自动记住） |
 | `tui` | 打开交互式 TUI（不带子命令时的默认形态也是它） |
 | `llm` | LLM 配置示例与自检（`--preset` / `--test`） |
 | `config` | 配置文件状态与初始化（`--init`） |

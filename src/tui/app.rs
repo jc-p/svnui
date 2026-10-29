@@ -468,6 +468,21 @@ impl App {
 
     fn fetch(svn: &Svn, sort: SortMode) -> crate::domain::Result<(Vec<crate::tui::panels::Item>, PathBuf)> {
         let snap = svn.snapshot(&StatusOpts::default())?;
+
+        // 顺手写一份状态缓存。两个用处：
+        // 1. 下次 `svnui status` 能命中，省一次联网级的 svn status
+        // 2. **让"这台机器上打开过哪些仓库"有据可查** —— 项目列表的
+        //    "历史发现"就是从缓存文件反推的，TUI 不留痕迹的话，
+        //    TUI 用户（主形态）打开过的仓库一个都记不住。
+        //
+        // 刻意**只写不读**：读取仍走 snapshot，缓存语义不进主流程。
+        // 写失败无所谓（缓存只是优化），所以吞掉错误。
+        // `Cache::open` 在 SVN 1.6（没有 wc.db）下返回 None，那种仓库
+        // 记不住 —— 可接受，1.6 的校验模型本来就不成立。
+        if let Some(c) = crate::cache::Cache::open(svn.root.as_path()) {
+            let _ = c.save(&snap);
+        }
+
         let root = PathBuf::from(snap.root.as_str());
         // 浏览列表也要展示未版本化文件，用户才能按 A 加入 SVN；
         // 能否勾选提交仍由 Item / TreePanel 的提交资格规则控制。

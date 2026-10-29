@@ -263,6 +263,19 @@ impl Default for LogConfig {
 
 // ── 总配置 ───────────────────────────────────────────────
 
+/// 一个登记的工作副本。
+///
+/// `name` 可省略（省略则显示目录名）：多数情况下目录名就够了，
+/// 但同名目录（`~/work/api` 和 `~/oss/api`）必须能区分开。
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct ProjectEntry {
+    /// 显示名。留空取目录名。
+    pub name: String,
+    /// 工作副本路径，支持 `~`。
+    pub path: String,
+}
+
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
 pub struct Config {
@@ -271,6 +284,8 @@ pub struct Config {
     pub ui: UiConfig,
     pub preview: PreviewConfig,
     pub log: LogConfig,
+    /// 登记的工作副本。可重复多段；不写也能用 —— 见 `projects` 模块的历史发现。
+    pub projects: Vec<ProjectEntry>,
 }
 
 /// 默认配置全文。首次运行时写进 `~/.config/svnui/config.toml`。
@@ -361,6 +376,14 @@ pager = "auto"
 [log]
 # 首次加载多少条。svn log 是联网操作，多了要等服务器。
 page_size = 100
+
+# ── 项目登记 ─────────────────────────────────────────
+# 可以重复多段，也可以一段都不写 —— 打开过的仓库会被自动记住。
+# 想让某个项目一直出现在列表里（或给它起个好认的名字）就写在这里。
+#
+# [[projects]]
+# name = "svnui"
+# path = "~/learn/Lazy/svnui"
 "##;
 
 impl Config {

@@ -22,6 +22,7 @@ pub mod domain;
 pub mod ipc;
 pub mod output;
 pub mod policy;
+pub mod projects;
 pub mod svn;
 
 /// TUI 层。feature = "tui" 时才有。
