@@ -56,11 +56,19 @@ impl App {
                 } else {
                     "此操作会把整个工作副本切换到所示 URL 和版本。Y 执行；Enter/N/Esc 取消。"
                 };
+                // 危险级由 policy 定，不在调用点挑颜色：
+                // branch/tag/switch 都是中危，改一处即全生效。
+                let op = match plan.operation() {
+                    WorkflowOperation::Branch => Op::Branch,
+                    WorkflowOperation::Tag => Op::Tag,
+                    WorkflowOperation::Switch => Op::Switch,
+                    WorkflowOperation::MergePreview => Op::MergePreview,
+                };
                 self.confirm = Some(ConfirmPanel::new(
                     plan.operation().title(),
                     message,
                     plan.describe(),
-                    Danger::Warn,
+                    op,
                     ConfirmAction::Workflow(plan),
                 ));
                 self.mode = Mode::Confirm;

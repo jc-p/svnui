@@ -50,7 +50,9 @@ use crate::tui::panels::file_preview::{self, FileContent};
 use crate::tui::panels::help::HelpPanel;
 use crate::tui::panels::log::LogPanel;
 use crate::tui::panels::notice::{Action as NoticeAction, Level as NoticeLevel, NoticePanel};
-use crate::tui::panels::confirm::{ConfirmAction, ConfirmPanel, Danger};
+use crate::policy::Op;
+use crate::tui::panels::confirm::{ConfirmAction, ConfirmPanel, Field, Toggle};
+use crate::policy::Danger;
 use crate::tui::panels::conflict::{ConflictItem, ConflictPanel, Side, Strategy};
 use crate::tui::panels::tree::{TreeMode, TreePanel};
 use crate::tui::panels::repo::{RepoAction, RepoPanel};
@@ -984,7 +986,7 @@ impl App {
                                     format!("丢弃本地改动：{} 项", items.len()),
                                     format!("范围：{}\n目录递归撤销，包含执行时目录内的版本改动。\n丢弃的内容无法恢复；不影响仓库历史。", scope),
                                     items,
-                                    Danger::Critical,
+                                    Op::Revert,
                                     ConfirmAction::Revert(paths),
                                 ));
                                 self.mode = Mode::Confirm;
@@ -1020,7 +1022,7 @@ impl App {
                             rev, n, rev
                         ),
                         items,
-                        Danger::Critical,
+                        Op::Revert,
                         ConfirmAction::RevertToRev(rev),
                     ));
                     self.mode = Mode::Confirm;
@@ -1031,7 +1033,7 @@ impl App {
                     if remote.is_empty() {
                         // 远端没更新，直接 update 不会撞冲突。
                         // tick 返回 ()，这里不能 return Ok(()) —— 用完 continue 跳过剩余逻辑。
-                        self.do_update_confirmed();
+                        self.do_update_confirmed(None);
                         continue;
                     }
                     // 重叠 = 远端有更新 && 本地也改了 → 大概率冲突
@@ -1057,22 +1059,30 @@ impl App {
 
                     if overlaps.is_empty() {
                         // 远端有更新但和本地改动不重叠，安全
-                        self.do_update_confirmed();
+                        self.do_update_confirmed(None);
                         continue;
                     }
 
                     let n = remote.len();
-                    self.confirm = Some(ConfirmPanel::new(
-                        "更新前预警",
-                        format!(
-                            "远端有 {} 项更新，其中 {} 项你本地也改了，更新后可能产生冲突：",
-                            n,
-                            overlaps.len()
-                        ),
-                        overlaps,
-                        Danger::Warn,
-                        ConfirmAction::Update,
-                    ));
+                    // 版本号输入框：CLI 的 `update -r REV` 在 TUI 里原本无处可填，
+                    // 恒为 None 导致「更新到某个旧版本」只能退出去用命令行。
+                    self.confirm = Some(
+                        ConfirmPanel::new(
+                            "更新前预警",
+                            format!(
+                                "远端有 {} 项更新，其中 {} 项你本地也改了，更新后可能产生冲突：",
+                                n,
+                                overlaps.len()
+                            ),
+                            overlaps,
+                            Op::Update,
+                            ConfirmAction::Update,
+                        )
+                        .with_field(Field {
+                            label: "更新到版本".to_string(),
+                            value: String::new(),
+                        }),
+                    );
                     self.mode = Mode::Confirm;
                 }
 
@@ -1565,13 +1575,11 @@ impl App {
             }
 
             // Ctrl+K = svn cleanup：只解锁、清中断的操作，不删任何文件。
-            // 三 false 是刻意的（不删未版本化、不删忽略项、不真空 pristine），
-            // 危险开关留在 CLI `svnui cleanup --remove-unversioned`。
+            //
+            // 删除开关原来写死成 false（CLI 有 --remove-unversioned / --remove-ignored），
+            // 现在放进确认框：默认关闭，打开即升到高危，边框先变红。
             KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.spawn_busy("svn cleanup", |svn| {
-                    svn.cleanup(false, false, false)?;
-                    Ok("已清理工作副本（解锁 + 清除中断的操作）".to_string())
-                });
+                self.confirm_cleanup();
             }
 
             // E = 用外部编辑器打开（$VISUAL / $EDITOR / vim）
@@ -1625,7 +1633,9 @@ impl App {
             KeyCode::Char('v') | KeyCode::Char('V') => self.open_repo(),
             KeyCode::Char('b') | KeyCode::Char('B') => self.open_workflow(),
             KeyCode::Char('R') | KeyCode::F(5) => self.spawn_reload(),
-            KeyCode::Char('u') | KeyCode::Char('U') => self.do_update(),
+            // 小写 u 更新到最新；大写 U 弹框填版本号（对应 CLI 的 update -r）。
+            KeyCode::Char('u') => self.do_update(),
+            KeyCode::Char('U') => self.do_update_to_rev(),
             KeyCode::Char('h') | KeyCode::Char('H') => self.do_doctor(),
             KeyCode::Char('l') | KeyCode::Char('L') => self.open_log(),
             _ => {}
@@ -1796,10 +1806,43 @@ impl App {
                 self.mode = if workflow { Mode::Workflow } else { Mode::Browse };
                 self.notice = Some("已取消".into());
             }
+            // Tab 在 开关 → 输入框 → 列表 之间循环。
+            KeyCode::Tab => {
+                if let Some(p) = self.confirm.as_mut() {
+                    p.focus_next();
+                }
+            }
+            // Space 切换聚焦的开关（Enter 是确认，不能用它切）。
+            KeyCode::Char(' ') => {
+                if let Some(p) = self.confirm.as_mut() {
+                    p.toggle_focused();
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(p) = self.confirm.as_mut() {
+                    p.field_pop();
+                }
+            }
+            // 版本号字符集：只吞掉这几个字符，其余按键行为不变
+            // （否则输入框聚焦时按 y/N/q 会被吃掉，用户就出不去了）。
+            KeyCode::Char(c) if c.is_ascii_digit() || matches!(c, '.' | ':' | '-') => {
+                if let Some(p) = self.confirm.as_mut() {
+                    p.field_push(c);
+                }
+            }
             KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
                 // 先 clone 出动作再关面板：确认过程中可能又要 spawn，
                 // 借着 panel 不放手会在下面 self.spawn_busy 时冲突。
                 let action = panel.action().clone();
+                // 开关与输入框的值也要在关面板前取出来 —— 面板里的
+                // keep_local / 版本号是用户刚刚在框里改过的，不是构造时的常量。
+                let toggles: Vec<bool> = panel.toggles().iter().map(|t| t.on).collect();
+                let keep_local = toggles.first().copied().unwrap_or(false);
+                let rev_input = panel
+                    .field_value()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
                 self.confirm = None;
                 self.mode = Mode::Browse;
                 match action {
@@ -1813,19 +1856,25 @@ impl App {
                         }
                     }
                     ConfirmAction::RevertToRev(rev) => self.do_revert_to_rev_confirmed(rev),
-                    ConfirmAction::Update => self.do_update_confirmed(),
+                    ConfirmAction::Update => self.do_update_confirmed(rev_input),
                     ConfirmAction::Resolve(path, strategy) => {
                         self.do_resolve_confirmed(path, strategy)
                     }
                     ConfirmAction::RestoreFromRepo(path) => {
                         self.do_restore_from_repo_confirmed(path)
                     }
-                    ConfirmAction::Delete(paths, keep_local) => {
+                    // keep_local 以开关为准，构造时传的那个 false 只是占位。
+                    ConfirmAction::Delete(paths, _) => {
                         if paths.is_empty() {
                             self.notice = Some("没有要删除的项".into());
                         } else {
                             self.do_delete_confirmed(paths, keep_local);
                         }
+                    }
+                    ConfirmAction::Cleanup => {
+                        let remove_unversioned = toggles.first().copied().unwrap_or(false);
+                        let remove_ignored = toggles.get(1).copied().unwrap_or(false);
+                        self.do_cleanup_confirmed(remove_unversioned, remove_ignored);
                     }
                 }
             }
@@ -2386,7 +2435,7 @@ impl App {
             format!("确认加入 SVN：{} 个目标", targets.len()),
             format!("范围：{scope}\n目录递归添加未忽略子项。\n仅加入 SVN，尚未提交。"),
             entries,
-            Danger::Warn,
+            Op::Add,
             ConfirmAction::Add(targets),
         ));
         self.mode = Mode::Confirm;
@@ -2523,6 +2572,57 @@ impl App {
         });
     }
 
+    /// `Ctrl+K`：先确认再 cleanup。
+    ///
+    /// 基础 cleanup 只是解锁，低危，本来可以直接跑；但两个删除开关
+    /// 会让同一个键变成不可撤销的删除，所以统一走确认框，
+    /// 由开关决定最终危险级。
+    fn confirm_cleanup(&mut self) {
+        self.confirm = Some(
+            ConfirmPanel::new(
+                "清理工作副本",
+                "svn cleanup：解锁工作副本、清除中断的操作，不改动你的文件。\n\
+                 下面两个开关会**永久删除**文件，默认关闭 —— 打开即为高危。",
+                vec![format!("工作副本：{}", self.root.display())],
+                Op::Cleanup,
+                ConfirmAction::Cleanup,
+            )
+            .with_toggles(vec![
+                Toggle::with_danger(
+                    "同时删除未纳管文件（含刚写好还没 add 的新文件）",
+                    false,
+                    Danger::High,
+                    Danger::Low,
+                ),
+                Toggle::with_danger("同时删除被忽略的文件", false, Danger::High, Danger::Low),
+            ]),
+        );
+        self.mode = Mode::Confirm;
+    }
+
+    /// `U`：更新到指定版本。
+    ///
+    /// CLI 有 `update -r REV`，TUI 里原本恒为 `None`，想回到某个旧版本
+    /// 只能退出去敲命令行。这里复用确认面板当输入框，不新增模式。
+    fn do_update_to_rev(&mut self) {
+        self.confirm = Some(
+            ConfirmPanel::new(
+                "更新到指定版本",
+                "填入版本号后执行 svn update -r <版本>（可填 1234 或 1200:1234）。\n\
+                 留空确认等同于更新到最新版本。\n\
+                 往旧版本更新后再提交，会丢掉这中间的改动 —— 先想清楚。",
+                vec![format!("工作副本：{}", self.root.display())],
+                Op::Update,
+                ConfirmAction::Update,
+            )
+            .with_field(Field {
+                label: "版本".to_string(),
+                value: String::new(),
+            }),
+        );
+        self.mode = Mode::Confirm;
+    }
+
     /// update 第一阶段：先查远端有没有更新（`svn status -u`）。
     ///
     /// 为什么多这一步：`svn update` 撞上别人改过的文件时会产生冲突，
@@ -2545,9 +2645,10 @@ impl App {
         });
     }
 
-    fn do_update_confirmed(&mut self) {
-        self.spawn_busy("svn update", |svn| {
-            let out = svn.update(None, &[])?;
+    /// `rev` 为 `None` 表示更新到最新版本（HEAD）。
+    fn do_update_confirmed(&mut self, rev: Option<String>) {
+        self.spawn_busy("svn update", move |svn| {
+            let out = svn.update(rev.as_deref(), &[])?;
             Ok(out
                 .stdout
                 .lines()
@@ -2619,7 +2720,7 @@ impl App {
             format!("确认：{}", strategy.label()),
             body,
             vec![rel],
-            Danger::Critical,
+            Op::Resolve,
             ConfirmAction::Resolve(path, strategy),
         ));
         self.mode = Mode::Confirm;
@@ -2669,7 +2770,8 @@ impl App {
                    改名历史无法保留（要保留请用 svn mv）。"
             ),
             vec![rel],
-            Danger::Critical,
+            // 树冲突恢复 = revert -R + update，丢本地改动，按 revert 定级。
+            Op::Revert,
             ConfirmAction::RestoreFromRepo(path),
         ));
         self.mode = Mode::Confirm;
@@ -2726,10 +2828,12 @@ impl App {
 
         // 显示名：解掉 percent 编码、去掉根前缀（svn 输出的路径可能带编码）
         let show = pretty_path(&rel, &self.root, 70);
+        // 后果写在开关上而不是正文里：开关一动，危险级和 Y 键文案跟着变，
+        // 不会出现「正文说会删本地文件，但用户已经打开了保留开关」的错位。
         let message = if is_dir {
-            format!("将递归删除目录 {} 及其下所有文件，本地文件一并删除：", show)
+            format!("将递归删除目录 {} 及其下所有文件：\n默认连本地文件一起删；打开下面开关可只移出版本控制。", show)
         } else {
-            format!("将从版本控制删除 {}，同时删除本地文件：", show)
+            format!("将从版本控制删除 {}：\n默认连本地文件一起删；打开下面开关可只移出版本控制。", show)
         };
 
         self.confirm = Some(ConfirmPanel::new(
@@ -2740,9 +2844,18 @@ impl App {
             } else {
                 show
             }],
-            Danger::Critical,
+            Op::Remove,
+            // CLI 的 `remove --keep-local` 在 TUI 里原本恒为 false。
+            // 开关默认关闭（= svn rm 的默认语义，连本地文件一起删），
+            // 危险级随之从 中危 升到 高危 —— 边框会先变红。
             ConfirmAction::Delete(vec![abs], false),
-        ));
+        )
+        .with_toggles(vec![Toggle::with_danger(
+            "保留本地文件（只移出版本控制）",
+            false,
+            Danger::Medium,
+            Danger::High,
+        )]));
         self.mode = Mode::Confirm;
     }
 
@@ -2755,6 +2868,19 @@ impl App {
                 format!("已从版本控制移除 {} 项（本地文件保留）", n)
             } else {
                 format!("已删除 {} 项", n)
+            })
+        });
+    }
+
+    /// 真正执行 cleanup。`--vacuum-pristines` 不开放给 TUI：
+    /// 它只是省磁盘，风险收益不划算。
+    fn do_cleanup_confirmed(&mut self, remove_unversioned: bool, remove_ignored: bool) {
+        self.spawn_busy("svn cleanup", move |svn| {
+            svn.cleanup(remove_unversioned, remove_ignored, false)?;
+            Ok(if remove_unversioned || remove_ignored {
+                "已清理工作副本，并删除了未纳管/被忽略的文件".to_string()
+            } else {
+                "已清理工作副本（解锁 + 清除中断的操作）".to_string()
             })
         });
     }
