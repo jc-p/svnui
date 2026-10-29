@@ -99,13 +99,9 @@ fn which(name: &str) -> Option<std::path::PathBuf> {
 /// # 失败怎么办
 /// 分页器不存在/被中断（用户按 `q`）时**退回直接打印**，绝不丢内容。
 /// 这是刻意的：宁可刷屏也不能让 diff 消失。
-pub fn page(content: &str) -> std::io::Result<()> {
-    page_with(content, None)
-}
-
 /// 按偏好的分页器输出（`preview.pager` 配置）。
 ///
-/// `preferred` 为 `None` 或 `auto` 时与 [`page`] 完全一致。
+/// `preferred` 为 `None` 或 `auto` 时走自动探测。
 pub fn page_with(content: &str, preferred: Option<&str>) -> std::io::Result<()> {
     if content.is_empty() {
         return Ok(());
@@ -124,8 +120,7 @@ pub fn page_with(content: &str, preferred: Option<&str>) -> std::io::Result<()> 
                 let mut it = raw.split_whitespace();
                 let prog = it.next().unwrap_or("less").to_string();
                 let args: Vec<String> = it.map(|s| s.to_string()).collect();
-                // 需要 'static str，这里只能借用后立刻使用，故走 owned 分支
-                return spawn_owned(&prog, &args, content);
+                return spawn_with(&prog, &args, content);
             }
             None => Some(("less", vec!["-R".to_string()])),
         },
@@ -136,7 +131,7 @@ pub fn page_with(content: &str, preferred: Option<&str>) -> std::io::Result<()> 
         None => return print_plain(content),
     };
 
-    match spawn_with(&prog, &args, content) {
+    match spawn_with(prog, &args, content) {
         Ok(()) => Ok(()),
         Err(_) => print_plain(content),
     }
@@ -171,24 +166,9 @@ fn spawn_with(prog: &str, args: &[String], content: &str) -> std::io::Result<()>
     Ok(())
 }
 
-fn spawn_owned(prog: &str, args: &[String], content: &str) -> std::io::Result<()> {
-    spawn_with(prog, args, content)
-}
-
 fn print_plain(content: &str) -> std::io::Result<()> {
     print!("{content}");
     std::io::stdout().flush()
-}
-
-/// 内容超过 `threshold` 行才分页，否则直接打印。
-///
-/// 短输出走 pager 是负体验：用户得按 q 才能回到 shell。
-pub fn page_if_long(content: &str, threshold: usize) -> std::io::Result<()> {
-    if content.lines().count() > threshold {
-        page(content)
-    } else {
-        print_plain(content)
-    }
 }
 
 #[cfg(test)]
@@ -198,19 +178,14 @@ mod tests {
     #[test]
     fn detect_never_panics() {
         // 环境里可能一个 pager 都没有，这时应返回 None 而不是 panic。
-        let k = detect();
+        let k = detect_preferred(None);
         assert!(matches!(k, PagerKind::Delta | PagerKind::Bat | PagerKind::Less | PagerKind::None));
     }
 
     #[test]
     fn empty_content_is_noop() {
-        assert!(page("").is_ok());
-    }
-
-    #[test]
-    fn short_content_is_not_paged() {
-        // 3 行 < 阈值 10，应走 print_plain（不启动任何子进程）
-        assert!(page_if_long("a\nb\nc\n", 10).is_ok());
+        // 空串不该启动任何子进程
+        assert!(page_with("", None).is_ok());
     }
 
     /// 配置钉死的分页器：装了就用，没装就回退自动探测。

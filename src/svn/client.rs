@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::domain::{Error, LogEntry, NodeKind, RepoInfo, Result, Snapshot, StatusEntry, StatusKind};
+use crate::domain::{Error, LogEntry, RepoInfo, Result, Snapshot, StatusEntry, StatusKind};
 use crate::svn::command::{
     run, run_preview, run_streaming, run_with_stdin, CancelToken, PreviewOutput, RawOutput, RunOpts,
 };
@@ -545,19 +545,6 @@ impl Svn {
         args.push(rel);
         let out = run(&self.exe, &args, &self.root, &self.opts(true))?;
         Ok(out.stdout)
-    }
-
-    /// 某个路径当前的节点类型。文本解析拿不到 kind，需要时按需 stat（不在热路径上）。
-    pub fn node_kind(&self, abs: &Path) -> NodeKind {
-        if abs.is_dir() {
-            NodeKind::Dir
-        } else if abs.is_symlink() {
-            NodeKind::Symlink
-        } else if abs.is_file() {
-            NodeKind::File
-        } else {
-            NodeKind::Unknown
-        }
     }
 
     /// 相对工作副本根的路径。

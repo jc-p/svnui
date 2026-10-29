@@ -37,11 +37,6 @@ impl SvnVersion {
         (self.major, self.minor) >= (1, 12)
     }
 
-    /// `svn patch`（1.7+）。
-    pub fn supports_patch(&self) -> bool {
-        (self.major, self.minor) >= (1, 7)
-    }
-
     /// 工作副本格式 1.8+（`.svn` 单一 wc.db，现代 svn 都是）。
     pub fn is_modern(&self) -> bool {
         (self.major, self.minor) >= (1, 7)

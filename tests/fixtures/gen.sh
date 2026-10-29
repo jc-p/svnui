@@ -60,8 +60,6 @@ svn add -q "src/中文 文件.txt"
 # ---- 导出"干净"样本（无冲突）
 echo "→ 导出 status_plain.txt"
 svn status --non-interactive > "$FIX/status_plain.txt" 2>/dev/null || true
-echo "→ 导出 status.xml"
-svn status --xml --non-interactive > "$FIX/status.xml" 2>/dev/null || true
 
 # ---- 日志 / info
 echo "→ 导出 log.xml / info.xml"
@@ -90,7 +88,7 @@ echo "→ 导出 status_conflict.txt"
 svn status --non-interactive > "$FIX/status_conflict.txt" 2>/dev/null || true
 
 # ---- 校验：样本必须能被解析（非空）
-for f in status_plain.txt status_conflict.txt status.xml log.xml info.xml; do
+for f in status_plain.txt status_conflict.txt log.xml info.xml; do
   if [ ! -s "$FIX/$f" ]; then
     echo "⚠ $f 是空的，保留仓库里已有的手工样本" >&2
     git -C "$ROOT" checkout -- "tests/fixtures/$f" 2>/dev/null || true

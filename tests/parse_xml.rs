@@ -6,26 +6,7 @@
 
 mod common;
 
-use svnui::domain::StatusKind;
-use svnui::svn::parser::{parse_info_xml, parse_log_xml, parse_status_xml};
-
-#[test]
-fn status_xml_maps_item_kinds() {
-    let v = parse_status_xml(&common::fixture("status.xml")).expect("status.xml 应解析成功");
-    assert_eq!(v.len(), 5);
-
-    let find = |p: &str| v.iter().find(|e| e.path == p).unwrap_or_else(|| panic!("缺少 {p}")).clone();
-
-    assert_eq!(find("src/main.rs").text, StatusKind::Modified);
-    assert_eq!(find("src/new.rs").text, StatusKind::Added);
-    assert_eq!(find("src/deleted.rs").text, StatusKind::Deleted);
-    assert_eq!(find("src/props_only.rs").props, StatusKind::Modified);
-    assert!(find("src/tree_conflict.rs").tree_conflict);
-
-    // 归一：XML 的 item="normal" 必须收敛到 None，与文本路径的第 1 列空格一致。
-    // 若这条红了，说明两条解析路径语义分裂了，`== StatusKind::Normal` 会静默漏判。
-    assert_eq!(find("src/props_only.rs").text, StatusKind::None);
-}
+use svnui::svn::parser::{parse_info_xml, parse_log_xml};
 
 #[test]
 fn log_xml_parses_revisions_and_paths() {

@@ -8,7 +8,7 @@ pub mod json;
 pub mod pager;
 
 pub use json::{err, kind_of, ok};
-pub use pager::{detect_preferred, page, page_if_long, page_with, PagerKind};
+pub use pager::{detect_preferred, page_with, PagerKind};
 
 /// 是否为交互式终端。管道/重定向时返回 false。
 pub fn is_tty() -> bool {

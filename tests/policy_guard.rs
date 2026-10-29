@@ -84,7 +84,7 @@ fn render_targets_handles_empty() {
 
 #[test]
 fn pager_detect_returns_known_kind() {
-    let k = svnui::output::pager::detect();
+    let k = svnui::output::detect_preferred(None);
     assert!(matches!(
         k,
         svnui::output::PagerKind::Delta
@@ -96,11 +96,12 @@ fn pager_detect_returns_known_kind() {
 
 #[test]
 fn pager_empty_is_noop() {
-    assert!(svnui::output::pager::page("").is_ok());
+    assert!(svnui::output::page_with("", None).is_ok());
 }
 
+/// 配置钉死 `none` 就必须真的不分页 —— 否则"关掉分页"这个开关是假的。
 #[test]
-fn short_output_not_paged() {
-    // 短内容走 pager 是负体验（看 3 行还要按 q）
-    assert!(svnui::output::pager::page_if_long("a\nb\nc\n", 10).is_ok());
+fn pinned_none_really_disables_the_pager() {
+    assert_eq!(svnui::output::detect_preferred(Some("none")), svnui::output::PagerKind::None);
+    assert!(svnui::output::page_with("a\nb\n", Some("none")).is_ok());
 }
