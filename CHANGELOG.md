@@ -10,6 +10,19 @@
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-10-29
+
+### Fixed
+- `svnui --help` 里 `blame` 的说明混进了 `add` 那句（「加入版本控制。逐行追溯作者与版本。」），而 `add` 自己变成空白——两个变体紧挨着，编辑时被整段移动错位。
+- 提交动作的注释说 `F2` 已去掉，代码里还留着：改的是注释。它们是终端兼容性兜底（`Ctrl+S` 会被 IXON 软件流控吞掉），不是重复入口。
+
+### Changed
+- 文档跟上 0.6.0：README 补 `Ctrl+B` / `Ctrl+K` / `Ctrl+L` / `I` / `i` / `M` 及 `u`、`U` 的分工，新增「确认框」「冲突面板」两节（含 Enter 在 revert 与分支操作下是取消、其余是执行），AI 章节的「不发送 diff 正文」按 `send_diff` 改写并点明隐私开关；`docs/cli.md` 危险分级由三档补到四档，补齐 `purge-mine`、`blame`、`preview`、分支工作流、`tui` / `llm` / `config`。
+
+### Removed
+- 五个零调用者的 `pub` 函数：`theme::identity`、`theme::separator`、`loading::without_elapsed`、`domain::info::is_trunk`、`svn::locator::svn_exe_forced`。
+- `daemon::watcher::EventBus`：注释明说「保留给未来挪线程时用」，而它唯一的 `take_batch` 收了 `timeout` 却写死 1ms、名叫 batch 只回一条。
+
 ## [0.6.0] - 2026-10-29
 
 ### Added
