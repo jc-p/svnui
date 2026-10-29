@@ -17,7 +17,6 @@ pub mod log;
 pub mod notice;
 pub mod preview;
 pub mod repo;
-pub mod status;
 pub mod tree;
 pub mod workflow;
 

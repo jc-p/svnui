@@ -49,7 +49,7 @@ use crate::tui::panels::preview::{BarHit, Kind as PreviewKind, PreviewPanel};
 use crate::tui::panels::file_preview::{self, FileContent};
 use crate::tui::panels::help::HelpPanel;
 use crate::tui::panels::log::LogPanel;
-use crate::tui::panels::notice::{Action as NoticeAction, Level as NoticeLevel, NoticePanel};
+use crate::tui::panels::notice::{Action as NoticeAction, Level as NoticeLevel, Notice, NoticePanel};
 use crate::policy::Op;
 use crate::tui::panels::confirm::{ConfirmAction, ConfirmPanel, Field, Toggle};
 use crate::policy::Danger;
@@ -266,7 +266,7 @@ pub struct App {
     /// 检出的实时进度：(已落盘条目数, 最后一项)。只有 checkout 会填。
     busy_prog: Option<(usize, String)>,
 
-    notice: Option<String>,
+    notice: Option<Notice>,
     notice_panel: Option<NoticePanel>,
     show_notice: bool,
     title: String,
@@ -498,22 +498,34 @@ impl App {
     // ── diff 预览 ─────────────────────────────────────────
 
     pub fn set_notice(&mut self, msg: impl Into<String>) {
-        self.notice = Some(msg.into());
+        self.notice = Some(Notice::new(msg));
         self.sync_notice();
     }
 
     /// 已打开的详情保存快照，避免后台状态刷新覆盖用户正在读的错误。
     fn sync_notice(&mut self) {
+        // 提示类通知到期即清；用户正在读的完整详情不动。
+        if !self.show_notice && self.notice.as_ref().is_some_and(Notice::expired) {
+            self.notice = None;
+            self.notice_panel = None;
+        }
         if self.show_notice { return; }
-        if self.notice.as_deref() == self.notice_panel.as_ref().map(NoticePanel::message) { return; }
-        self.notice_panel = self.notice.as_ref().map(|msg| NoticePanel::new(msg.clone()));
+        if self.notice.as_ref().map(|n| n.text.as_str())
+            == self.notice_panel.as_ref().map(NoticePanel::message)
+        {
+            return;
+        }
+        self.notice_panel = self
+            .notice
+            .as_ref()
+            .map(|n| NoticePanel::with_level(n.text.clone(), n.level));
         self.show_notice = self.notice_panel.as_ref().is_some_and(|p| p.level == NoticeLevel::Error);
     }
 
     fn notify_error(&mut self, context: &str, error: &crate::domain::Error) {
         let message = format!("{context}：{}", crate::cli::hint::human_hint(error));
-        self.notice = Some(message.clone());
-        self.notice_panel = Some(NoticePanel::new(message));
+        self.notice = Some(Notice::error(message.clone()));
+        self.notice_panel = Some(NoticePanel::with_level(message, NoticeLevel::Error));
         self.show_notice = true;
     }
 
@@ -643,11 +655,11 @@ impl App {
     fn toggle_mouse(&mut self) {
         self.mouse_on = !self.mouse_on;
         self.mouse_pending = Some(self.mouse_on);
-        self.notice = Some(if self.mouse_on {
-            "鼠标：已开启（可拖拽滚动条；要选中文本复制按 M 关闭，或按住 Option 拖选）".into()
+        self.notice = Some(Notice::new(if self.mouse_on {
+            "鼠标：已开启（可拖拽滚动条；要选中文本复制按 M 关闭，或按住 Option 拖选）"
         } else {
-            "鼠标：已关闭（可以正常选中文本复制了；滚动条拖拽也不可用）".into()
-        });
+            "鼠标：已关闭（可以正常选中文本复制了；滚动条拖拽也不可用）"
+        }));
     }
 
     /// 取走待生效的鼠标开关（由事件循环执行真正的 enable/disable）。
@@ -851,7 +863,7 @@ impl App {
                     self.last_refresh = Some(Instant::now());
                     self.scan_failed = false;
                     if !automatic {
-                        self.notice = Some(format!("已刷新：{} 项状态（含未纳管）", n));
+                        self.notice = Some(Notice::new(format!("已刷新：{} 项状态（含未纳管）", n)));
                     }
                     // 顶栏的 @rNNN 只在启动时读过一次，提交/更新后不重读
                     // 就会一直停在启动那一刻的版本号。
@@ -885,7 +897,7 @@ impl App {
                     if self.mode == Mode::Log {
                         self.spawn_log_load(None, Self::LOG_PAGE, false);
                     }
-                    self.notice = Some(msg);
+                    self.notice = Some(Notice::new(msg));
                     self.spawn_reload();
                 }
                 BgDone::Msg(Err(e)) => {
@@ -925,10 +937,10 @@ impl App {
                         }
                     }
                     if n == 0 {
-                        self.notice = Some(match &search {
+                        self.notice = Some(Notice::new(match &search {
                             Some(kw) => format!("没有找到包含“{}”的提交", kw),
-                            None => "没有提交历史".into(),
-                        });
+                            None => "没有提交历史".to_string(),
+                        }));
                     }
                     self.spawn_log_detail();
                 }
@@ -980,7 +992,7 @@ impl App {
                                 .collect();
                             if items.is_empty() {
                                 self.notice =
-                                    Some("所选范围没有可撤销的版本改动；未纳管文件会保留".into());
+                                    Some(Notice::new("所选范围没有可撤销的版本改动；未纳管文件会保留"));
                             } else {
                                 self.confirm = Some(ConfirmPanel::new(
                                     format!("丢弃本地改动：{} 项", items.len()),
@@ -1094,13 +1106,13 @@ impl App {
                 BgDone::Conflicts(Ok(files)) => {
                     self.busy = None;
                     if files.is_empty() {
-                        self.notice = Some("没有冲突".into());
+                        self.notice = Some(Notice::new("没有冲突"));
                     } else {
                         let n = files.len();
                         self.conflict = Some(ConflictPanel::new(files));
                         self.mode = Mode::Conflict;
                         self.load_conflict_content();
-                        self.notice = Some(format!("{} 处冲突", n));
+                        self.notice = Some(Notice::new(format!("{} 处冲突", n)));
                     }
                 }
 
@@ -1109,7 +1121,7 @@ impl App {
                     match res {
                         Ok(text) => {
                             if text.trim().is_empty() {
-                                self.notice = Some(format!("r{} 没有内容改动（可能只改了属性）", rev));
+                                self.notice = Some(Notice::new(format!("r{} 没有内容改动（可能只改了属性）", rev)));
                             } else {
                                 // 彩色 diff：+ 绿、- 红、@@ 青
                                 let lines: Vec<Line> = text
@@ -1142,7 +1154,7 @@ impl App {
                         }
                         Err(e) => {
                             let (s, _d) = humanize_error(&e);
-                            self.notice = Some(format!("读取 r{} 失败：{}", rev, s));
+                            self.notice = Some(Notice::new(format!("读取 r{} 失败：{}", rev, s)));
                         }
                     }
                 }
@@ -1159,7 +1171,7 @@ impl App {
                 }
                 BgDone::Checkout(Ok(msg)) => {
                     self.busy = None;
-                    self.notice = Some(format!("{} — 按 Q 退出后 cd 进去", msg.lines().next().unwrap_or("已检出")));
+                    self.notice = Some(Notice::new(format!("{} — 按 Q 退出后 cd 进去", msg.lines().next().unwrap_or("已检出"))));
                 }
                 BgDone::Checkout(Err(e)) => {
                     self.busy = None;
@@ -1392,7 +1404,7 @@ impl App {
                 self.preview_focused = true;
                 self.notice = None;
             } else {
-                self.notice = Some("预览暂不可用；选中文件后按 Enter 全屏查看".into());
+                self.notice = Some(Notice::new("预览暂不可用；选中文件后按 Enter 全屏查看"));
             }
             return Ok(());
         }
@@ -1444,7 +1456,7 @@ impl App {
             KeyCode::Char('q' | 'j' | 'k' | 'J' | 'K' | 'M' | '<' | '>' | ',' | '.' | '0' | ' ')
             | KeyCode::Esc | KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right);
         if self.busy.is_some() && !navigation {
-            self.notice = Some("后台任务进行中，请稍候再操作".into());
+            self.notice = Some(Notice::new("后台任务进行中，请稍候再操作"));
             return Ok(());
         }
         match key.code {
@@ -1503,7 +1515,7 @@ impl App {
                 if self.tree.mode() == TreeMode::Changed {
                     self.rebuild_tree_keep_mode();
                 }
-                self.notice = Some(format!("排序：{}", next.label()));
+                self.notice = Some(Notice::new(format!("排序：{}", next.label())));
             }
 
             // 展开/折叠。全量模式下展开会触发懒加载。
@@ -1540,26 +1552,26 @@ impl App {
             KeyCode::Char(' ') => match self.tree.toggle_check() {
                 Some(true) => {
                     let n = self.tree.checked_count();
-                    self.notice = Some(format!("已勾选 {} 项（按 C 提交）", n));
+                    self.notice = Some(Notice::new(format!("已勾选 {} 项（按 C 提交）", n)));
                 }
                 Some(false) => {
                     let n = self.tree.checked_count();
-                    self.notice = Some(if n == 0 {
-                        "已取消勾选".into()
+                    self.notice = Some(Notice::new(if n == 0 {
+                        "已取消勾选".to_string()
                     } else {
                         format!("已取消，当前 {} 项", n)
-                    });
+                    }));
                 }
                 None => {
                     // 不能勾的原因有很多（目录/无改动/未版本化/忽略），
                     // 统一问 tree 要，别在这儿写死一句"目录不能勾选"——
                     // 那样用户看到的是错误的原因。
-                    self.notice = Some(
+                    self.notice = Some(Notice::new(
                         self.tree
                             .check_block_reason()
                             .unwrap_or("请先选择要提交的文件")
                             .to_string(),
-                    )
+                    ))
                 }
             },
 
@@ -1567,11 +1579,11 @@ impl App {
             KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.tree.select_committable(true);
                 let n = self.tree.checked_count();
-                self.notice = Some(format!("已全选可提交项（{} 项）", n));
+                self.notice = Some(Notice::new(format!("已全选可提交项（{} 项）", n)));
             }
             KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.tree.clear_check();
-                self.notice = Some("已清空勾选".into());
+                self.notice = Some(Notice::new("已清空勾选"));
             }
 
             // Ctrl+K = svn cleanup：只解锁、清中断的操作，不删任何文件。
@@ -1600,10 +1612,10 @@ impl App {
                 };
                 self.tree.set_mode(next);
                 self.spawn_preview();
-                self.notice = Some(match next {
-                    TreeMode::Changed => "已切换到变更视图".into(),
-                    TreeMode::All => "已切换到全量文件树".into(),
-                });
+                self.notice = Some(Notice::new(match next {
+                    TreeMode::Changed => "已切换到变更视图",
+                    TreeMode::All => "已切换到全量文件树",
+                }));
             }
 
             // X：冲突解决面板
@@ -1792,7 +1804,7 @@ impl App {
         if key.code == KeyCode::Enter && (workflow || matches!(panel.action(), ConfirmAction::Revert(_))) {
             self.confirm = None;
             self.mode = if workflow { Mode::Workflow } else { Mode::Browse };
-            self.notice = Some(if workflow { "已取消分支操作" } else { "已取消丢弃本地改动" }.into());
+            self.notice = Some(Notice::new(if workflow { "已取消分支操作" } else { "已取消丢弃本地改动" }));
             return Ok(());
         }
         // 进 match 前先把动作 clone 出来：
@@ -1804,7 +1816,7 @@ impl App {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('n') | KeyCode::Char('N') => {
                 self.confirm = None;
                 self.mode = if workflow { Mode::Workflow } else { Mode::Browse };
-                self.notice = Some("已取消".into());
+                self.notice = Some(Notice::new("已取消"));
             }
             // Tab 在 开关 → 输入框 → 列表 之间循环。
             KeyCode::Tab => {
@@ -1850,7 +1862,7 @@ impl App {
                     ConfirmAction::Add(paths) => self.spawn_add(paths),
                     ConfirmAction::Revert(paths) => {
                         if paths.is_empty() {
-                            self.notice = Some("没有要撤销的项目".into());
+                            self.notice = Some(Notice::new("没有要撤销的项目"));
                         } else {
                             self.do_revert_confirmed(paths);
                         }
@@ -1866,7 +1878,7 @@ impl App {
                     // keep_local 以开关为准，构造时传的那个 false 只是占位。
                     ConfirmAction::Delete(paths, _) => {
                         if paths.is_empty() {
-                            self.notice = Some("没有要删除的项".into());
+                            self.notice = Some(Notice::new("没有要删除的项"));
                         } else {
                             self.do_delete_confirmed(paths, keep_local);
                         }
@@ -2152,7 +2164,7 @@ impl App {
                 self.should_quit = self.standalone_repo;
             }
             RepoAction::Copy(text) => match copy_to_clipboard(&text) {
-                Ok(()) => self.notice = Some(format!("已复制：{}", text)),
+                Ok(()) => self.notice = Some(Notice::new(format!("已复制：{}", text))),
                 Err(e) => {
                     // 复制失败别静默：用户以为复制了，粘出来还是旧内容。
                     // 兜底把 URL 直接显示出来，至少能手动选中。
@@ -2253,7 +2265,7 @@ impl App {
     /// 复用外部编辑器的终端让出/恢复流程；只在用户明确按 o 时启动默认查看器。
     fn request_open(&mut self) {
         if self.busy.is_some() {
-            self.notice = Some("后台任务进行中，请稍候再打开文件".into());
+            self.notice = Some(Notice::new("后台任务进行中，请稍候再打开文件"));
             return;
         }
         let program = if cfg!(target_os = "macos") {
@@ -2271,11 +2283,11 @@ impl App {
             return;
         };
         if node.is_dir {
-            self.notice = Some("请先选择要打开的文件".to_string());
+            self.notice = Some(Notice::new("请先选择要打开的文件".to_string()));
             return;
         }
         if !node.abs.exists() {
-            self.notice = Some("文件不存在（可能是已删除）".to_string());
+            self.notice = Some(Notice::new("文件不存在（可能是已删除）".to_string()));
             return;
         }
         self.editor_req = Some((program, node.abs.clone()));
@@ -2306,7 +2318,7 @@ impl App {
     /// 但 `?` 永远不自动进 —— 那需要先 `svn add`。
     fn open_commit(&mut self) {
         if self.items.is_empty() {
-            self.notice = Some("没有可提交的变更".into());
+            self.notice = Some(Notice::new("没有可提交的变更"));
             return;
         }
 
@@ -2317,7 +2329,7 @@ impl App {
 
         let paths = self.tree.checked_abs();
         if paths.is_empty() {
-            self.notice = Some("没有可提交的文件（未纳管项请先按 a 或 A 加入）".into());
+            self.notice = Some(Notice::new("没有可提交的文件（未纳管项请先按 a 或 A 加入）"));
             return;
         }
 
@@ -2360,26 +2372,26 @@ impl App {
         }
         self.mode = Mode::Browse;
         // 没写东西就别提"已保留" —— 会让人以为有什么东西在等他
-        self.notice = Some(
+        self.notice = Some(Notice::new(
             if saved {
                 "已退出提交（内容已保留，按 C 可继续）"
             } else {
                 "已取消提交"
             }
-            .into(),
-        );
+            ,
+        ));
     }
 
     fn add_current(&mut self) {
         let Some(selected) = self.tree.selected() else {
-            self.notice = Some("请先选中要添加的文件或目录".into());
+            self.notice = Some(Notice::new("请先选中要添加的文件或目录"));
             return;
         };
         // 文本 status 的 kind 可能为 Unknown；添加前确认真实类型，目录不能绕过确认。
         let is_dir = match std::fs::symlink_metadata(&selected.abs) {
             Ok(metadata) => metadata.file_type().is_dir(),
             Err(e) => {
-                self.notice = Some(format!("无法读取所选项类型：{}", e));
+                self.notice = Some(Notice::new(format!("无法读取所选项类型：{}", e)));
                 return;
             }
         };
@@ -2396,7 +2408,7 @@ impl App {
             .map(|item| self.root.join(&item.rel))
             .collect();
         if targets.is_empty() {
-            self.notice = Some("当前项没有可添加的未纳管内容，按 A 可查看全部新增项".into());
+            self.notice = Some(Notice::new("当前项没有可添加的未纳管内容，按 A 可查看全部新增项"));
         } else if is_dir {
             self.confirm_add(targets, format!("当前目录：{}/", rel));
         } else {
@@ -2416,7 +2428,7 @@ impl App {
 
     fn confirm_add(&mut self, mut targets: Vec<PathBuf>, scope: String) {
         if targets.is_empty() {
-            self.notice = Some("没有可添加的未纳管项".into());
+            self.notice = Some(Notice::new("没有可添加的未纳管项"));
             return;
         }
         // 冻结显式目标；目标目录的子项仍由 svn add 执行时按递归规则发现。
@@ -2469,13 +2481,13 @@ impl App {
         } else if let Some(node) = self.tree.selected() {
             (format!("当前项 {}", node.rel), vec![node.abs.clone()])
         } else {
-            self.notice = Some("请先选中文件、目录或勾选要撤销的项目".into());
+            self.notice = Some(Notice::new("请先选中文件、目录或勾选要撤销的项目"));
             return;
         };
         paths.sort();
         paths.dedup();
         if paths.is_empty() {
-            self.notice = Some("勾选范围已失效，请刷新后重新选择".into());
+            self.notice = Some(Notice::new("勾选范围已失效，请刷新后重新选择"));
             return;
         }
         let svn = self.svn.clone();
@@ -2496,7 +2508,7 @@ impl App {
         let rev = match self.logpanel.as_ref().and_then(|p| p.selected_rev()) {
             Some(r) => r,
             None => {
-                self.notice = Some("请先用 ↑↓ 选中一个版本".into());
+                self.notice = Some(Notice::new("请先用 ↑↓ 选中一个版本"));
                 return Ok(());
             }
         };
@@ -2802,7 +2814,7 @@ impl App {
         //    下面要给 self.notice / self.confirm 赋值（可变借用），
         //    持有 tree 的不可变借用会冲突。
         if self.tree.selected().is_none() {
-            self.notice = Some("请先把光标移到要删除的项上".into());
+            self.notice = Some(Notice::new("请先把光标移到要删除的项上"));
             return;
         }
         let (is_dir, sign, rel, abs) = {
@@ -2814,15 +2826,15 @@ impl App {
         };
 
         if sign == '?' {
-            self.notice = Some(format!("{} 未纳入版本控制，直接删除文件即可（不需要 svn）", rel));
+            self.notice = Some(Notice::new(format!("{} 未纳入版本控制，直接删除文件即可（不需要 svn）", rel)));
             return;
         }
         if sign == 'I' || sign == 'X' {
-            self.notice = Some(format!("{} 是忽略/外部项，不需要删除", rel));
+            self.notice = Some(Notice::new(format!("{} 是忽略/外部项，不需要删除", rel)));
             return;
         }
         if sign == 'D' {
-            self.notice = Some(format!("{} 已经标记为删除了（提交后生效）", rel));
+            self.notice = Some(Notice::new(format!("{} 已经标记为删除了（提交后生效）", rel)));
             return;
         }
 
@@ -2883,6 +2895,11 @@ impl App {
                 "已清理工作副本（解锁 + 清除中断的操作）".to_string()
             })
         });
+    }
+
+    /// 后台任务已跑的毫秒数；没有任务时给 0（等待框仍要能画出来）。
+    fn busy_ms(&self) -> u128 {
+        self.busy_start.map(|t| t.elapsed().as_millis()).unwrap_or(0)
     }
 
     fn do_doctor(&mut self) {
@@ -3051,7 +3068,7 @@ impl App {
         if let Some(notice) = &self.notice {
             let rect = chunks[2];
             f.render_widget(
-                Paragraph::new(NoticePanel::summary(notice, rect.width)),
+                Paragraph::new(NoticePanel::summary(&notice.text, notice.level, rect.width)),
                 rect,
             );
         }
@@ -3125,19 +3142,10 @@ impl App {
                     rect,
                 );
             } else {
-                f.render_widget(
-                    Paragraph::new(Line::from(Span::styled(
-                        " 正在读取提交历史… ",
-                        theme::Theme::title(),
-                    )))
-                    .block(
-                        theme::block()
-                            .borders(Borders::ALL)
-                            .title(" 提交历史 ")
-                            .border_style(theme::Theme::border_active()),
-                    ),
-                    rect,
-                );
+                // 与顶栏共用同一份帧计算：别处转起来了，这里必然同步转。
+                loading::Loading::new("读取提交历史", self.busy_ms())
+                    .detail(Some("正在向服务器取提交记录"))
+                    .render(f, rect);
             }
         }
 
@@ -3152,19 +3160,9 @@ impl App {
         if self.mode == Mode::Conflict && self.conflict.is_none() {
             let rect = centered_rect(60, 25, area);
             f.render_widget(Clear, rect);
-            f.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    " 正在扫描冲突… ",
-                    theme::Theme::title(),
-                )))
-                .block(
-                    theme::block()
-                        .borders(Borders::ALL)
-                        .title(" 解决冲突 ")
-                        .border_style(theme::Theme::border_active()),
-                ),
-                rect,
-            );
+            loading::Loading::new("扫描冲突", self.busy_ms())
+                .detail(Some("正在检查工作副本的冲突标记"))
+                .render(f, rect);
         }
 
         if let Some(panel) = self.checkout.as_ref() {
@@ -3188,19 +3186,9 @@ impl App {
                     // panel 还没建好（理论上不会），至少别黑屏
                     let rect = centered_rect(60, 25, area);
                     f.render_widget(Clear, rect);
-                    f.render_widget(
-                        Paragraph::new(Line::from(Span::styled(
-                            " 正在连接仓库… ",
-                            theme::Theme::title(),
-                        )))
-                        .block(
-                            theme::block()
-                                .borders(Borders::ALL)
-                                .title(" 仓库 ")
-                                .border_style(theme::Theme::border_active()),
-                        ),
-                        rect,
-                    );
+                    loading::Loading::new("连接仓库", self.busy_ms())
+                        .detail(Some("正在读取远端目录"))
+                        .render(f, rect);
                 }
             }
         }
@@ -4351,7 +4339,7 @@ mod refresh_tests {
         std::fs::rename(&hidden, &wc).unwrap();
         assert!(app.scan_failed);
         assert!(!app.editor_refresh_loading);
-        assert!(app.notice.as_ref().unwrap().contains("扫描失败"));
+        assert!(app.notice.as_ref().unwrap().text.contains("扫描失败"));
     }
 
     #[test]
@@ -4855,7 +4843,7 @@ mod refresh_tests {
         wait_for_scan(&mut app);
         assert_eq!(app.mode, Mode::Browse);
         assert!(app.confirm.is_none());
-        assert!(app.notice.as_ref().unwrap().contains("没有可撤销"));
+        assert!(app.notice.as_ref().unwrap().text.contains("没有可撤销"));
 
         std::fs::write(&path, "keep until confirmed\n").unwrap();
         app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)).unwrap();

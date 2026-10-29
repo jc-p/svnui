@@ -125,7 +125,7 @@ impl App {
             Ok(text) => {
                 self.workflow = None;
                 self.mode = Mode::Browse;
-                self.notice = Some(text);
+                self.notice = Some(Notice::new(text));
                 self.spawn_reload();
             }
             Err(error) => {

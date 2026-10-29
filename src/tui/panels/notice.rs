@@ -64,6 +64,75 @@ impl Level {
     }
 }
 
+/// 底栏上那条通知。
+///
+/// 之前只有 `Option<String>`：等级靠 `Level::of()` 从文案里猜
+/// （路径含"失败"就会误判成错误），而且没有生命周期 ——
+/// "已勾选 3 项"会一直挂在那儿，直到被下一条覆盖。
+///
+/// 现在等级在**产生通知的地方**显式给出，并带上时间戳供 TTL 清理。
+#[derive(Debug, Clone)]
+pub struct Notice {
+    pub text: String,
+    pub level: Level,
+    at: std::time::Instant,
+}
+
+impl Notice {
+    /// 等级从文案推断。仅用于历史调用点，新代码请用下面几个显式构造器。
+    pub fn new(text: impl Into<String>) -> Self {
+        let text = text.into();
+        Self {
+            level: Level::of(&text),
+            text,
+            at: std::time::Instant::now(),
+        }
+    }
+
+    pub fn info(text: impl Into<String>) -> Self {
+        Self::with_level(text, Level::Info)
+    }
+
+    pub fn success(text: impl Into<String>) -> Self {
+        Self::with_level(text, Level::Success)
+    }
+
+    pub fn warning(text: impl Into<String>) -> Self {
+        Self::with_level(text, Level::Warning)
+    }
+
+    /// 错误**不过期**：它描述的是已经发生的事，用户可能还没看见。
+    pub fn error(text: impl Into<String>) -> Self {
+        Self::with_level(text, Level::Error)
+    }
+
+    fn with_level(text: impl Into<String>, level: Level) -> Self {
+        Self {
+            text: text.into(),
+            level,
+            at: std::time::Instant::now(),
+        }
+    }
+
+    /// 提示类通知活 8 秒，警告 15 秒，错误常驻。
+    ///
+    /// "已勾选 3 项"这种状态回执，八秒足够；超过之后还挂着就成了噪音，
+    /// 反而把真正的错误挤出视野。
+    pub fn expired(&self) -> bool {
+        self.expired_at(std::time::Instant::now())
+    }
+
+    /// 可注入 `now` 的判定，便于测试（总不能真等 8 秒）。
+    pub fn expired_at(&self, now: std::time::Instant) -> bool {
+        let ttl = match self.level {
+            Level::Info | Level::Success => 8,
+            Level::Warning => 15,
+            Level::Error => return false,
+        };
+        now.saturating_duration_since(self.at) >= std::time::Duration::from_secs(ttl)
+    }
+}
+
 pub enum Action {
     None,
     Close,
@@ -81,9 +150,16 @@ pub struct NoticePanel {
 }
 
 impl NoticePanel {
+    /// 等级由文案推断。仅保留给历史调用点 —— 新代码请用 `with_level`
+    /// 在产生通知的地方把等级说清楚，别让文案去猜。
     pub fn new(message: String) -> Self {
+        let level = Level::of(&message);
+        Self::with_level(message, level)
+    }
+
+    pub fn with_level(message: String, level: Level) -> Self {
         Self {
-            level: Level::of(&message),
+            level,
             message,
             rows: Vec::new(),
             wrap_width: None,
@@ -131,8 +207,7 @@ impl NoticePanel {
     }
 
     /// 摘要明确显示省略号，并为详情入口预留宽度；不修改独立保存的完整原文。
-    pub fn summary(message: &str, width: u16) -> Line<'static> {
-        let level = Level::of(message);
+    pub fn summary(message: &str, level: Level, width: u16) -> Line<'static> {
         let prefix = format!("[{}] ", level.label());
         let suffix = "  F4 详情";
         let reserved = Line::from(prefix.as_str()).width() + Line::from(suffix).width();
@@ -303,13 +378,42 @@ mod tests {
         ] {
             assert_eq!(Level::of(message), level);
             for width in [20, 40, 100] {
-                let line = NoticePanel::summary(message, width);
+                let line = NoticePanel::summary(message, level, width);
                 assert!(line.width() <= width as usize);
                 assert!(line.to_string().contains("F4 详情"));
                 assert_eq!(line.spans[0].style.fg, Some(color));
             }
         }
         assert_eq!(Level::of("已复制：/失败.sql"), Level::Success);
+    }
+
+    #[test]
+    fn transient_notices_expire_but_errors_persist() {
+        use std::time::{Duration, Instant};
+        let base = Instant::now();
+        let later = |secs: u64| base + Duration::from_secs(secs);
+
+        // 提示与成功：8 秒内还在，之后清掉。
+        for notice in [Notice::info("已勾选 3 项"), Notice::success("已提交")] {
+            assert!(!notice.expired_at(later(7)));
+            assert!(notice.expired_at(later(9)));
+        }
+        // 警告宽限到 15 秒。
+        let warning = Notice::warning("有 2 项未纳管");
+        assert!(!warning.expired_at(later(14)));
+        assert!(warning.expired_at(later(16)));
+        // 错误永不过期：它描述已经发生的事，用户可能还没看见。
+        let error = Notice::error("提交失败：连接被拒绝");
+        assert!(!error.expired_at(later(600)));
+    }
+
+    #[test]
+    fn explicit_levels_beat_guessing_from_text() {
+        // 路径里含"失败"二字：文本推断会误判成错误，显式等级不会。
+        let path = Notice::info("已选中 docs/失败案例.txt");
+        assert_eq!(path.level, Level::Info);
+        assert_eq!(Notice::error("提交失败").level, Level::Error);
+        assert_eq!(Notice::warning("没有可提交的项").level, Level::Warning);
     }
 
     #[test]
