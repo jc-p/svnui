@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -564,10 +565,79 @@ impl Svn {
     /// 而 commit 必须喂 stdin。为此单开一个 `run_with_stdin`。
     pub fn commit(&self, message: &str, paths: &[PathBuf]) -> Result<RawOutput> {
         let mut args: Vec<String> = vec!["commit".to_string(), "-F".to_string(), "-".to_string()];
-        for p in paths {
+        // macOS /var 与 /private/var 混用会让 SVN 重复加锁。
+        // 只规范化父目录，保留目标本身的符号链接身份。
+        let mut targets: BTreeSet<PathBuf> = paths
+            .iter()
+            .map(|p| {
+                let path = self.root.join(p);
+                match path.parent().and_then(|p| p.canonicalize().ok()) {
+                    Some(parent) => parent.join(path.file_name().unwrap_or_default()),
+                    None => path,
+                }
+            })
+            .collect();
+        let parents = self.added_commit_parents(&targets)?;
+        if !parents.is_empty() {
+            // 隐式补齐的目录不能递归，否则会带入未勾选的文件。
+            // 显式选中的目录仍保留递归语义：先展开其变更，再逐项浅提交。
+            let directories: Vec<PathBuf> = targets
+                .iter()
+                .filter(|p| std::fs::symlink_metadata(p).is_ok_and(|m| m.is_dir()))
+                .cloned()
+                .collect();
+            if !directories.is_empty() {
+                let mut status_args = vec![
+                    "status".to_string(),
+                    "--ignore-externals".to_string(),
+                    "--".to_string(),
+                ];
+                status_args.extend(directories.iter().map(|p| p.to_string_lossy().to_string()));
+                let out = self.op_no_targets(&status_args)?;
+                targets.extend(
+                    super::porcelain::parse_status(&out.stdout)
+                        .into_iter()
+                        .filter(StatusEntry::is_changed)
+                        .map(|e| self.root.join(e.path.as_str())),
+                );
+            }
+            targets.extend(parents);
+            args.extend(["--depth".to_string(), "empty".to_string()]);
+        }
+        args.push("--".to_string());
+        for p in &targets {
             args.push(p.to_string_lossy().to_string());
         }
         super::command::run_with_stdin(&self.exe, &args, &self.root, message, &self.opts(true))
+    }
+
+    /// 只查目标的祖先目录，不扫描整个工作副本，也不补入已有目录的属性修改。
+    fn added_commit_parents(&self, targets: &BTreeSet<PathBuf>) -> Result<Vec<PathBuf>> {
+        let mut ancestors = BTreeSet::new();
+        for target in targets {
+            for ancestor in target.ancestors().skip(1) {
+                if ancestor == self.root || !ancestor.starts_with(&self.root) {
+                    break;
+                }
+                ancestors.insert(ancestor.to_path_buf());
+            }
+        }
+        if ancestors.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut args = vec![
+            "status".to_string(),
+            "--depth".to_string(),
+            "empty".to_string(),
+            "--".to_string(),
+        ];
+        args.extend(ancestors.iter().map(|p| p.to_string_lossy().to_string()));
+        let out = self.op_no_targets(&args)?;
+        Ok(super::porcelain::parse_status(&out.stdout)
+            .into_iter()
+            .filter(|e| matches!(e.text, StatusKind::Added | StatusKind::Replaced))
+            .map(|e| self.root.join(e.path.as_str()))
+            .collect())
     }
 
     /// 反向合并：`svn merge -r HEAD:{rev} .`
@@ -875,7 +945,7 @@ impl Svn {
     }
 
     /// 已有完整参数列表，直接跑（用于 resolve / cleanup 这类带 `--flag=value` 的）。
-    fn op_no_targets(&self, args: &[String]) -> Result<RawOutput> {
+    pub(super) fn op_no_targets(&self, args: &[String]) -> Result<RawOutput> {
         let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
         run(&self.exe, &refs, &self.root, &self.opts(true))
     }

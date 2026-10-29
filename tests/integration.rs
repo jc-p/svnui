@@ -40,7 +40,7 @@ fn run(exe: &Path, args: &[&str], cwd: &Path) -> std::io::Result<String> {
     let out = Command::new(exe)
         .args(args)
         .arg("--non-interactive")
-        .env("LC_ALL", "C")
+        .env("LC_ALL", "C.UTF-8")
         .current_dir(cwd)
         .output()?;
     if !out.status.success() {
@@ -172,6 +172,107 @@ fn commit_produces_revision_and_clears_status() {
 
     let st2 = run(&svn, &["status"], &f.wc).unwrap();
     assert!(st2.trim().is_empty(), "提交后状态应清空，实际：{st2}");
+}
+
+/// 单选新增文件时补齐父目录，但不能递归提交未勾选的兄弟文件。
+#[test]
+#[ignore = "需要 svn + svnadmin"]
+fn commit_selected_file_adds_parents_without_unselected_changes() {
+    let f = Fixture::new();
+    let exe = svn();
+    let dir = "新增目录/版本 1";
+    std::fs::create_dir_all(f.wc.join(dir)).unwrap();
+    let selected = format!("{dir}/selected.sql");
+    let unselected = format!("{dir}/unselected.sql");
+    std::fs::write(f.wc.join(&selected), "selected\n").unwrap();
+    std::fs::write(f.wc.join(&unselected), "unselected\n").unwrap();
+    std::fs::write(f.wc.join("a.txt"), "keep local\n").unwrap();
+    run(&exe, &["add", "新增目录"], &f.wc).unwrap();
+
+    let client = svnui::svn::Svn::discover(&f.wc, std::time::Duration::from_secs(10), false)
+        .unwrap();
+    let out = client.commit("selected file", &[f.wc.join(&selected)]).unwrap();
+    assert!(out.stdout.contains("Committed revision"), "{}", out.stdout);
+
+    let status = run(&exe, &["status"], &f.wc).unwrap();
+    let entries = svnui::svn::porcelain::parse_status(&status);
+    assert_eq!(entries.len(), 2, "只能留下未勾选的变更：{status}");
+    assert!(entries.iter().any(|e| {
+        e.path.as_str() == unselected && e.text == svnui::domain::StatusKind::Added
+    }));
+    assert!(entries.iter().any(|e| {
+        e.path.as_str() == "a.txt" && e.text == svnui::domain::StatusKind::Modified
+    }));
+    assert_eq!(run(&exe, &["cat", "-r", "HEAD", &selected], &f.wc).unwrap(), "selected\n");
+}
+
+/// 显式提交目录仍包含其子树，但隐式补齐的父目录不能扩大范围。
+#[test]
+#[ignore = "需要 svn + svnadmin"]
+fn commit_explicit_directory_keeps_recursion_inside_selected_subtree() {
+    let f = Fixture::new();
+    let exe = svn();
+    std::fs::create_dir_all(f.wc.join("new/selected/nested")).unwrap();
+    std::fs::write(f.wc.join("new/selected/a.txt"), "a\n").unwrap();
+    std::fs::write(f.wc.join("new/selected/nested/b.txt"), "b\n").unwrap();
+    std::fs::write(f.wc.join("new/unselected.txt"), "keep local\n").unwrap();
+    run(&exe, &["add", "new"], &f.wc).unwrap();
+
+    let client = svnui::svn::Svn::discover(&f.wc, std::time::Duration::from_secs(10), false)
+        .unwrap();
+    client.commit("selected directory", &[PathBuf::from("new/selected")]).unwrap();
+
+    let status = run(&exe, &["status"], &f.wc).unwrap();
+    let entries = svnui::svn::porcelain::parse_status(&status);
+    assert_eq!(entries.len(), 1, "只能留下未选中的兄弟文件：{status}");
+    assert_eq!(entries[0].path.as_str(), "new/unselected.txt");
+    assert_eq!(entries[0].text, svnui::domain::StatusKind::Added);
+    assert_eq!(run(&exe, &["cat", "-r", "HEAD", "new/selected/nested/b.txt"], &f.wc).unwrap(), "b\n");
+}
+
+/// 普通文件修改和删除照常提交；已有父目录的属性改动仍留在本地。
+#[test]
+#[ignore = "需要 svn + svnadmin"]
+fn commit_existing_files_preserves_unselected_parent_properties() {
+    let f = Fixture::new();
+    let exe = svn();
+    std::fs::create_dir(f.wc.join("tracked")).unwrap();
+    std::fs::write(f.wc.join("tracked/keep.txt"), "before\n").unwrap();
+    std::fs::write(f.wc.join("tracked/delete.txt"), "remove\n").unwrap();
+    run(&exe, &["add", "tracked"], &f.wc).unwrap();
+    run(&exe, &["ci", "-m", "setup"], &f.wc).unwrap();
+    std::fs::write(f.wc.join("tracked/keep.txt"), "after\n").unwrap();
+    run(&exe, &["rm", "tracked/delete.txt"], &f.wc).unwrap();
+    run(&exe, &["propset", "test:local", "keep local", "tracked"], &f.wc).unwrap();
+
+    let client = svnui::svn::Svn::discover(&f.wc, std::time::Duration::from_secs(10), false)
+        .unwrap();
+    client.commit("selected changes", &[
+        PathBuf::from("tracked/keep.txt"),
+        PathBuf::from("tracked/delete.txt"),
+    ]).unwrap();
+
+    let status = run(&exe, &["status"], &f.wc).unwrap();
+    let entries = svnui::svn::porcelain::parse_status(&status);
+    assert_eq!(entries.len(), 1, "只能留下父目录属性变更：{status}");
+    assert_eq!(entries[0].path.as_str(), "tracked");
+    assert_eq!(entries[0].props, svnui::domain::StatusKind::Modified);
+    assert_eq!(run(&exe, &["cat", "-r", "HEAD", "tracked/keep.txt"], &f.wc).unwrap(), "after\n");
+    assert_eq!(run(&exe, &["ls", "-r", "HEAD", "tracked"], &f.wc).unwrap(), "keep.txt\n");
+}
+
+/// 未指定路径时仍提交整个工作副本，保持 CLI 默认范围。
+#[test]
+#[ignore = "需要 svn + svnadmin"]
+fn commit_without_paths_keeps_whole_working_copy_behavior() {
+    let f = Fixture::new();
+    let exe = svn();
+    std::fs::write(f.wc.join("a.txt"), "after\n").unwrap();
+    let client = svnui::svn::Svn::discover(&f.wc, std::time::Duration::from_secs(10), false)
+        .unwrap();
+    client.commit("all changes", &[]).unwrap();
+    assert!(run(&exe, &["status"], &f.wc).unwrap().trim().is_empty());
+    assert_eq!(run(&exe, &["cat", "-r", "HEAD", "a.txt"], &f.wc).unwrap(), "after\n");
 }
 
 /// 7 列解析在真实输出上不产生幽灵路径。

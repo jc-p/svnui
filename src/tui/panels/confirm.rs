@@ -38,6 +38,8 @@ pub enum Danger {
 /// 所有副作用都在一处，好推理。
 #[derive(Debug, Clone)]
 pub enum ConfirmAction {
+    /// URL 和版本在准备时冻结；确认后仍会复核工作副本状态。
+    Workflow(crate::svn::workflow::WorkflowPlan),
     /// 加入版本控制；路径在确认框打开时冻结，目录遵循 svn add 的递归规则。
     Add(Vec<std::path::PathBuf>),
     /// 真正执行 revert。
@@ -125,7 +127,8 @@ impl ConfirmPanel {
     pub fn render(&mut self, f: &mut Frame, area: Rect) {
         let adding = matches!(self.action, ConfirmAction::Add(_));
         let reverting = matches!(self.action, ConfirmAction::Revert(_));
-        let detailed = adding || reverting;
+        let workflow = matches!(self.action, ConfirmAction::Workflow(_));
+        let detailed = adding || reverting || workflow;
         let pop = if detailed {
             Self::centered(area, 90, 90)
         } else {
@@ -177,9 +180,9 @@ impl ConfirmPanel {
             chunks[0],
         );
 
-        // 撤销时路径和后果按终端宽度展开，滚动偏移以实际显示行为单位。
+        // 路径和分支 URL 按终端宽度展开，避免关键目标被水平截断；滚动以显示行为单位。
         let wrapped_rows;
-        let rows = if reverting {
+        let rows = if reverting || workflow {
             wrapped_rows = self
                 .items
                 .iter()
@@ -223,6 +226,7 @@ impl ConfirmPanel {
         // 每个框把「按了会怎样」写死，不用通用的"确认/取消"：
         // 用户得先想"确认是干啥"，出事故的往往就是那一下想当然。
         let yes_txt = match &self.action {
+            ConfirmAction::Workflow(plan) => plan.operation().title(),
             ConfirmAction::Add(_) => "加入 SVN（尚未提交）",
             ConfirmAction::Revert(_) => "丢弃本地改动",
             ConfirmAction::Delete(_, _) => "删除（本地文件一并删除）",
@@ -253,6 +257,11 @@ impl ConfirmPanel {
                 ),
                 Span::styled("j/k 滚动", theme::Theme::dim()),
             ])
+        } else if workflow {
+            Line::from(Span::styled(
+                "Y 执行  Enter/N/Esc 取消  j/k 滚动",
+                Style::default().fg(accent),
+            ))
         } else if reverting {
             Line::from(Span::styled(
                 "Y 丢弃  Enter/N 取消  j/k 滚动",

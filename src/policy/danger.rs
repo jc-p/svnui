@@ -9,6 +9,10 @@ pub enum Op {
     Diff,
     Log,
     Info,
+    Branch,
+    Tag,
+    Switch,
+    MergePreview,
     Add,
     Remove,
     Revert,
@@ -26,6 +30,10 @@ impl std::fmt::Display for Op {
             Op::Diff => "diff",
             Op::Log => "log",
             Op::Info => "info",
+            Op::Branch => "branch",
+            Op::Tag => "tag",
+            Op::Switch => "switch",
+            Op::MergePreview => "merge-preview",
             Op::Add => "add",
             Op::Remove => "remove",
             Op::Revert => "revert",
@@ -70,9 +78,10 @@ impl Danger {
 /// 静态定级。`cleanup` 例外：它本身不危险，但带 `--remove-*` 就是核弹。
 pub fn danger_of(op: Op) -> Danger {
     match op {
-        Op::Status | Op::Diff | Op::Log | Op::Info => Danger::Safe,
+        Op::Status | Op::Diff | Op::Log | Op::Info | Op::MergePreview => Danger::Safe,
         Op::Add => Danger::Low,
-        Op::Remove | Op::Commit | Op::Update | Op::Resolve | Op::PurgeMine => Danger::Medium,
+        Op::Remove | Op::Commit | Op::Update | Op::Resolve | Op::PurgeMine
+        | Op::Branch | Op::Tag | Op::Switch => Danger::Medium,
         Op::Revert => Danger::High,
         // 基础 cleanup 只是解锁，安全；带 remove 参数由调用方升级为 High。
         Op::Cleanup => Danger::Low,
@@ -94,6 +103,14 @@ pub fn cleanup_danger(remove_unversioned: bool, remove_ignored: bool) -> Danger 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workflow_writes_require_confirmation_and_merge_preview_is_readonly() {
+        for op in [Op::Branch, Op::Tag, Op::Switch] {
+            assert!(danger_of(op).needs_confirm());
+        }
+        assert_eq!(danger_of(Op::MergePreview), Danger::Safe);
+    }
 
     #[test]
     fn readonly_ops_are_safe() {

@@ -168,6 +168,27 @@ svnui tui
 svnui probe           # svn 路径 / 版本 / 工作副本根 / 能力开关
 ```
 
+独立预览本地文件，无需先进入项目或 SVN 工作副本，也无需安装 svn：
+
+```bash
+svnui preview /path/to/file.txt
+svnui preview ./image.png
+svnui --cwd /path/to/project preview docs/report.xlsx
+```
+
+也可直接打开远端 SVN 目录，无需先检出项目（需要已安装 svn 并配置认证）：
+
+```bash
+svnui preview "https://svn.example.com/repo/trunk/project/"
+svnui --trust-cert preview "https://svn.example.com/repo/trunk/project/"
+```
+
+远端目录复用仓库浏览器：`Enter` 进入子目录，`←` / 退格返回，`q` / `Esc` 退出。
+浏览边界为传入 URL；已编码的中文 URL 可直接传入，不会二次编码。
+
+支持文本、图片和办公文档，沿用 2 MiB 上限；压缩包、大文件和不支持的二进制
+显示提示。`j/k`、方向键和 `d/u` 滚动，`q` / `Esc` / `Ctrl+C` 退出。
+
 ### 内网自签名证书（公司 SVN 常见）
 
 如果报 `E230001: Server SSL certificate verification failed`：
@@ -277,6 +298,32 @@ Ghostty/Kitty 使用 Kitty 图片协议，iTerm2/WezTerm/Rio 使用 iTerm2 图�
 ---
 
 ## 命令行
+
+### 分支工作流
+
+TUI 主界面按 `B` 打开分支面板：`F1` 创建分支、`F2` 创建标签、`F3` 切换、`F4` 合并预演。
+`Tab` 切字段，`Ctrl+U` 清空当前字段，`Ctrl+S` 准备操作。创建和切换须在确认框按 `Y`；`Enter` / `N` / `Esc` 取消。
+
+```bash
+# 目标父目录必须已存在；^/ 表示当前 SVN 仓库根。
+svnui branch '^/branches/feature-a' -m '创建 feature-a' --dry-run
+svnui branch '^/branches/feature-a' -m '创建 feature-a' --yes
+svnui tag '^/tags/v1.0' -r HEAD -m '发布 v1.0' --yes
+svnui switch '^/branches/feature-a' --dry-run
+svnui switch '^/branches/feature-a' --yes
+svnui merge-preview '^/trunk'
+svnui merge-preview '^/trunk' -r 12:18
+```
+
+创建分支和标签会**立即提交仓库副本**，不会自动切换，也不包含本地未提交改动。
+默认复制当前工作副本根的 `BASE` 版本，可用 `-r` 指定整数版本、`HEAD` 或 `BASE`；标签与分支采用同样的 SVN copy 机制，不提供不可变标签保证。
+准备阶段会固定实际版本号；重复目标、跨仓库 URL 和越级路径会被拒绝。
+
+切换与合并预演要求整个工作副本干净，包括无未纳管项和已切换子树；不处理 externals。
+`merge-preview` 始终运行 SVN 原生 `--dry-run`，不会应用改动或提交；`N:M` 表示两个端点之间的差异。
+创建/切换的 `--dry-run` 只读取信息并打印计划，不执行 copy/switch；非交互执行写操作必须显式给 `--yes`。
+
+### 通用参数
 
 `svnui` 同时是可以直接脚本调用的 CLI。全局参数：
 

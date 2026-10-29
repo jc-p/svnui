@@ -3,6 +3,7 @@ pub mod hint;
 pub mod mutate;
 pub mod query;
 pub mod rescue;
+pub mod workflow;
 
 use std::path::PathBuf;
 
@@ -113,6 +114,13 @@ pub enum Cmd {
     #[cfg(feature = "tui")]
     Tui,
 
+    /// 独立预览本地文件或浏览 SVN URL，无需进入工作副本。
+    #[cfg(feature = "tui")]
+    Preview {
+        /// 本地文件路径或 SVN 目录 URL；相对路径基于 --cwd 或当前目录。
+        path: PathBuf,
+    },
+
     /// 工作副本状态。
     Status {
         #[arg(long)]
@@ -219,6 +227,55 @@ pub enum Cmd {
         paths: Vec<PathBuf>,
         #[arg(long, short = 'y')]
         yes: bool,
+    },
+
+    /// 从当前 URL 的仓库版本创建分支（立即提交仓库，不含本地改动）。
+    Branch {
+        /// 新目标的完整 URL 或 ^/branches/name；父目录必须存在。
+        destination: String,
+        #[arg(short, long)]
+        message: String,
+        /// 非负整数 / HEAD / BASE；默认 BASE。
+        #[arg(short, long)]
+        revision: Option<String>,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+
+    /// 从当前 URL 的仓库版本创建标签（与 branch 同为仓库副本）。
+    Tag {
+        /// 新目标的完整 URL 或 ^/tags/name；父目录必须存在。
+        destination: String,
+        #[arg(short, long)]
+        message: String,
+        #[arg(short, long)]
+        revision: Option<String>,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+
+    /// 切换整个工作副本；拒绝本地改动、未纳管项或已切换子树。
+    Switch {
+        url: String,
+        /// 非负整数 / HEAD / BASE；默认 HEAD。
+        #[arg(short, long)]
+        revision: Option<String>,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+
+    /// 原生 SVN 合并预演；不会应用改动或提交。
+    MergePreview {
+        source: String,
+        /// N:M；不指定时预演所有符合条件的合并。
+        #[arg(short = 'r', long = "revision")]
+        revisions: Option<String>,
     },
 
     /// 解决冲突。
@@ -357,6 +414,28 @@ pub fn run(mut cli: Cli) -> i32 {
 
     let start = cli.start_dir();
 
+    // URL 保持原字符串，不能与本地目录拼接；本地预览仍绕过 SVN 探测。
+    #[cfg(feature = "tui")]
+    if let Some(Cmd::Preview { path }) = cli.cmd.as_ref() {
+        let url = path.to_str().filter(|value| {
+            ["https://", "http://", "svn://", "svn+ssh://", "file://"]
+                .iter()
+                .any(|scheme| value.starts_with(scheme))
+        });
+        let result = match url {
+            Some(url) => crate::svn::Svn::discover_bare(&start, cli.timeout(), cli.trust_cert)
+                .and_then(|svn| crate::tui::browse_repository(svn, url)),
+            None => crate::tui::preview(&start.join(path)),
+        };
+        return match result {
+            Ok(()) => 0,
+            Err(e) => {
+                emit_err(&cli, &e);
+                e.exit_code()
+            }
+        };
+    }
+
     // 这些命令不需要工作副本：
     //   · probe        —— 它就是用来回答"为什么找不到仓库"的，
     //                     进了非工作副本直接退出等于自废武功
@@ -475,6 +554,9 @@ fn dispatch(cli: &Cli, svn: &crate::svn::Svn, tty: bool) -> Result<String, crate
             return crate::tui::run(svn.clone()).map(|_| String::new());
         }
 
+        #[cfg(feature = "tui")]
+        Cmd::Preview { .. } => unreachable!("preview 在 SVN 探测前已分发"),
+
         Cmd::Probe => query::probe(cli, svn),
         Cmd::Checkout { url, path, username, password, depth, no_auth_cache } => mutate::checkout(
             svn,
@@ -517,6 +599,28 @@ fn dispatch(cli: &Cli, svn: &crate::svn::Svn, tty: bool) -> Result<String, crate
             mutate::commit(svn, message.as_deref(), paths, *dry_run, *yes, tty)
         }
         Cmd::Update { rev, paths, yes } => mutate::update(svn, rev.as_deref(), paths, *yes, tty),
+        Cmd::Branch { destination, message, revision, dry_run, yes }
+        | Cmd::Tag { destination, message, revision, dry_run, yes } => {
+            use crate::svn::workflow::{WorkflowOperation, WorkflowRequest};
+            let operation = if matches!(cli.cmd, Some(Cmd::Branch { .. })) {
+                WorkflowOperation::Branch
+            } else {
+                WorkflowOperation::Tag
+            };
+            workflow::run(svn, WorkflowRequest {
+                operation, url: destination.clone(), revision: revision.clone(), message: message.clone(),
+            }, *dry_run, *yes, tty, cli.json)
+        }
+        Cmd::Switch { url, revision, dry_run, yes } => workflow::run(svn,
+            crate::svn::workflow::WorkflowRequest {
+                operation: crate::svn::workflow::WorkflowOperation::Switch,
+                url: url.clone(), revision: revision.clone(), message: String::new(),
+            }, *dry_run, *yes, tty, cli.json),
+        Cmd::MergePreview { source, revisions } => workflow::run(svn,
+            crate::svn::workflow::WorkflowRequest {
+                operation: crate::svn::workflow::WorkflowOperation::MergePreview,
+                url: source.clone(), revision: revisions.clone(), message: String::new(),
+            }, false, false, tty, cli.json),
         Cmd::Resolve { accept, paths, dry_run, yes } => {
             rescue::resolve(svn, accept, paths, *dry_run, *yes, tty)
         }

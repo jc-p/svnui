@@ -25,6 +25,7 @@
 //! 按键无响应，看起来就是"卡死"。
 
 mod history;
+mod workflow;
 
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -48,6 +49,7 @@ use crate::tui::panels::preview::{BarHit, Kind as PreviewKind, PreviewPanel};
 use crate::tui::panels::file_preview::{self, FileContent};
 use crate::tui::panels::help::HelpPanel;
 use crate::tui::panels::log::LogPanel;
+use crate::tui::panels::notice::{Action as NoticeAction, Level as NoticeLevel, NoticePanel};
 use crate::tui::panels::confirm::{ConfirmAction, ConfirmPanel, Danger};
 use crate::tui::panels::conflict::{ConflictItem, ConflictPanel, Side, Strategy};
 use crate::tui::panels::tree::{TreeMode, TreePanel};
@@ -72,6 +74,8 @@ pub enum Mode {
     Checkout,
     /// 远端仓库浏览（`svn list --xml`，可逐层下钻）。
     Repo,
+    /// 分支/标签创建、工作副本切换与只读合并预演。
+    Workflow,
 }
 
 /// 把路径压成相对工作副本根的显示名；不在 root 下就原样返回。
@@ -130,6 +134,8 @@ enum SearchFor {
 }
 
 enum BgDone {
+    WorkflowPrepared(crate::domain::Result<crate::svn::workflow::WorkflowPlan>),
+    WorkflowFinished(crate::svn::workflow::WorkflowOperation, crate::domain::Result<String>),
     /// (变更条目, 工作副本根)
     Status(bool, crate::domain::Result<(Vec<crate::tui::panels::Item>, PathBuf, String)>),
     Msg(crate::domain::Result<String>),
@@ -198,10 +204,14 @@ pub struct App {
     image_picker: ImageSupport,
     logpanel: Option<LogPanel>,
     checkout: Option<CheckoutPanel>,
+    workflow: Option<crate::tui::panels::workflow::WorkflowPanel>,
+    workflow_preparing: bool,
     confirm: Option<ConfirmPanel>,
     conflict: Option<ConflictPanel>,
     /// 远端仓库浏览面板（`V` 打开）。
     repo: Option<RepoPanel>,
+    /// 从 CLI URL 直接启动时，关闭仓库面板即退出程序。
+    standalone_repo: bool,
     /// 提交范围（打开提交面板时锁定，避免弹框期间勾选变化导致不一致）。
     commit_paths: Vec<PathBuf>,
     /// 是否有一个 svn commit 在后台跑。
@@ -255,6 +265,8 @@ pub struct App {
     busy_prog: Option<(usize, String)>,
 
     notice: Option<String>,
+    notice_panel: Option<NoticePanel>,
+    show_notice: bool,
     title: String,
     sort: SortMode,
     /// 待打开的外部编辑器请求（路径）。由 `mod.rs` 拿到后让出终端。
@@ -276,6 +288,14 @@ impl App {
 
     /// 实际终端根据终端标识选择图片协议；非交互调用和测试使用兼容色块。
     pub(super) fn with_image_picker(svn: Svn, image_picker: ImageSupport) -> crate::domain::Result<Self> {
+        Self::with_start_url(svn, image_picker, None)
+    }
+
+    pub(super) fn with_start_url(
+        svn: Svn,
+        image_picker: ImageSupport,
+        repo_url: Option<&str>,
+    ) -> crate::domain::Result<Self> {
         let (tx, rx) = channel();
         // ⚠️ 必须在构造 Self 之前取：svn 马上要 move 进去，之后借不到了
         let self_trust = svn.trust_cert;
@@ -296,9 +316,12 @@ impl App {
             image_picker,
             logpanel: None,
             checkout: None,
+            workflow: None,
+            workflow_preparing: false,
             confirm: None,
             conflict: None,
             repo: None,
+            standalone_repo: repo_url.is_some(),
             commit_paths: Vec::new(),
             commit_draft: None,
             commit_inflight: false,
@@ -324,6 +347,8 @@ impl App {
             busy_start: None,
             busy_prog: None,
             notice: None,
+            notice_panel: None,
+            show_notice: false,
             sort: SortMode::Status,
             editor_req: None,
             editor_refresh_pending: false,
@@ -333,6 +358,18 @@ impl App {
             items: Vec::new(),
             should_quit: false,
         };
+
+        if let Some(url) = repo_url {
+            // 以调用者提供的目录为浏览边界，避免访问无权限的仓库祖先。
+            // RepoPanel 保留已有 percent-encoding，不对传入 URL 二次编码。
+            app.root = start_cwd;
+            app.title = format!("SVN · {url}");
+            app.repo = Some(RepoPanel::new(url.to_string()));
+            app.mode = Mode::Repo;
+            let url = app.repo.as_ref().unwrap().current_url();
+            app.spawn_repo_list(&url);
+            return Ok(app);
+        }
 
         // 传进来的 svn 可能是 discover_bare 得到的（root 不是真工作副本根）。
         // 这里再试一次真正的 discover，失败就进检出界面。
@@ -460,6 +497,22 @@ impl App {
 
     pub fn set_notice(&mut self, msg: impl Into<String>) {
         self.notice = Some(msg.into());
+        self.sync_notice();
+    }
+
+    /// 已打开的详情保存快照，避免后台状态刷新覆盖用户正在读的错误。
+    fn sync_notice(&mut self) {
+        if self.show_notice { return; }
+        if self.notice.as_deref() == self.notice_panel.as_ref().map(NoticePanel::message) { return; }
+        self.notice_panel = self.notice.as_ref().map(|msg| NoticePanel::new(msg.clone()));
+        self.show_notice = self.notice_panel.as_ref().is_some_and(|p| p.level == NoticeLevel::Error);
+    }
+
+    fn notify_error(&mut self, context: &str, error: &crate::domain::Error) {
+        let message = format!("{context}：{}", crate::cli::hint::human_hint(error));
+        self.notice = Some(message.clone());
+        self.notice_panel = Some(NoticePanel::new(message));
+        self.show_notice = true;
     }
 
     /// 外部编辑器返回后调用：重新拉一次预览。
@@ -609,7 +662,7 @@ impl App {
         self.busy.is_some()
     }
 
-    /// 鼠标事件处理：**只做滚动条拖拽，不接管滚轮**。
+    /// 鼠标事件处理：预览只拖拽滚动条，完整提示打开时支持滚轮。
     ///
     /// 不做滚轮是刻意的 —— 滚轮一动就滚，很容易在看 diff 时误触把位置冲掉，
     /// 而拖拽是"明确指着滚动条拖"的主动动作，不会误触。
@@ -619,6 +672,17 @@ impl App {
     /// 树在滚动/折叠后换算容易错位，收益不抵风险。
     pub fn handle_mouse(&mut self, ev: MouseEvent) {
         use crossterm::event::{MouseButton, MouseEventKind};
+        if self.show_notice {
+            self.drag = None;
+            if let Some(panel) = self.notice_panel.as_mut() {
+                match ev.kind {
+                    MouseEventKind::ScrollDown => panel.scroll_down(3),
+                    MouseEventKind::ScrollUp => panel.scroll_up(3),
+                    _ => {}
+                }
+            }
+            return;
+        }
         // 只在这两种模式下响应。
         // 提交框 / 确认框 / 冲突面板里滚预览是错的行为
         // （用户在看的是那块面板，不是背后的预览）。
@@ -795,12 +859,14 @@ impl App {
                 BgDone::Status(_, Err(e)) => {
                     self.busy = None;
                     self.scan_failed = true;
-                    self.notice = Some(format!("扫描失败：{}", e));
+                    self.notify_error("扫描失败", &e);
                     if self.editor_refresh_loading {
                         self.preview = Some(PreviewPanel::notice("预览", format!("扫描失败：{e} · 按 R 重试")));
                         self.editor_refresh_loading = false;
                     }
                 }
+                BgDone::WorkflowPrepared(result) => self.finish_workflow_prepare(result),
+                BgDone::WorkflowFinished(operation, result) => self.finish_workflow(operation, result),
                 BgDone::Msg(Ok(msg)) => {
                     self.busy = None;
                     // 提交成功才清草稿 + 清勾选。
@@ -832,10 +898,9 @@ impl App {
                                 self.tree.set_checked(&r.to_string_lossy(), true);
                             }
                         }
-                        self.notice =
-                            Some(format!("提交失败：{}（信息已保留，按 C 重试）", e));
+                        self.notify_error("提交失败（信息已保留，关闭后按 C 重试）", &e);
                     } else {
-                        self.notice = Some(format!("失败：{}", e));
+                        self.notify_error("操作失败", &e);
                     }
                 }
                 BgDone::LogLoad(Ok(entries), search, append) => {
@@ -870,20 +935,20 @@ impl App {
                     // 搜索失败要特别处理：可能是旧 svn 不支持 --search。
                     // 明确告诉用户降级到"只搜已加载的"，而不是笼统说"失败"。
                     if let Some(kw) = search {
-                        self.notice = Some(format!("搜索“{}”失败：{}（将只搜索已加载的部分）", kw, e));
+                        self.notify_error(&format!("搜索“{}”失败（将只搜索已加载的部分）", kw), &e);
                         if let Some(p) = self.logpanel.as_mut() {
                             p.set_filter(Some(kw));
                         }
                     } else {
                         self.logpanel = None;
                         self.log_error = Some(humanize_error(&e));
-                        self.notice = Some(format!("读取历史失败：{}", e));
+                        self.notify_error("读取历史失败", &e);
                     }
                 }
                 BgDone::RevertCheck(scope, paths, result) => {
                     self.busy = None;
                     match result {
-                        Err(e) => self.notice = Some(format!("检查撤销范围失败：{}", e)),
+                        Err(e) => self.notify_error("检查撤销范围失败", &e),
                         Ok(entries) => {
                             // 清单来自真实状态；执行路径沿用用户选择，不能从展示文字反推。
                             let items: Vec<String> = entries
@@ -1013,7 +1078,7 @@ impl App {
 
                 BgDone::OutdatedCheck(Err(e)) | BgDone::Conflicts(Err(e)) => {
                     self.busy = None;
-                    self.notice = Some(format!("失败：{}", e));
+                    self.notify_error("操作失败", &e);
                 }
 
                 BgDone::Conflicts(Ok(files)) => {
@@ -1146,7 +1211,7 @@ impl App {
         }
         // 输入提交信息、确认危险操作、搜索时只积累事件，回到空闲主界面再刷新。
         if self.mode == Mode::Browse && self.busy.is_none()
-            && self.searching.is_none() && !self.show_help
+            && self.searching.is_none() && !self.show_help && !self.show_notice
         {
             if self.refresh_watch.as_mut().is_some_and(|w| w.take_due(Instant::now())) {
                 self.spawn_status(true);
@@ -1162,6 +1227,7 @@ impl App {
     /// **不**逐字符模拟按键 —— 那样粘贴内容里的 `q` / `Esc` / `/`
     /// 会被当成快捷键触发，界面直接被点掉。
     pub fn handle_paste(&mut self, text: String) {
+        if self.show_notice { return; }
         if text.is_empty() {
             return;
         }
@@ -1191,6 +1257,9 @@ impl App {
                     p.push_str(&text);
                 }
             }
+            Mode::Workflow if self.busy.is_none() => {
+                if let Some(panel) = self.workflow.as_mut() { panel.insert(&text); }
+            }
             // 其余模式没有输入框，粘贴没有落点。
             // 静默忽略比报错好 —— 用户只是按错了地方。
             _ => {}
@@ -1198,11 +1267,33 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> crate::domain::Result<()> {
+        self.sync_notice();
+        if self.show_notice {
+            self.drag = None;
+            let action = self.notice_panel.as_mut().map(|p| p.handle_key(key));
+            match action {
+                Some(NoticeAction::Close) => self.show_notice = false,
+                Some(NoticeAction::Copy) => {
+                    let text = self.notice_panel.as_ref().unwrap().message().to_string();
+                    let feedback = match copy_to_clipboard(&text) {
+                        Ok(()) => (NoticeLevel::Success, "已复制完整提示".to_string()),
+                        Err(e) => (NoticeLevel::Error, format!("复制失败：{e}")),
+                    };
+                    self.notice_panel.as_mut().unwrap().feedback(feedback.0, feedback.1);
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+        if key.code == KeyCode::F(4) && self.mode != Mode::Workflow {
+            self.show_notice = self.notice_panel.is_some();
+            return Ok(());
+        }
         if self.show_help {
             self.show_help = false;
             return Ok(());
         }
-        if self.searching.is_none() && matches!(key.code, KeyCode::Char('?') | KeyCode::F(1)) {
+        if self.mode != Mode::Workflow && self.searching.is_none() && matches!(key.code, KeyCode::Char('?') | KeyCode::F(1)) {
             self.show_help = true;
             return Ok(());
         }
@@ -1258,6 +1349,7 @@ impl App {
             Mode::Conflict => self.handle_conflict_key(key),
             Mode::Checkout => self.handle_checkout_key(key),
             Mode::Repo => self.handle_repo_key(key),
+            Mode::Workflow => self.handle_workflow_key(key),
         };
         if self.should_quit {
             self.preview_worker.cancel();
@@ -1531,6 +1623,7 @@ impl App {
             // 原来挂在 R 上，但 R 和小写 r（revert）只差一个 Shift，
             // 而 revert 是破坏性操作 —— 手滑按成大写的代价太大。
             KeyCode::Char('v') | KeyCode::Char('V') => self.open_repo(),
+            KeyCode::Char('b') | KeyCode::Char('B') => self.open_workflow(),
             KeyCode::Char('R') | KeyCode::F(5) => self.spawn_reload(),
             KeyCode::Char('u') | KeyCode::Char('U') => self.do_update(),
             KeyCode::Char('h') | KeyCode::Char('H') => self.do_doctor(),
@@ -1685,10 +1778,11 @@ impl App {
             return Ok(());
         };
         // 丢弃本地改动必须明确按 Y；Enter 保持保守默认，直接取消。
-        if key.code == KeyCode::Enter && matches!(panel.action(), ConfirmAction::Revert(_)) {
+        let workflow = matches!(panel.action(), ConfirmAction::Workflow(_));
+        if key.code == KeyCode::Enter && (workflow || matches!(panel.action(), ConfirmAction::Revert(_))) {
             self.confirm = None;
-            self.mode = Mode::Browse;
-            self.notice = Some("已取消丢弃本地改动".into());
+            self.mode = if workflow { Mode::Workflow } else { Mode::Browse };
+            self.notice = Some(if workflow { "已取消分支操作" } else { "已取消丢弃本地改动" }.into());
             return Ok(());
         }
         // 进 match 前先把动作 clone 出来：
@@ -1699,7 +1793,7 @@ impl App {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('n') | KeyCode::Char('N') => {
                 self.confirm = None;
-                self.mode = Mode::Browse;
+                self.mode = if workflow { Mode::Workflow } else { Mode::Browse };
                 self.notice = Some("已取消".into());
             }
             KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
@@ -1709,6 +1803,7 @@ impl App {
                 self.confirm = None;
                 self.mode = Mode::Browse;
                 match action {
+                    ConfirmAction::Workflow(plan) => self.execute_workflow(plan),
                     ConfirmAction::Add(paths) => self.spawn_add(paths),
                     ConfirmAction::Revert(paths) => {
                         if paths.is_empty() {
@@ -1963,7 +2058,7 @@ impl App {
                 }
             }
             Err(e) => {
-                self.notice = Some(format!("读取仓库信息失败：{}", e));
+                self.notify_error("读取仓库信息失败", &e);
                 return;
             }
         };
@@ -2005,13 +2100,14 @@ impl App {
             RepoAction::Close => {
                 self.repo = None;
                 self.mode = Mode::Browse;
+                self.should_quit = self.standalone_repo;
             }
             RepoAction::Copy(text) => match copy_to_clipboard(&text) {
                 Ok(()) => self.notice = Some(format!("已复制：{}", text)),
                 Err(e) => {
                     // 复制失败别静默：用户以为复制了，粘出来还是旧内容。
                     // 兜底把 URL 直接显示出来，至少能手动选中。
-                    self.notice = Some(format!("复制失败（{}）：{}", e, text));
+                    self.notify_error("复制失败", &e);
                 }
             },
             RepoAction::Checkout(url) => {
@@ -2800,6 +2896,7 @@ impl App {
     // ── 渲染 ──────────────────────────────────────────────
 
     pub fn render(&mut self, f: &mut Frame, area: Rect) {
+        self.sync_notice();
         let (_, keys) = self.footer_hint();
         let footer_rows = wrap_hints(keys, area.width.saturating_sub(2) as usize);
         // 保留主体空间；底栏最多三行内容，极矮窗口只用一行。
@@ -2810,30 +2907,26 @@ impl App {
             .constraints([
                 Constraint::Length(2),
                 Constraint::Min(3),
+                Constraint::Length(u16::from(self.notice.is_some())),
                 Constraint::Length(footer_height),
             ])
             .split(area);
 
         self.render_top(f, chunks[0]);
         self.render_body(f, chunks[1]);
-        self.render_bottom(f, chunks[2], footer_rows);
+        self.render_bottom(f, chunks[3], footer_rows);
 
         if let Some(notice) = &self.notice {
-            let y = chunks[2].y.saturating_sub(1);
-            let rect = Rect::new(area.x + 1, y, area.width.saturating_sub(2), 1);
-            f.render_widget(Clear, rect);
+            let rect = chunks[2];
             f.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    notice.as_str(),
-                    theme::Theme::title(),
-                ))),
+                Paragraph::new(NoticePanel::summary(notice, rect.width)),
                 rect,
             );
         }
 
         // 搜索输入条：浮在底部上方
         if let Some(target) = self.searching {
-            let y = chunks[2].y.saturating_sub(2);
+            let y = chunks[3].y.saturating_sub(2);
             let rect = Rect::new(area.x + 2, y, area.width.saturating_sub(4), 1);
             let label = match target {
                 SearchFor::Tree => "搜索文件",
@@ -2855,7 +2948,7 @@ impl App {
             panel.render(f, centered_rect(80, 85, area));
         }
         if let Some(panel) = self.diff.as_mut() {
-            if panel.kind() != PreviewKind::Image || !self.show_help {
+            if panel.kind() != PreviewKind::Image || (!self.show_help && !self.show_notice) {
                 panel.render(f, centered_rect(92, 92, area));
             }
         }
@@ -2949,6 +3042,12 @@ impl App {
             panel.render(f, centered_rect_min(70, 55, 16, area));
         }
 
+        if self.mode == Mode::Workflow {
+            if let Some(panel) = self.workflow.as_ref() {
+                panel.render(f, centered_rect_min(90, 75, 18, area));
+            }
+        }
+
         // 仓库浏览：整屏浮层（要显示层级和详情，弹出框尺寸不够）
         if self.mode == Mode::Repo {
             match self.repo.as_mut() {
@@ -2976,6 +3075,11 @@ impl App {
 
         if self.show_help {
             HelpPanel::render(f, centered_rect(70, 80, area));
+        }
+        if self.show_notice {
+            if let Some(panel) = self.notice_panel.as_mut() {
+                panel.render(f, area);
+            }
         }
     }
 
@@ -3116,7 +3220,7 @@ impl App {
 
         match self.preview.as_mut() {
             Some(p) if p.kind() != PreviewKind::Image
-                || (self.mode == Mode::Browse && !self.show_help && self.searching.is_none()) => {
+                || (self.mode == Mode::Browse && !self.show_help && !self.show_notice && self.searching.is_none()) => {
                 p.render_pane(f, preview_area, self.preview_focused)
             }
             _ => {
@@ -3174,6 +3278,10 @@ impl App {
     fn footer_hint(&self) -> (&'static str, &'static str) {
         match self.mode {
             Mode::Browse => (" 操作 ", self.browse_hint()),
+            Mode::Repo if self.standalone_repo => (
+                " 仓库预览 ",
+                "↑↓ 选择   Enter 进入   ←/退格 返回   o 检出   Y 复制路径   R 刷新   q/Esc 退出",
+            ),
             Mode::Repo => (
                 " 仓库 ",
                 "↑↓ 选择   Enter 进入   ←/退格 返回   o 检出   Y 复制路径   R 刷新   Esc 返回",
@@ -3201,6 +3309,13 @@ impl App {
             // 用户按 Esc 以为能退出，实际被送回上一层 —— 两边矛盾最害人。
             Mode::Confirm
                 if self.confirm.as_ref().is_some_and(|panel| {
+                    matches!(panel.action(), ConfirmAction::Workflow(_))
+                }) =>
+            {
+                (" 分支确认 ", "Y 执行   Enter/N/Esc 取消   j/k 滚动")
+            }
+            Mode::Confirm
+                if self.confirm.as_ref().is_some_and(|panel| {
                     matches!(panel.action(), ConfirmAction::Revert(_))
                 }) =>
             {
@@ -3212,6 +3327,10 @@ impl App {
                 "j/k 选文件   1/2/3 切版本   M 用我的   T 用服务器的   Enter 保留当前   Esc 返回",
             ),
             Mode::Checkout => (" 检出 ", "Tab 切换   Enter 确认   Ctrl+U 清空   Esc 退出"),
+            Mode::Workflow if self.busy.is_some() && !self.workflow_preparing => (
+                " 分支工作流 ", "SVN 正在执行，请等待结果；Esc 不会撤销已发出的操作",
+            ),
+            Mode::Workflow => (" 分支工作流 ", "F1 分支   F2 标签   F3 切换   F4 合并预演   Tab 切字段   Ctrl+S 准备   Esc 返回"),
         }
     }
 
@@ -3679,6 +3798,32 @@ mod refresh_tests {
     }
 
     #[test]
+    #[ignore = "需要 svn + svnadmin；仅操作临时本地仓库"]
+    fn standalone_repo_browses_encoded_url_without_working_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        run("svnadmin", &["create", "repo"], tmp.path());
+        // 已编码中文及尾部斜线均按 CLI 输入保留。
+        let url = format!("file://{}/repo/%E8%BF%90%E8%90%A5/", tmp.path().display());
+        let child = format!("{}child", url);
+        run("svn", &["mkdir", "--parents", &child, "-m", "fixture"], tmp.path());
+        let svn = Svn::discover_bare(tmp.path(), Duration::from_secs(5), false).unwrap();
+        let mut app = App::with_start_url(svn, ImageSupport::halfblocks(), Some(&url)).unwrap();
+        wait_for_scan(&mut app);
+        assert_eq!(app.mode, Mode::Repo);
+        assert!(app.checkout.is_none());
+        assert!(app.refresh_watch.is_none());
+        assert_eq!(app.repo.as_ref().unwrap().current_url(), url.trim_end_matches('/'));
+        assert_eq!(app.repo.as_ref().unwrap().selected().unwrap().name, "child");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)).unwrap();
+        wait_for_scan(&mut app);
+        assert_eq!(app.repo.as_ref().unwrap().current_url(), child);
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)).unwrap();
+        assert_eq!(app.repo.as_ref().unwrap().current_url(), url.trim_end_matches('/'));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+        assert!(app.should_quit());
+    }
+
+    #[test]
     #[ignore = "需要 svn + svnadmin；验证生成回退提示与人工草稿保护"]
     fn commit_generation_shows_source_without_overwriting_existing_draft() {
         let (_tmp, mut app) = temporary_app();
@@ -3801,6 +3946,61 @@ mod refresh_tests {
         let app = App::new(svn).unwrap();
         assert!(app.refresh_watch.is_some(), "临时工作副本必须成功启动监听");
         (tmp, app)
+    }
+
+    #[test]
+    #[ignore = "需要 svn + svnadmin；仅操作临时本地仓库"]
+    fn notice_error_details_keep_raw_diagnostic_and_block_background_keys() {
+        let (_tmp, mut app) = temporary_app();
+        app.commit_draft = Some("人工提交说明".to_string());
+        app.commit_inflight = true;
+        let error = crate::domain::with_explanation(1,
+            "svn: E170013: Commit failed\nsvn: E230001: SSL certificate failed\nTAIL_DIAGNOSTIC".to_string());
+        app.tx.send(BgDone::Msg(Err(error))).unwrap();
+        app.tick();
+        assert!(app.show_notice, "提交失败必须自动打开完整详情");
+        let message = app.notice_panel.as_ref().unwrap().message().to_string();
+        assert!(message.contains("SSL 证书校验失败"));
+        assert!(message.contains("SVN 原始错误"));
+        assert!(message.contains("TAIL_DIAGNOSTIC"));
+        assert_eq!(app.commit_draft.as_deref(), Some("人工提交说明"));
+
+        for key in [KeyEvent::new(KeyCode::Char('C'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)] {
+            app.handle_key(key).unwrap();
+            assert_eq!(app.mode, Mode::Browse);
+            assert!(!app.commit_inflight, "详情中的按键不能再次触发提交");
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+        assert!(!app.show_notice);
+        assert!(!app.should_quit);
+        app.handle_key(KeyEvent::new(KeyCode::F(4), KeyModifiers::NONE)).unwrap();
+        assert!(app.show_notice);
+        assert_eq!(app.notice_panel.as_ref().unwrap().message(), message);
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)).unwrap();
+        assert!(!app.show_notice);
+        assert!(!app.should_quit, "q 只关闭详情，不退出应用");
+    }
+
+    #[test]
+    #[ignore = "需要 svn + svnadmin；仅操作临时本地仓库"]
+    fn notice_open_error_survives_refresh_and_paste_preserves_commit_input() {
+        let (_tmp, mut app) = temporary_app();
+        app.notify_error("提交失败", &crate::domain::Error::Parse("\nORIGINAL_ERROR_TAIL".into()));
+        let original = app.notice_panel.as_ref().unwrap().message().to_string();
+        app.set_notice("已刷新：3 项状态");
+        assert_eq!(app.notice_panel.as_ref().unwrap().message(), original);
+        app.mode = Mode::Commit;
+        app.commit = Some(CommitPanel::new(Vec::new(), Some("人工草稿".into()), Vec::new()));
+        app.handle_paste("不能进入背后输入框".into());
+        assert_eq!(app.commit.as_ref().unwrap().message(), "人工草稿");
+        for (width, height) in [(100, 24), (30, 10)] {
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            let frame = terminal.draw(|f| app.render(f, f.area())).unwrap();
+            let text = frame.buffer.content.iter().flat_map(|c| c.symbol().chars())
+                .filter(|c| !c.is_whitespace()).collect::<String>();
+            assert!(text.contains("ORIGINAL_ERROR_TAIL"), "窗口 {width}×{height} 必须显示保留的错误：{text}");
+        }
     }
 
     fn wait_until(app: &mut App, done: impl Fn(&App) -> bool) {

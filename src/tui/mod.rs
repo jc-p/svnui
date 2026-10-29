@@ -8,6 +8,7 @@ mod image_support;
 pub mod panels;
 mod preview_worker;
 mod refresh;
+mod standalone_preview;
 pub mod theme;
 
 use std::io::{self, Stdout};
@@ -248,6 +249,22 @@ fn evlog(ev: &Event) {
 ///
 /// `svn` 由调用方构造（已 discover 过工作副本）。
 pub fn run(svn: Svn) -> Result<()> {
+    with_terminal_restore(|state| run_session(svn, None, state))
+}
+
+/// 从给定远端目录起步，不探测本地工作副本、不触发检出。
+pub fn browse_repository(svn: Svn, url: &str) -> Result<()> {
+    with_terminal_restore(|state| run_session(svn, Some(url), state))
+}
+
+/// 独立预览不构造 Svn/App，但共享完整的终端恢复保障。
+pub fn preview(path: &std::path::Path) -> Result<()> {
+    // 先读文件，路径/权限错误直接报告，不必进入 alternate screen。
+    let content = panels::file_preview::load(path)?;
+    with_terminal_restore(|state| standalone_preview::run(path, content, state))
+}
+
+fn with_terminal_restore(session: impl FnOnce(Arc<TerminalState>) -> Result<()>) -> Result<()> {
     let state = Arc::new(TerminalState::default());
     let session_thread = std::thread::current().id();
     // hook 先于终端初始化生效，panic 输出前恢复全部登记模式。
@@ -262,7 +279,7 @@ pub fn run(svn: Svn) -> Result<()> {
     }));
     // set_hook 不能在展开期间执行；先捕获清理，再还原 hook、恢复展开。
     let outcome =
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_session(svn, state)));
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| session(state)));
     std::panic::set_hook(Box::new(move |info| panic_hook(info)));
     match outcome {
         Ok(result) => result,
@@ -270,7 +287,7 @@ pub fn run(svn: Svn) -> Result<()> {
     }
 }
 
-fn run_session(svn: Svn, state: Arc<TerminalState>) -> Result<()> {
+fn run_session(svn: Svn, repo_url: Option<&str>, state: Arc<TerminalState>) -> Result<()> {
     let mut guard = TerminalGuard::enter(state)?;
 
     // 开诊断时先清空日志，免得跟上一次的混在一起判读不了。
@@ -278,7 +295,11 @@ fn run_session(svn: Svn, state: Arc<TerminalState>) -> Result<()> {
         let _ = std::fs::write("/tmp/svnui-key.log", "");
     }
 
-    let mut app = App::with_image_picker(svn, image_support::detect())?;
+    let picker = image_support::detect();
+    let mut app = match repo_url {
+        Some(url) => App::with_start_url(svn, picker, Some(url))?,
+        None => App::with_image_picker(svn, picker)?,
+    };
 
     loop {
         // 外部编辑器：必须先让出终端，否则 vim 在 raw mode + alternate screen 里

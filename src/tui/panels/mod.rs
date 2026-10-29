@@ -14,10 +14,12 @@ pub mod help;
 pub mod file_preview;
 pub mod loading;
 pub mod log;
+pub mod notice;
 pub mod preview;
 pub mod repo;
 pub mod status;
 pub mod tree;
+pub mod workflow;
 
 use crate::domain::StatusEntry;
 

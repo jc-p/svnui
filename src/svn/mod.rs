@@ -8,6 +8,7 @@ pub mod locator;
 pub mod parser;
 pub mod porcelain;
 pub mod version;
+pub mod workflow;
 
 pub use client::{StatusOpts, Svn};
 pub use command::{run, run_with_stdin, RawOutput, RunOpts};

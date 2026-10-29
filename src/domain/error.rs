@@ -23,7 +23,7 @@ pub enum Error {
     /// svn 自身非零退出，且 stderr 已被翻译成人话。
     ///
     /// 和 `SvnFailed` 的区别：这个变体适合直接显示给用户
-    /// （"连不上服务器，检查网络"），`SvnFailed` 保留原始 stderr 用于排查。
+    /// （"连不上服务器，检查网络"），detail 同时保留建议与原始 stderr 用于排查。
     #[error("{summary}")]
     Explained { summary: String, detail: String },
 
@@ -213,7 +213,7 @@ pub fn with_explanation(code: i32, stderr: String) -> Error {
     match explain(&stderr) {
         Some((summary, detail)) => Error::Explained {
             summary: format!("{}（svn 退出码 {}）", summary, code),
-            detail,
+            detail: format!("{detail}\n\nSVN 原始错误：\n{stderr}"),
         },
         None => Error::SvnFailed { code, stderr },
     }
