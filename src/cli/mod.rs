@@ -169,13 +169,13 @@ pub enum Cmd {
         paths: Vec<PathBuf>,
     },
 
-    /// 加入版本控制。
     /// 逐行追溯作者与版本。
     Blame {
         #[arg(value_name = "PATH", required = true)]
         path: PathBuf,
     },
 
+    /// 加入版本控制。
     Add {
         #[arg(value_name = "PATH", required = true)]
         paths: Vec<PathBuf>,
