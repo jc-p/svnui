@@ -66,6 +66,25 @@ pub enum Source {
     Registered,
     /// 打开过，从状态缓存反推出来的。
     History,
+    /// 就是当前所在的那个（补进来的，见 [`ensure_current`]）。
+    Current,
+}
+
+/// 确保当前所在的仓库出现在清单里。
+///
+/// 它可能既没登记、也还没来得及写缓存（刚检出、或缓存被清过），
+/// 但**"我现在在哪儿"是这个面板必须能回答的问题** ——
+/// 缺了它，用户切走之后就找不到回来的路。
+pub fn ensure_current(all: &mut Vec<Project>, root: &Path) {
+    if all.iter().any(|p| p.path == root) {
+        return;
+    }
+    all.push(Project {
+        path: root.to_path_buf(),
+        name: dir_name(root),
+        source: Source::Current,
+        state: state_of(root),
+    });
 }
 
 /// 列出所有已知项目。按名字排序，同路径只出现一次。

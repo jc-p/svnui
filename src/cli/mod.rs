@@ -613,6 +613,9 @@ fn projects_report(
         let source = match p.source {
             crate::projects::Source::Registered => "登记",
             crate::projects::Source::History => "打开过",
+            // CLI 列不出来"当前"这一档（命令行没有"当前副本"的概念），
+            // 走不到这里；兜底成一个能看懂的词，别留空白。
+            crate::projects::Source::Current => "当前",
         };
         let state = match p.state {
             crate::projects::State::Ready => "",

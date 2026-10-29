@@ -27,6 +27,7 @@
 mod history;
 mod workflow;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::{Duration, Instant};
@@ -77,6 +78,8 @@ pub enum Mode {
     Repo,
     /// 分支/标签创建、工作副本切换与只读合并预演。
     Workflow,
+    /// 项目切换（`Ctrl+P`）：选一个工作副本切过去。
+    Projects,
 }
 
 /// 把路径压成相对工作副本根的显示名；不在 root 下就原样返回。
@@ -227,6 +230,8 @@ pub struct App {
     conflict: Option<ConflictPanel>,
     /// 远端仓库浏览面板（`V` 打开）。
     repo: Option<RepoPanel>,
+    /// 项目切换面板（`Ctrl+P` 打开）。
+    projects: Option<crate::tui::panels::projects::ProjectsPanel>,
     /// 从 CLI URL 直接启动时，关闭仓库面板即退出程序。
     standalone_repo: bool,
     /// 提交范围（打开提交面板时锁定，避免弹框期间勾选变化导致不一致）。
@@ -237,14 +242,17 @@ pub struct App {
     /// 光看回调分不清"这次成功的是提交还是 revert"，
     /// 而只有提交成功才该清掉草稿和勾选 —— 所以要单独记一笔。
     commit_inflight: bool,
-    /// 提交信息草稿。
+    /// 提交信息草稿，**按工作副本分别存**。
     ///
     /// 退出提交框时把内容存在这里，下次按 C 打开**自动恢复**。
     /// 这是"不弹二次确认框"的前提 —— 不存档就必须问一句"确定放弃吗"，
     /// 而那个框会让"我只想退出去改点东西"变成出不来。
     ///
+    /// 按副本分开是切换项目逼出来的：草稿跟着项目走，切走再切回来还在；
+    /// 混在一个格子里则会串到另一个仓库，那比丢掉更糟。
+    ///
     /// 提交成功才清空；提交失败时保留，方便改完直接重试。
-    commit_draft: Option<String>,
+    commit_drafts: HashMap<PathBuf, String>,
     /// 日志读取失败的原因（人话摘要 + 建议）。
     ///
     /// 单独存而不只弹 notice：
@@ -347,9 +355,10 @@ impl App {
             confirm: None,
             conflict: None,
             repo: None,
+            projects: None,
             standalone_repo: repo_url.is_some(),
             commit_paths: Vec::new(),
-            commit_draft: None,
+            commit_drafts: HashMap::new(),
             commit_inflight: false,
             log_error: None,
             show_help: false,
@@ -420,13 +429,181 @@ impl App {
                 }
             }
             Err(_) => {
-                app.checkout = Some(CheckoutPanel::new(
-                    start_cwd.to_string_lossy().to_string(),
-                ));
-                app.mode = Mode::Checkout;
+                // 不在工作副本里。
+                //
+                // 有已知项目时先给项目面板：**"我要打开哪个项目"比"我要检出"
+                // 更常是此刻真正想做的事** —— 这正是"每次都要另开终端 cd 过去"
+                // 的痛点。一个项目都还没有时才直接进检出，保持原来的行为。
+                let known = crate::projects::list(&app.cfg);
+                if known.is_empty() {
+                    app.checkout = Some(CheckoutPanel::new(
+                        start_cwd.to_string_lossy().to_string(),
+                    ));
+                    app.mode = Mode::Checkout;
+                } else {
+                    app.projects = Some(crate::tui::panels::projects::ProjectsPanel::new(
+                        known, None,
+                    ));
+                    app.mode = Mode::Projects;
+                }
             }
         }
         Ok(app)
+    }
+
+    /// 打开项目切换面板（`Ctrl+P`）。
+    fn open_projects(&mut self) {
+        // 有后台任务时不让切：切换要重新全量扫描，跟正在跑的那个叠在一起
+        // 结果会互相覆盖，用户看到的会是错的状态。
+        if self.busy.is_some() {
+            self.set_notice("有操作正在跑，等它结束再切换".to_string());
+            return;
+        }
+        let mut all = crate::projects::list(&self.cfg);
+        // 当前仓库可能既没登记也没留下缓存（刚检出、缓存被清过），
+        // 但"我现在在哪儿"必须出现在列表里 —— 否则切走就回不来了。
+        crate::projects::ensure_current(&mut all, &self.svn.root);
+        let current = Some(self.svn.root.clone());
+        self.projects =
+            Some(crate::tui::panels::projects::ProjectsPanel::new(all, current));
+        self.mode = Mode::Projects;
+    }
+
+    /// 项目面板的按键。
+    ///
+    /// 导航和过滤交给面板自己；登记/移除要动配置文件和 App 状态，留在这里。
+    fn handle_projects_key(&mut self, key: KeyEvent) -> crate::domain::Result<()> {
+        // 搜索时 `a` / `d` 只是输入字符，不能被当成命令。
+        let searching = self.projects.as_ref().map(|p| p.searching()).unwrap_or(false);
+        if !searching {
+            match (key.code, key.modifiers) {
+                (KeyCode::Char('a'), KeyModifiers::NONE) => return self.register_current(),
+                (KeyCode::Char('d'), KeyModifiers::NONE) => return self.remove_selected_project(),
+                _ => {}
+            }
+        }
+
+        let Some(panel) = self.projects.as_mut() else {
+            self.mode = Mode::Browse;
+            return Ok(());
+        };
+        match panel.handle_key(key) {
+            crate::tui::panels::projects::ProjectsAction::None => Ok(()),
+            crate::tui::panels::projects::ProjectsAction::Close => {
+                self.projects = None;
+                self.mode = Mode::Browse;
+                Ok(())
+            }
+            crate::tui::panels::projects::ProjectsAction::Open(path) => {
+                self.projects = None;
+                self.switch_to(path)
+            }
+            crate::tui::panels::projects::ProjectsAction::Checkout => {
+                self.projects = None;
+                self.checkout =
+                    Some(CheckoutPanel::new(self.svn.cwd.to_string_lossy().to_string()));
+                self.mode = Mode::Checkout;
+                Ok(())
+            }
+        }
+    }
+
+    /// 把当前工作副本登记进项目清单。
+    fn register_current(&mut self) -> crate::domain::Result<()> {
+        match crate::projects::add(&self.svn.root, None) {
+            Ok(msg) => {
+                if let Some(p) = self.projects.as_mut() {
+                    p.refresh(crate::projects::list(&self.cfg));
+                    // add 的输出有好几行，面板底部只放得下一句。
+                    p.set_notice(msg.lines().next().unwrap_or("已登记").to_string());
+                }
+            }
+            Err(e) => {
+                if let Some(p) = self.projects.as_mut() {
+                    p.set_notice(e);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// 从清单里移除选中的项目。
+    fn remove_selected_project(&mut self) -> crate::domain::Result<()> {
+        let Some(path) = self
+            .projects
+            .as_ref()
+            .and_then(|p| p.selected())
+            .map(|x| x.path.clone())
+        else {
+            return Ok(());
+        };
+        // 正在用的那个不让删：它明明还在磁盘上，删了反而找不回来，
+        // 而"我当前在这儿"本身就是最重要的上下文。
+        if path == self.svn.root {
+            if let Some(p) = self.projects.as_mut() {
+                p.set_notice("当前正在用的副本不能移除".to_string());
+            }
+            return Ok(());
+        }
+        let name = dir_name_of(&path);
+        match crate::projects::remove(&path) {
+            Ok(_) => {
+                if let Some(p) = self.projects.as_mut() {
+                    p.refresh(crate::projects::list(&self.cfg));
+                    p.set_notice(format!("已移除 {name}"));
+                }
+            }
+            Err(e) => {
+                if let Some(p) = self.projects.as_mut() {
+                    p.set_notice(e);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// 切到另一个工作副本。
+    ///
+    /// 和启动时"用真工作副本替换裸 svn"是同一段序列（`app.rs` 的构造里），
+    /// 走同一条路径才不会出现"启动正常、切换后少做一步"。
+    fn switch_to(&mut self, root: PathBuf) -> crate::domain::Result<()> {
+        // 超时和 trust_cert 都从当前 Svn 继承：不继承的话切过去的仓库
+        // 会悄悄用上默认超时、丢掉证书信任配置。
+        let svn = crate::svn::Svn::discover(&root, self.svn.timeout(), self.svn.trust_cert)?;
+        self.svn = svn;
+
+        // 与启动同序：先监听再扫描，免得扫描期间丢掉外部修改。
+        match super::refresh::RefreshWatch::new(self.svn.root.as_path()) {
+            Ok(w) => self.refresh_watch = Some(w),
+            Err(e) => self.watch_error = Some(e.to_string()),
+        }
+
+        // 清掉一切绑定旧仓库的状态。这份清单是"切换"最容易埋 bug 的地方 ——
+        // 漏掉任何一个，都会表现为"切过去了但屏幕上还留着上一个项目"。
+        self.tree.clear_check();
+        self.tree.set_filter(None);
+        self.commit = None;
+        self.diff = None;
+        self.preview = None;
+        self.logpanel = None;
+        self.conflict = None;
+        self.repo = None;
+        self.workflow = None;
+        self.confirm = None;
+        self.commit_paths.clear();
+        self.commit_inflight = false;
+        self.log_error = None;
+        self.searching = None;
+        self.query.clear();
+        self.mode = Mode::Browse;
+
+        self.reload_sync()?;
+        self.title = Self::fetch_title(&self.svn);
+        if self.tree.selected().is_some() {
+            self.spawn_preview();
+        }
+        self.set_notice(format!("已切换到 {}", dir_name_of(&self.svn.root)));
+        Ok(())
     }
 
     pub fn should_quit(&self) -> bool {
@@ -929,7 +1106,7 @@ impl App {
                     // 清掉的话用户得重新写信息、重新勾一遍文件。
                     if self.commit_inflight {
                         self.commit_inflight = false;
-                        self.commit_draft = None;
+                        self.commit_drafts.remove(&self.svn.root);
                         self.commit_paths.clear();
                         self.tree.clear_check();
                     }
@@ -1490,6 +1667,7 @@ impl App {
             Mode::Checkout => self.handle_checkout_key(key),
             Mode::Repo => self.handle_repo_key(key),
             Mode::Workflow => self.handle_workflow_key(key),
+            Mode::Projects => self.handle_projects_key(key),
         };
         if self.should_quit {
             self.preview_worker.cancel();
@@ -1567,6 +1745,12 @@ impl App {
                     _ => {}
                 }
             }
+            return Ok(());
+        }
+        // Ctrl+P 放在后台任务检查**之前**：切换面板自己会判断 busy 并给出
+        // 更贴切的提示（"等它结束再切换"比通用的"后台任务进行中"更说明问题）。
+        if matches!((key.code, key.modifiers), (KeyCode::Char('p'), KeyModifiers::CONTROL)) {
+            self.open_projects();
             return Ok(());
         }
         // 后台工作时仍可浏览和退出；写操作及打开其他后台面板等待当前任务结束。
@@ -1917,7 +2101,7 @@ impl App {
         // 之前有内容时会弹"确定放弃吗"，结果用户按 N 想退出却被送回提交框，
         // 再按 Esc 又弹 —— 出不去。根因是"退出"和"不放弃"共用一个键。
         //
-        // 现在改成：Esc 永远能走，内容存进 commit_draft，
+        // 现在改成：Esc 永远能走，内容按副本存进 commit_drafts，
         // 下次按 C 打开自动恢复。既然不会丢，就没必要再问一句。
         if matches!(key.code, KeyCode::Esc) {
             self.close_commit();
@@ -2618,7 +2802,7 @@ impl App {
         // 草稿在这里生效：上次按 Esc 退出时存的内容自动回来。
         // 用 take() 而不是 clone —— 恢复之后草稿就归提交框管了，
         // 留一份副本会在"提交成功"和"再次 Esc"之间产生两份不一致的状态。
-        self.commit = Some(CommitPanel::new(files, self.commit_draft.take(), changes));
+        self.commit = Some(CommitPanel::new(files, self.commit_drafts.remove(&self.svn.root), changes));
         self.commit_paths = paths;
         self.mode = Mode::Commit;
     }
@@ -2631,9 +2815,9 @@ impl App {
         if let Some(p) = self.commit.take() {
             let msg = p.message();
             if msg.is_empty() {
-                self.commit_draft = None;
+                self.commit_drafts.remove(&self.svn.root);
             } else {
-                self.commit_draft = Some(msg);
+                self.commit_drafts.insert(self.svn.root.clone(), msg);
                 saved = true;
             }
         }
@@ -3456,7 +3640,7 @@ impl App {
         // 信息没了得整个重打一遍。存下来，失败后按 C 直接回到这里。
         //
         // 成功时由 BgDone::Msg(Ok) 那侧清掉 —— 那里才知道到底成没成。
-        self.commit_draft = Some(msg.clone());
+        self.commit_drafts.insert(self.svn.root.clone(), msg.clone());
         self.commit_paths = paths.clone();
         self.commit_inflight = true;
 
@@ -3577,6 +3761,9 @@ impl App {
         }
         if let Some(panel) = self.logpanel.as_mut() {
             panel.render(f, theme::centered(area, 92, 88, 30, 8));
+        }
+        if let Some(panel) = self.projects.as_mut() {
+            panel.render(f, theme::centered(area, 84, 76, 40, 10));
         }
 
         // 日志：加载中 / 失败 / 正常，三种状态都要有明确画面
@@ -3881,6 +4068,10 @@ impl App {
 
     fn footer_hint(&self) -> (&'static str, &'static str) {
         match self.mode {
+            Mode::Projects => (
+                " 项目 ",
+                "↑↓ 选择   Enter 打开   a 登记当前   d 移除   / 过滤   Esc 返回",
+            ),
             Mode::Browse => (" 操作 ", self.browse_hint()),
             Mode::Repo if self.standalone_repo => (
                 " 仓库预览 ",
@@ -4186,6 +4377,13 @@ fn delete_consequence(keep_local: bool) -> &'static str {
     } else {
         "连本地文件一起删除 —— 不可撤销；打开下面开关可只移出版本控制。"
     }
+}
+
+/// 路径最后一段。用于"已切换到 X"这类提示 —— 整条路径太长，占满一行还看不出重点。
+fn dir_name_of(p: &std::path::Path) -> String {
+    p.file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| p.display().to_string())
 }
 
 /// 把路径整理成"人看的形态"。
@@ -4670,11 +4868,66 @@ mod refresh_tests {
         (tmp, app)
     }
 
+    /// `Ctrl+P` 要真的画出项目面板，而且**当前所在的副本必须在列表里** ——
+    /// 它可能既没登记、也没留下缓存，但"我现在在哪儿"是面板必须能回答的。
+    #[test]
+    #[ignore = "需要 svn + svnadmin；仅操作临时本地仓库"]
+    fn ctrl_p_shows_the_project_panel_including_where_i_am() {
+        let (_tmp, mut app) = temporary_app();
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL)).unwrap();
+        assert_eq!(app.mode, Mode::Projects, "Ctrl+P 必须进项目面板");
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| {
+            let area = f.area();
+            app.render(f, area);
+        }).unwrap();
+        let text: String =
+            terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
+        let text: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+
+        assert!(text.contains("项目"), "面板标题要出现，实际：{text}");
+        assert!(text.contains("wc"), "当前副本要在列表里，实际：{text}");
+        assert!(text.contains("当前"), "当前副本要有标记，实际：{text}");
+    }
+
+    /// 切换要把所有绑定旧仓库的状态清掉 ——
+    /// 漏掉任何一个，都会表现为"切过去了但屏幕上还留着上一个项目"。
+    #[test]
+    #[ignore = "需要 svn + svnadmin；仅操作临时本地仓库"]
+    fn switching_projects_leaves_nothing_of_the_previous_one() {
+        let (tmp, mut app) = temporary_app();
+        let url = format!("file://{}/repo", tmp.path().display());
+        run("svn", &["checkout", "--non-interactive", &url, "wc2"], tmp.path());
+        let wc2 = tmp.path().join("wc2");
+        std::fs::write(wc2.join("b.txt"), "second\n").unwrap();
+        run("svn", &["add", "b.txt"], &wc2);
+        run("svn", &["commit", "--non-interactive", "-m", "init"], &wc2);
+
+        // 先在旧仓库上留点状态：过滤词、搜索态、提交草稿
+        app.query = "a.txt".into();
+        app.searching = Some(SearchFor::Tree);
+        app.commit_drafts.insert(app.svn.root.clone(), "给上一个项目的说明".into());
+
+        app.switch_to(wc2.clone()).unwrap();
+
+        assert!(app.svn.root.ends_with("wc2"), "必须切到新副本：{:?}", app.svn.root);
+        assert_eq!(app.mode, Mode::Browse);
+        assert!(app.query.is_empty(), "过滤词不能带过去");
+        assert!(app.searching.is_none(), "搜索状态不能带过去");
+        assert!(app.commit.is_none(), "提交框不能带过去");
+        assert!(app.preview.is_none(), "预览不能带过去");
+        // 草稿按副本存：新的没有，旧的还在
+        assert!(!app.commit_drafts.contains_key(&app.svn.root));
+        assert_eq!(app.commit_drafts.len(), 1, "上个项目的草稿要留着");
+    }
+
     #[test]
     #[ignore = "需要 svn + svnadmin；仅操作临时本地仓库"]
     fn notice_error_details_keep_raw_diagnostic_and_block_background_keys() {
         let (_tmp, mut app) = temporary_app();
-        app.commit_draft = Some("人工提交说明".to_string());
+        app.commit_drafts.insert(app.svn.root.clone(), "人工提交说明".to_string());
         app.commit_inflight = true;
         let error = crate::domain::with_explanation(1,
             "svn: E170013: Commit failed\nsvn: E230001: SSL certificate failed\nTAIL_DIAGNOSTIC".to_string());
@@ -4685,7 +4938,10 @@ mod refresh_tests {
         assert!(message.contains("SSL 证书校验失败"));
         assert!(message.contains("SVN 原始错误"));
         assert!(message.contains("TAIL_DIAGNOSTIC"));
-        assert_eq!(app.commit_draft.as_deref(), Some("人工提交说明"));
+        assert_eq!(
+            app.commit_drafts.get(&app.svn.root).map(String::as_str),
+            Some("人工提交说明")
+        );
 
         for key in [KeyEvent::new(KeyCode::Char('C'), KeyModifiers::NONE),
             KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)] {

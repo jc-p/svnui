@@ -16,6 +16,7 @@ pub mod loading;
 pub mod log;
 pub mod notice;
 pub mod preview;
+pub mod projects;
 pub mod repo;
 pub mod tree;
 pub mod workflow;
