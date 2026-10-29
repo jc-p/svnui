@@ -964,7 +964,11 @@ impl App {
                     match result {
                         Err(e) => self.notify_error("检查撤销范围失败", &e),
                         Ok(entries) => {
-                            // 清单来自真实状态；执行路径沿用用户选择，不能从展示文字反推。
+                            // 清单来自真实状态，执行路径也用它 —— 不再用用户选的
+                            // 那个目录去递归。目录递归的话，清单里剔掉某几项就
+                            // 没有意义了（剔了也会被目录整体带进去）。
+                            // 现在是文件级精确清单，剔除才真的剔得掉。
+                            let mut item_paths: Vec<PathBuf> = Vec::new();
                             let items: Vec<String> = entries
                                 .iter()
                                 .filter_map(|entry| {
@@ -982,6 +986,7 @@ impl App {
                                         '~' => "尝试还原版本状态；阻碍项可能导致失败",
                                         _ => return None,
                                     };
+                                    item_paths.push(path.clone());
                                     Some(format!(
                                         "{} {}\n  {}",
                                         if entry.sign() == 'A' && entry.copied { "A+".into() } else { entry.sign().to_string() },
@@ -994,13 +999,18 @@ impl App {
                                 self.notice =
                                     Some(Notice::new("所选范围没有可撤销的版本改动；未纳管文件会保留"));
                             } else {
-                                self.confirm = Some(ConfirmPanel::new(
-                                    format!("丢弃本地改动：{} 项", items.len()),
-                                    format!("范围：{}\n目录递归撤销，包含执行时目录内的版本改动。\n丢弃的内容无法恢复；不影响仓库历史。", scope),
-                                    items,
-                                    Op::Revert,
-                                    ConfirmAction::Revert(paths),
-                                ));
+                                self.confirm = Some(
+                                    ConfirmPanel::new(
+                                        format!("丢弃本地改动：{} 项", items.len()),
+                                        format!(
+                                            "范围：{scope}\n清单是文件级精确范围：j/k 移动、Space 剔除不想丢弃的。\n丢弃的内容无法恢复；不影响仓库历史。"
+                                        ),
+                                        items,
+                                        Op::Revert,
+                                        ConfirmAction::Revert(item_paths),
+                                    )
+                                    .with_pick(),
+                                );
                                 self.mode = Mode::Confirm;
                             }
                         }
@@ -1578,11 +1588,23 @@ impl App {
                 }
             },
 
-            // Ctrl+A 全选可提交的 / Ctrl+R 清空勾选
+            // Ctrl+A 分级全选 / i 反选 / Ctrl+R 清空
+            //
+            // 全选原来直接把所有可提交项（含折叠、搜索过滤之外的）勾上，
+            // 树上看不见它们，用户却要为它们负责 —— 提交范围里混进
+            // 没看过的文件是最容易出事的一种。
+            //
+            // 改成两级：先勾看得见的；再按一次才把隐藏的也带进来，
+            // 并且明确告诉你多带了多少。
             KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.tree.select_committable(true);
-                let n = self.tree.checked_count();
-                self.notice = Some(Notice::new(format!("已全选可提交项（{} 项）", n)));
+                self.check_all_escalating();
+            }
+            // i：反选看得见的可提交项。
+            // 「勾 3 个」和「除了这 3 个都要」是两种心情，后者原本只能
+            // 先 Ctrl+A 再挨个取消。
+            KeyCode::Char('i') => {
+                let n = self.tree.invert_visible();
+                self.notice = Some(Notice::new(format!("已反选当前可见项，现在勾着 {} 项", n)));
             }
             KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.tree.clear_check();
@@ -1827,10 +1849,23 @@ impl App {
                     p.focus_next();
                 }
             }
-            // Space 切换聚焦的开关（Enter 是确认，不能用它切）。
+            // Space：有裁剪清单时切换光标项，否则切换聚焦的开关。
+            // （Enter 是确认，不能用它切。）
             KeyCode::Char(' ') => {
                 if let Some(p) = self.confirm.as_mut() {
-                    p.toggle_focused();
+                    p.toggle_at_cursor();
+                }
+            }
+            // Ctrl+A / Ctrl+R：全选 / 清空裁剪清单。
+            // 与文件树上的同一组键保持一致 —— 同一个动作别记两套键。
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(p) = self.confirm.as_mut() {
+                    p.set_all_picks(true);
+                }
+            }
+            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(p) = self.confirm.as_mut() {
+                    p.set_all_picks(false);
                 }
             }
             KeyCode::Backspace => {
@@ -1858,12 +1893,19 @@ impl App {
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
                     .map(str::to_string);
+                // 裁剪结果也要在关面板前取出来：清单里剔掉哪几项是
+                // 用户刚刚在框里改过的，不是构造时的那份全量。
+                let picked = panel.picked_indexes();
                 self.confirm = None;
                 self.mode = Mode::Browse;
                 match action {
                     ConfirmAction::Workflow(plan) => self.execute_workflow(plan),
-                    ConfirmAction::Add(paths) => self.spawn_add(paths),
+                    ConfirmAction::Add(paths) => {
+                        let paths = pick_by(&paths, picked.as_deref());
+                        self.spawn_add(paths);
+                    }
                     ConfirmAction::Revert(paths) => {
+                        let paths = pick_by(&paths, picked.as_deref());
                         if paths.is_empty() {
                             self.notice = Some(Notice::new("没有要撤销的项目"));
                         } else {
@@ -1893,14 +1935,25 @@ impl App {
                     }
                 }
             }
+            // j/k：清单可裁剪时在条目间移动光标（滚动由面板自动跟随），
+            // 不可裁剪时才是翻清单。一个键两种含义不冲突 ——
+            // 用户此刻要么在挑条目，要么在看清单，不会同时需要两者。
             KeyCode::Char('j') | KeyCode::Down => {
                 if let Some(p) = self.confirm.as_mut() {
-                    p.scroll_down(1)
+                    if p.has_picks() {
+                        p.pick_move(1);
+                    } else {
+                        p.scroll_down(1);
+                    }
                 }
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 if let Some(p) = self.confirm.as_mut() {
-                    p.scroll_up(1)
+                    if p.has_picks() {
+                        p.pick_move(-1);
+                    } else {
+                        p.scroll_up(1);
+                    }
                 }
             }
             _ => {}
@@ -2325,9 +2378,10 @@ impl App {
             return;
         }
 
-        // 一个都没勾就默认全选可提交的
+        // 一个都没勾就默认全选可提交的（提交要的是完整范围，
+        // 不能只勾当前看得见的 —— 那会漏掉折叠起来的改动）
         if self.tree.checked_count() == 0 {
-            self.tree.select_committable(true);
+            self.tree.check_all_committable();
         }
 
         let paths = self.tree.checked_abs();
@@ -2413,23 +2467,58 @@ impl App {
         if targets.is_empty() {
             self.notice = Some(Notice::new("当前项没有可添加的未纳管内容，按 A 可查看全部新增项"));
         } else if is_dir {
-            self.confirm_add(targets, format!("当前目录：{}/", rel));
+            // 目录里未必每一样都要进库（构建产物、临时文件混在里面很常见），
+            // 所以目录也走可裁剪清单，而不是一句「递归添加」了事。
+            self.confirm_add(targets, format!("当前目录：{}/", rel), None);
         } else {
             self.spawn_add(targets);
         }
     }
 
+    /// `A`：批量添加的清单。
+    ///
+    /// 过去只能「全加」：几十个未纳管文件里混着 build 产物也得一起进去。
+    /// 现在默认预选**当前搜索匹配到**的那些 —— 搜 `src/` 再按 A，
+    /// 得到的就是 src 下那批，不必在清单里再剔一遍。
     fn confirm_add_all(&mut self) {
-        let targets: Vec<PathBuf> = self
+        let has_filter = self.tree.filter().is_some();
+        let mut targets: Vec<PathBuf> = self
             .items
             .iter()
             .filter(|item| item.sign == '?')
             .map(|item| self.root.join(&item.rel))
             .collect();
-        self.confirm_add(targets, "全部未纳管项（包含搜索过滤外的项目）".into());
+        targets.sort();
+        targets.dedup();
+        // 预选规则直接问 tree，不在外面另写一份 contains：
+        // 搜索匹配有「含 / 按路径、否则按文件名」两套语义，写重样
+        // 就会出现「树上显示 3 条、框里预选 5 条」。
+        let preset = has_filter.then(|| {
+            targets
+                .iter()
+                .map(|p| {
+                    let rel = p
+                        .strip_prefix(&self.root)
+                        .unwrap_or(p)
+                        .to_string_lossy()
+                        .into_owned();
+                    self.tree.matches_filter(&rel)
+                })
+                .collect::<Vec<bool>>()
+        });
+        let preselected = preset.as_ref().map(|v| v.iter().filter(|b| **b).count());
+        let scope = match (self.tree.filter(), preselected) {
+            (Some(f), Some(n)) => format!(
+                "全部未纳管项 {} 个，已按当前搜索「{f}」预选 {n} 个",
+                targets.len()
+            ),
+            _ => format!("全部未纳管项（包含搜索过滤外的项目）共 {} 个", targets.len()),
+        };
+        self.confirm_add(targets, scope, preset);
     }
 
-    fn confirm_add(&mut self, mut targets: Vec<PathBuf>, scope: String) {
+    /// `preset` 为 `Some` 时按它预选条目，`None` 表示全部预选。
+    fn confirm_add(&mut self, mut targets: Vec<PathBuf>, scope: String, preset: Option<Vec<bool>>) {
         if targets.is_empty() {
             self.notice = Some(Notice::new("没有可添加的未纳管项"));
             return;
@@ -2446,13 +2535,20 @@ impl App {
                     .into_owned()
             })
             .collect();
-        self.confirm = Some(ConfirmPanel::new(
+        let panel = ConfirmPanel::new(
             format!("确认加入 SVN：{} 个目标", targets.len()),
-            format!("范围：{scope}\n目录递归添加未忽略子项。\n仅加入 SVN，尚未提交。"),
+            format!(
+                "范围：{scope}\n目录递归添加未忽略子项。\n仅加入 SVN，尚未提交。\n\
+                 清单可裁剪：j/k 移动、Space 剔除、Ctrl+A 全选、Ctrl+R 清空。"
+            ),
             entries,
             Op::Add,
             ConfirmAction::Add(targets),
-        ));
+        );
+        self.confirm = Some(match preset {
+            Some(selected) => panel.with_pick_selected(selected),
+            None => panel.with_pick(),
+        });
         self.mode = Mode::Confirm;
     }
 
@@ -2585,6 +2681,40 @@ impl App {
             svn.revert(&paths, false)?;
             Ok(format!("已撤销 {} 个目标的本地改动", n))
         });
+    }
+
+    /// `Ctrl+A`：先勾看得见的，再按一次才扩到全部。
+    ///
+    /// 返回给用户的每一句话都写清范围 —— 「已全选」这种说法
+    /// 在树上有折叠和过滤时是假的。
+    fn check_all_escalating(&mut self) {
+        let visible_total = self.tree.visible_committable_count();
+        let visible_checked = self
+            .items
+            .iter()
+            .filter(|i| self.tree.is_checked(&i.rel))
+            .count()
+            .min(visible_total);
+        if visible_checked < visible_total {
+            let added = self.tree.check_visible();
+            let hidden = self.tree.committable_count().saturating_sub(visible_total);
+            let msg = if hidden > 0 {
+                format!(
+                    "已勾选当前可见项（新增 {} 项）；折叠/过滤外还有 {} 项，再按 Ctrl+A 一起勾上",
+                    added, hidden
+                )
+            } else {
+                format!("已勾选当前可见项（新增 {} 项）", added)
+            };
+            self.notice = Some(Notice::new(msg));
+            return;
+        }
+        let added = self.tree.check_all_committable();
+        self.notice = Some(Notice::new(if added == 0 {
+            "可提交的项已经全部勾上了".to_string()
+        } else {
+            format!("已把折叠/过滤外的 {} 项也勾上（共 {} 项）", added, self.tree.checked_count())
+        }));
     }
 
     /// `Ctrl+K`：先确认再 cleanup。
@@ -3317,7 +3447,7 @@ impl App {
 
         // 宽度分配：左段先拿，右段次之，剩下的全给中段。
         let total = area.width as usize;
-        let title_w = display_width(title.content.as_ref()).min(total);
+        let title_w = theme::display_width(title.content.as_ref()).min(total);
         let right_w = spans_width(&right).min(total.saturating_sub(title_w));
         let mid_w = total.saturating_sub(title_w).saturating_sub(right_w);
 
@@ -3537,37 +3667,18 @@ const MIN_HEIGHT: u16 = 7;
 /// 窄于这个宽度连一个文件路径都显示不全。
 const MIN_WIDTH: u16 = 24;
 
-/// 字符串占多少显示列（中文 2 列）。
-fn display_width(s: &str) -> usize {
-    Line::from(s).width()
+/// 按确认框的裁剪结果保留选中条目。
+///
+/// `picked` 为 `None` 表示这个框不可裁剪（清单即范围），原样返回。
+fn pick_by<T: Clone>(all: &[T], picked: Option<&[usize]>) -> Vec<T> {
+    match picked {
+        Some(indexes) => indexes.iter().filter_map(|i| all.get(*i).cloned()).collect(),
+        None => all.to_vec(),
+    }
 }
 
 fn spans_width(spans: &[Span]) -> usize {
     spans.iter().map(|s| s.width()).sum()
-}
-
-/// 按显示宽度截断；截断处补一个 `…`。
-fn fit(s: &str, width: usize) -> String {
-    if display_width(s) <= width {
-        return s.to_string();
-    }
-    // 给 `…` 留一列；连一列都没有就只能整段丢弃。
-    let room = match width.checked_sub(1) {
-        Some(0) | None => return String::new(),
-        Some(r) => r,
-    };
-    let mut out = String::new();
-    let mut used = 0;
-    for ch in s.chars() {
-        let w = display_width(&ch.to_string());
-        if used + w > room {
-            break;
-        }
-        out.push(ch);
-        used += w;
-    }
-    out.push('…');
-    out
 }
 
 /// 把一组 Span 截断到不超过 `width` 列。放不下的整段丢掉，不折行。
@@ -3581,7 +3692,7 @@ fn truncate_spans<'a>(spans: &[Span<'a>], width: usize) -> Vec<Span<'a>> {
             used += w;
         } else {
             let rest = width.saturating_sub(used);
-            let cut = fit(&sp.content, rest);
+            let cut = theme::fit(&sp.content, rest);
             if !cut.is_empty() {
                 out.push(Span::styled(cut, sp.style));
             }
@@ -3614,13 +3725,13 @@ fn fit_hints(keys: &str, width: usize) -> (String, bool) {
     let reserved = if tail_text.is_empty() {
         0
     } else {
-        display_width(&tail_text) + 3
+        theme::display_width(&tail_text) + 3
     };
     let total_groups = groups.len();
     let mut out: Vec<String> = Vec::new();
     let mut used = 0;
     for g in groups {
-        let w = display_width(g);
+        let w = theme::display_width(g);
         let need = if out.is_empty() { w } else { w + 3 };
         // 给尾部逃生键留位置。
         if used + need + reserved > width {
@@ -3639,7 +3750,7 @@ fn render_too_small(f: &mut Frame, area: Rect) {
     let msg = format!(" 窗口太小（{}×{}），至少需要 {}×{}  ", area.width, area.height, MIN_WIDTH, MIN_HEIGHT);
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            fit(&msg, area.width as usize),
+            theme::fit(&msg, area.width as usize),
             theme::Theme::title(),
         ))),
         area,
@@ -4025,7 +4136,7 @@ mod layout_tests {
         for width in [12, 20, 34, 60, 200] {
             let (row, _truncated) = fit_hints(keys, width);
             assert!(
-                Line::from(row.as_str()).width() <= width.max(display_width("? 帮助   q 退出")),
+                Line::from(row.as_str()).width() <= width.max(theme::display_width("? 帮助   q 退出")),
                 "宽度 {width} 放不下：{row}"
             );
             // 逃生键在任何宽度下都不能被挤掉。
@@ -4041,12 +4152,12 @@ mod layout_tests {
 
     #[test]
     fn fit_truncates_by_display_width_not_char_count() {
-        assert_eq!(fit("abc", 10), "abc");
+        assert_eq!(theme::fit("abc", 10), "abc");
         // 4 列里留 1 列给省略号，中文按 2 列算 → 只放得下一个"未"。
-        assert_eq!(fit("未纳管文件", 4), "未…");
-        assert_eq!(fit("未纳管文件", 5), "未纳…");
+        assert_eq!(theme::fit("未纳管文件", 4), "未…");
+        assert_eq!(theme::fit("未纳管文件", 5), "未纳…");
         // 一列都放不下时整段丢弃，不留半个字符。
-        assert_eq!(fit("未纳管", 1), "");
+        assert_eq!(theme::fit("未纳管", 1), "");
     }
 
     #[test]

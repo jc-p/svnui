@@ -176,20 +176,72 @@ impl TreePanel {
         self.checked.clear();
     }
 
-    /// 全选 / 清空：只对"可提交"的条目生效。
+    /// 当前**看得见**的可提交条目（过滤与折叠之后的）。
+    fn visible_committable(&self) -> Vec<String> {
+        self.visible
+            .iter()
+            .filter(|r| self.is_checkable(r))
+            .cloned()
+            .collect()
+    }
+
+    /// 看得见的可提交条目数。
+    pub fn visible_committable_count(&self) -> usize {
+        self.visible.iter().filter(|r| self.is_checkable(r)).count()
+    }
+
+    /// 全部可提交条目数（含折叠、搜索过滤之外的）。
+    pub fn committable_count(&self) -> usize {
+        self.nodes
+            .values()
+            .filter(|n| !n.is_dir && is_committable_sign(n.sign))
+            .count()
+    }
+
+    /// 勾选当前看得见的可提交项。返回**本次新勾上**的数量。
+    ///
+    /// 只补勾、不清空已勾的 —— 已经用 Space 挑好的不该被"全选"冲掉。
+    pub fn check_visible(&mut self) -> usize {
+        let targets = self.visible_committable();
+        let mut added = 0;
+        for rel in targets {
+            if self.checked.insert(rel) {
+                added += 1;
+            }
+        }
+        added
+    }
+
+    /// 反选当前看得见的可提交项。返回反选后的勾选总数。
+    pub fn invert_visible(&mut self) -> usize {
+        for rel in self.visible_committable() {
+            if self.checked.contains(&rel) {
+                self.checked.remove(&rel);
+            } else {
+                self.checked.insert(rel);
+            }
+        }
+        self.checked.len()
+    }
+
+    /// 勾选全部可提交项（含折叠、搜索过滤之外的）。返回新勾上的数量。
     ///
     /// `?`（未版本化）永远不自动勾 —— 它还没纳入版本控制，
     /// 自动勾上会让用户误提交不该进库的东西。
-    pub fn select_committable(&mut self, on: bool) {
-        self.checked.clear();
-        if !on {
-            return;
-        }
-        for (rel, n) in &self.nodes {
-            if !n.is_dir && is_committable_sign(n.sign) {
-                self.checked.insert(rel.clone());
+    pub fn check_all_committable(&mut self) -> usize {
+        let mut added = 0;
+        let targets: Vec<String> = self
+            .nodes
+            .iter()
+            .filter(|(_, n)| !n.is_dir && is_committable_sign(n.sign))
+            .map(|(rel, _)| rel.clone())
+            .collect();
+        for rel in targets {
+            if self.checked.insert(rel) {
+                added += 1;
             }
         }
+        added
     }
 
     /// 勾选的绝对路径（按 visible 顺序，便于展示时稳定）。
@@ -506,12 +558,23 @@ impl TreePanel {
         }
     }
 
-    /// 无搜索时所有节点都可见；搜索时由 `collect_matched` 单独处理。
-    fn matches_filter(&self, rel: &str) -> bool {
-        match &self.filter {
-            None => true,
-            Some(f) => f.is_empty() || rel.to_lowercase().contains(f),
-        }
+    /// 相对路径是否命中当前过滤词。
+    ///
+    /// 与 `collect_matched` 同一套规则：关键词含 `/` 匹配整条路径，
+    /// 否则只匹配最后一段（文件名）。别处自己写一句 `contains`
+    /// 会和树上看到的对不上 —— 「按搜索预选」就成了假的所见即所得。
+    ///
+    /// 无搜索时返回 true（所有节点都可见）。
+    pub fn matches_filter(&self, rel: &str) -> bool {
+        let Some(f) = self.filter.as_deref().filter(|s| !s.is_empty()) else {
+            return true;
+        };
+        let hay = if f.contains('/') {
+            rel.to_lowercase()
+        } else {
+            rel.rsplit('/').next().unwrap_or(rel).to_lowercase()
+        };
+        hay.contains(f)
     }
 
     // ── 光标 ──────────────────────────────────────────────
@@ -689,6 +752,7 @@ impl TreePanel {
     pub fn filter(&self) -> Option<&String> {
         self.filter.as_ref()
     }
+
 
     // ── 渲染 ──────────────────────────────────────────────
 
@@ -874,6 +938,72 @@ mod refresh_state_tests {
         tree.set_filter(None);
         assert!(tree.nodes["src"].expanded);
         assert!(!tree.nodes["src/nested"].expanded);
+    }
+
+    /// 全选不该勾上树上看不见的东西：过滤之后还把隐藏项算进来，
+    /// 用户就是在为没看过的文件负责。
+    #[test]
+    fn check_visible_stops_at_what_the_user_can_see() {
+        let mut tree = TreePanel::new();
+        let root = Path::new("/wc");
+        tree.build_from_items(
+            &[
+                item("src/a.txt", 'M'),
+                item("src/b.txt", 'M'),
+                item("docs/c.txt", 'M'),
+                item("tmp/d.tmp", '?'),
+            ],
+            root,
+        );
+        assert_eq!(tree.committable_count(), 3, "未纳管的 tmp/d.tmp 不算可提交");
+
+        // 关键词含 `/` 才按整条路径匹配；只写 "src" 匹配的是文件名。
+        tree.set_filter(Some("src/".into()));
+        assert_eq!(tree.visible_committable_count(), 2);
+        assert_eq!(tree.check_visible(), 2);
+        assert!(tree.is_checked("src/a.txt"));
+        assert!(!tree.is_checked("docs/c.txt"), "过滤外的不该被勾上");
+
+        // 再按一次才扩到全部（含过滤外）。
+        assert_eq!(tree.check_all_committable(), 1);
+        assert!(tree.is_checked("docs/c.txt"));
+        assert!(!tree.is_checked("tmp/d.tmp"), "未纳管永远不自动勾");
+
+        // 重复调用不重复计数。
+        assert_eq!(tree.check_all_committable(), 0);
+        assert_eq!(tree.checked_count(), 3);
+    }
+
+    /// 反选只作用于可见范围，否则「除了这几个都要」会把过滤外的也翻进来。
+    #[test]
+    fn invert_only_flips_the_visible_range() {
+        let mut tree = TreePanel::new();
+        tree.build_from_items(
+            &[item("a.txt", 'M'), item("b.txt", 'M'), item("c.txt", 'M')],
+            Path::new("/wc"),
+        );
+        tree.set_filter(Some("a".into()));
+        assert_eq!(tree.invert_visible(), 1);
+        assert!(tree.is_checked("a.txt"));
+
+        // 再反一次：a 取消，b/c 不受影响（它们不在可见范围内）。
+        assert_eq!(tree.invert_visible(), 0);
+        assert!(!tree.is_checked("a.txt"));
+    }
+
+    /// 已经用 Space 挑好的不该被「全选」冲掉 —— 全选只补勾。
+    #[test]
+    fn check_visible_adds_without_clearing_manual_picks() {
+        let mut tree = TreePanel::new();
+        tree.build_from_items(
+            &[item("a.txt", 'M'), item("b.txt", 'M'), item("c.txt", 'M')],
+            Path::new("/wc"),
+        );
+        tree.set_checked("b.txt", true);
+        tree.set_filter(Some("a".into()));
+        assert_eq!(tree.check_visible(), 1);
+        assert!(tree.is_checked("b.txt"), "手动勾的还在");
+        assert!(tree.is_checked("a.txt"));
     }
 
     #[test]

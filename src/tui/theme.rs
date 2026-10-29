@@ -155,6 +155,39 @@ impl Theme {
     }
 }
 
+/// 字符串占多少显示列（中文 2 列）。
+///
+/// 截断一律按**列宽**算，不按字符数：把"未纳管文件"当成 5 个字符
+/// 去截 4 列，中文终端上会切出半个字。
+pub fn display_width(s: &str) -> usize {
+    Line::from(s).width()
+}
+
+/// 按显示列宽截断，截断处补一个 `…`。
+///
+/// 连一列都放不下时整段丢弃 —— 留半个字符不如什么都不留。
+pub fn fit(s: &str, width: usize) -> String {
+    if display_width(s) <= width {
+        return s.to_string();
+    }
+    let room = match width.checked_sub(1) {
+        Some(0) | None => return String::new(),
+        Some(r) => r,
+    };
+    let mut out = String::new();
+    let mut used = 0;
+    for ch in s.chars() {
+        let w = display_width(&ch.to_string());
+        if used + w > room {
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
+    out.push('…');
+    out
+}
+
 /// 空状态：居中的标题 + 若干提示行。
 ///
 /// 空**不是**错误 —— 用暗淡色而不是红色，否则"这个目录是空的"

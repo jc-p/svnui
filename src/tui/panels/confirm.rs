@@ -74,6 +74,21 @@ enum Focus {
     Field,
 }
 
+/// 条目裁剪器。
+///
+/// 「批量添加」原来只能全选或放弃：要么 `A` 把几十个未纳管文件
+/// 一股脑加进去（连 build 产物、临时文件一起），要么挨个按 `a`。
+/// 中间没有路 —— 这才是它不好用的根因，不是快捷键没给够。
+///
+/// 让清单本身可裁剪，一个框里就能完成「看清单 → 剔掉不要的 → 执行」，
+/// 不必先记住哪几个要加、再回到树上逐个找。
+struct Picks {
+    /// 按条目索引，与 `items` 同序。
+    on: Vec<bool>,
+    /// 光标所在条目（不是显示行 —— 一个条目可能换行占多行）。
+    cursor: usize,
+}
+
 /// 确认后要执行的动作。
 ///
 /// 做成枚举而不是闭包：闭包要捕获 `Svn`（不 Send）或 `Vec<PathBuf>`，
@@ -124,6 +139,8 @@ pub struct ConfirmPanel {
     toggles: Vec<Toggle>,
     field: Option<Field>,
     focus: Option<Focus>,
+    /// 条目可裁剪时才存在。不存在 = 老行为：整份清单一起执行。
+    picks: Option<Picks>,
 }
 
 impl ConfirmPanel {
@@ -146,7 +163,29 @@ impl ConfirmPanel {
             toggles: Vec::new(),
             field: None,
             focus: None,
+            picks: None,
         }
+    }
+
+    /// 让清单可裁剪，默认**全部选中**。
+    pub fn with_pick(mut self) -> Self {
+        self.picks = Some(Picks {
+            on: self.items.iter().map(|_| true).collect(),
+            cursor: 0,
+        });
+        self
+    }
+
+    /// 可裁剪 + 指定初选（用于「按当前搜索预选」）。
+    ///
+    /// 长度与 `items` 不一致时按 `items` 截断/补 `false` —— 调用方拿的是
+    /// 过滤后的下标，宁可少选也不能错位到别的文件上。
+    pub fn with_pick_selected(mut self, selected: Vec<bool>) -> Self {
+        let mut on = selected;
+        on.resize(self.items.len(), false);
+        let cursor = on.iter().position(|b| *b).unwrap_or(0);
+        self.picks = Some(Picks { on, cursor });
+        self
     }
 
     /// 附加可切换开关。返回 Self 以便链式构造。
@@ -185,6 +224,84 @@ impl ConfirmPanel {
     /// 输入框当前内容。
     pub fn field_value(&self) -> Option<&str> {
         self.field.as_ref().map(|f| f.value.as_str())
+    }
+
+    /// 清单是否可裁剪。
+    pub fn has_picks(&self) -> bool {
+        self.picks.is_some()
+    }
+
+    /// 已选 / 总数。不可裁剪时返回 `None`。
+    pub fn picked_count(&self) -> Option<(usize, usize)> {
+        let p = self.picks.as_ref()?;
+        Some((p.on.iter().filter(|b| **b).count(), p.on.len()))
+    }
+
+    /// 按选中状态取出对应下标的原始目标。
+    ///
+    /// 面板里存的是**显示文本**，真正要执行的 `Vec<PathBuf>` 在调用方手上，
+    /// 两者同序。所以这里只回下标，由调用方自己过滤 —— 面板不该知道路径。
+    pub fn picked<T: Clone>(&self, all: &[T]) -> Vec<T> {
+        match self.picks.as_ref() {
+            Some(p) => all
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| p.on.get(*i).copied().unwrap_or(false))
+                .map(|(_, v)| v.clone())
+                .collect(),
+            None => all.to_vec(),
+        }
+    }
+
+    /// 选中条目的下标；不可裁剪时返回 `None`（= 整份清单都执行）。
+    pub fn picked_indexes(&self) -> Option<Vec<usize>> {
+        let p = self.picks.as_ref()?;
+        Some(
+            p.on.iter()
+                .enumerate()
+                .filter(|(_, b)| **b)
+                .map(|(i, _)| i)
+                .collect(),
+        )
+    }
+
+    /// 光标在条目间移动；没有清单或清单为空时无动作。
+    pub fn pick_move(&mut self, delta: isize) {
+        let Some(p) = self.picks.as_mut() else {
+            return;
+        };
+        if p.on.is_empty() {
+            return;
+        }
+        let len = p.on.len() as isize;
+        let next = p.cursor as isize + delta;
+        p.cursor = next.clamp(0, len - 1) as usize;
+    }
+
+    /// Space：切换光标项。焦点在开关上时优先切开关 ——
+    /// 否则一个框里既有开关又有清单，Space 就不知道该动谁了。
+    pub fn toggle_at_cursor(&mut self) -> bool {
+        if matches!(self.focus, Some(Focus::Toggle(_))) {
+            self.toggle_focused();
+            return true;
+        }
+        let Some(p) = self.picks.as_mut() else {
+            return false;
+        };
+        if let Some(v) = p.on.get_mut(p.cursor) {
+            *v = !*v;
+            return true;
+        }
+        false
+    }
+
+    /// `a` 全选 / `n` 全不选。
+    pub fn set_all_picks(&mut self, on: bool) {
+        if let Some(p) = self.picks.as_mut() {
+            for v in &mut p.on {
+                *v = on;
+            }
+        }
     }
 
     /// 打开状态下重新定级：静态级与所有开关联动级取最高。
@@ -265,6 +382,61 @@ impl ConfirmPanel {
             Danger::Medium => Color::LightYellow,
             Danger::High => Color::LightRed,
         }
+    }
+
+    /// 条目展开成显示行：`(所属条目下标, 文本)`。
+    ///
+    /// revert / workflow 的条目是"路径 + 后果"两段，窄屏换行后一个条目
+    /// 会占多行 —— 行号 ≠ 条目号。裁剪清单要能按条目移动光标，
+    /// 靠的就是这层映射；不记录的话光标会停在条目的第二行上。
+    fn rows(&self, width: usize) -> Vec<(usize, String)> {
+        if matches!(
+            self.action,
+            ConfirmAction::Revert(_) | ConfirmAction::Workflow(_)
+        ) {
+            self.items
+                .iter()
+                .enumerate()
+                .flat_map(|(i, item)| {
+                    wrap_message(item, width)
+                        .into_iter()
+                        .map(move |row| (i, row))
+                })
+                .collect()
+        } else {
+            self.items.iter().cloned().enumerate().collect()
+        }
+    }
+
+    /// 清单里的一行。可裁剪时带复选框与光标高亮。
+    fn entry_line(&self, owner: usize, text: &str, first_line: bool, accent: Color) -> Line<'static> {
+        let Some(p) = self.picks.as_ref() else {
+            return Line::from(Span::raw(format!("  {text}")));
+        };
+        let on = p.on.get(owner).copied().unwrap_or(false);
+        let cursor = p.cursor == owner;
+        // 未选中的条目压暗：一眼看出「这批里剔掉了哪几个」。
+        let style = if cursor {
+            Style::default()
+                .fg(Color::Black)
+                .bg(accent)
+                .add_modifier(Modifier::BOLD)
+        } else if on {
+            Style::default().fg(accent)
+        } else {
+            theme::Theme::dim()
+        };
+        let mark = if !first_line {
+            "     ".to_string()
+        } else if on {
+            " [x] ".to_string()
+        } else {
+            " [ ] ".to_string()
+        };
+        Line::from(vec![
+            Span::styled(mark, style),
+            Span::styled(text.to_string(), if cursor { style } else { theme::Theme::text() }),
+        ])
     }
 
     /// 居中弹框，最大 70% 宽 / 80% 高。
@@ -348,17 +520,7 @@ impl ConfirmPanel {
         );
 
         // 路径和分支 URL 按终端宽度展开，避免关键目标被水平截断；滚动以显示行为单位。
-        let wrapped_rows;
-        let rows = if reverting || workflow {
-            wrapped_rows = self
-                .items
-                .iter()
-                .flat_map(|item| wrap_message(item, inner.width.saturating_sub(2) as usize))
-                .collect::<Vec<_>>();
-            &wrapped_rows
-        } else {
-            &self.items
-        };
+        let rows = self.rows(inner.width.saturating_sub(2) as usize);
         if rows.is_empty() {
             f.render_widget(
                 Paragraph::new("（无）").style(theme::Theme::dim()),
@@ -371,11 +533,28 @@ impl ConfirmPanel {
             if self.scroll > max_scroll {
                 self.scroll = max_scroll;
             }
+            // 光标必须跟着看得见：裁剪清单时光标跑到视口外，
+            // 用户按 Space 会切到一个看不见的条目上。
+            if let Some(p) = self.picks.as_ref() {
+                if let Some(row) = rows.iter().position(|(owner, _)| *owner == p.cursor) {
+                    if row < self.scroll {
+                        self.scroll = row;
+                    } else if row >= self.scroll + list_h {
+                        self.scroll = row + 1 - list_h;
+                    }
+                }
+            }
             let items: Vec<ListItem> = rows
                 .iter()
+                .enumerate()
                 .skip(self.scroll)
                 .take(list_h)
-                .map(|s| ListItem::new(Line::from(Span::raw(format!("  {s}")))))
+                .map(|(i, (owner, s))| {
+                    // 续行判断要看**整份列表**的前一行，不能只看本屏：
+                    // 换页后第一行的 owner 可能和上一屏末行相同。
+                    let first_line = rows.get(i.saturating_sub(1)).map(|(o, _)| *o) != Some(*owner);
+                    ListItem::new(self.entry_line(*owner, s, first_line, accent))
+                })
                 .collect();
             // ⚠️ 不能用 status_bar()：那是"黑字青底"，给顶栏设计的。
             //    用在多行列表上会变成一整片蓝底，既刺眼也盖住文字。
@@ -497,7 +676,27 @@ impl ConfirmPanel {
         } else {
             keys
         };
-        let keys = if adding {
+        let keys = if let Some((picked, total)) = self.picked_count() {
+            // 可裁剪时按键行要讲清「怎么剔除」，并实时显示已选/总数 ——
+            // 否则用户不知道自己最后到底圈了几个。
+            //
+            // 但提示太长会被 buffer 直接裁掉尾巴（80 列下 Ctrl+R 就没了），
+            // 所以按可用宽度降级：先丢细节，Y/N 永远留下。
+            let verb = if adding { "添加" } else { "执行" };
+            let core = format!(" Y {verb}选中的 {picked}/{total} 项   N 取消");
+            let detail = "   j/k 移动   Space 选中   Ctrl+A 全选   Ctrl+R 清空";
+            let room = chunks[3]
+                .width
+                .saturating_sub(theme::display_width(&core) as u16);
+            let tail = theme::fit(detail.trim_start(), room as usize);
+            Line::from(vec![
+                Span::styled(
+                    core,
+                    Style::default().fg(accent).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(tail, theme::Theme::dim()),
+            ])
+        } else if adding {
             Line::from(vec![
                 Span::styled(
                     "Y 添加  N 取消  ",
@@ -692,6 +891,119 @@ mod tests {
     }
 
     /// 等级必须写在标题里 —— 只靠边框颜色的话，配色主题一换就没人看见了。
+    /// 批量添加过去只能「全加」。裁剪清单要能真的剔掉，
+    /// 否则清单再长也只是个确认仪式。
+    #[test]
+    fn pick_list_excludes_deselected_entries_from_execution() {
+        let targets: Vec<std::path::PathBuf> =
+            (0..5).map(|i| std::path::PathBuf::from(format!("f{i}.txt"))).collect();
+        let mut panel = ConfirmPanel::new(
+            "确认加入 SVN",
+            "范围：全部未纳管项",
+            (0..5).map(|i| format!("f{i}.txt")).collect(),
+            Op::Add,
+            ConfirmAction::Add(targets.clone()),
+        )
+        .with_pick();
+        assert_eq!(panel.picked_count(), Some((5, 5)));
+
+        // 剔掉第 1、3 个。
+        panel.pick_move(1);
+        panel.toggle_at_cursor();
+        panel.pick_move(2);
+        panel.toggle_at_cursor();
+
+        assert_eq!(panel.picked_count(), Some((3, 5)));
+        let picked = panel.picked(&targets);
+        assert_eq!(
+            picked,
+            vec![
+                std::path::PathBuf::from("f0.txt"),
+                std::path::PathBuf::from("f2.txt"),
+                std::path::PathBuf::from("f4.txt"),
+            ]
+        );
+    }
+
+    /// 预选按索引对齐：宁可少选，也不能错位到别的文件上。
+    #[test]
+    fn preset_selection_aligns_with_items_and_pads_short_vectors() {
+        let mut panel = ConfirmPanel::new(
+            "确认加入 SVN",
+            "已按搜索预选",
+            vec!["a.txt".into(), "b.txt".into(), "c.txt".into()],
+            Op::Add,
+            ConfirmAction::Add(vec![]),
+        )
+        .with_pick_selected(vec![true, false]);
+        assert_eq!(panel.picked_count(), Some((1, 3)));
+        assert_eq!(
+            panel.picked_indexes(),
+            Some(vec![0]),
+            "短一截的预设补 false，不会把后面的项顶上来"
+        );
+        panel.set_all_picks(true);
+        assert_eq!(panel.picked_count(), Some((3, 3)));
+        panel.set_all_picks(false);
+        assert_eq!(panel.picked_count(), Some((0, 3)));
+    }
+
+    #[test]
+    fn pick_cursor_stays_inside_the_list() {
+        let mut panel = ConfirmPanel::new(
+            "确认加入 SVN",
+            "范围",
+            vec!["a".into(), "b".into()],
+            Op::Add,
+            ConfirmAction::Add(vec![]),
+        )
+        .with_pick();
+        panel.pick_move(-5);
+        assert_eq!(panel.picked_indexes(), Some(vec![0, 1]));
+        panel.pick_move(50);
+        // 光标到末尾，此时 Space 切的是最后一项。
+        panel.toggle_at_cursor();
+        assert_eq!(panel.picked_indexes(), Some(vec![0]));
+    }
+
+    /// 不可裁剪的框必须保持老行为：picked 返回全部。
+    #[test]
+    fn panels_without_picks_execute_everything() {
+        let targets = vec![std::path::PathBuf::from("x")];
+        let panel = ConfirmPanel::new(
+            "清理",
+            "执行清理",
+            vec!["x".into()],
+            Op::Cleanup,
+            ConfirmAction::Cleanup,
+        );
+        assert!(!panel.has_picks());
+        assert_eq!(panel.picked_indexes(), None);
+        assert_eq!(panel.picked(&targets), targets);
+    }
+
+    /// 可裁剪时按键行要给出「怎么剔除」，并把已选/总数写出来。
+    #[test]
+    fn pickable_panel_explains_how_to_trim_the_list() {
+        let mut panel = ConfirmPanel::new(
+            "确认加入 SVN",
+            "范围",
+            vec!["a".into(), "b".into(), "c".into()],
+            Op::Add,
+            ConfirmAction::Add(vec![]),
+        )
+        .with_pick();
+        panel.toggle_at_cursor();
+        let wide = render(&mut panel, 120, 20);
+        for expected in ["Y添加选中的2/3项", "Space选中", "Ctrl+A全选", "Ctrl+R清空"] {
+            assert!(wide.contains(expected), "宽屏缺少 {expected}：{wide}");
+        }
+        // 窄屏放不下全部提示：降级保住 Y/N，不能静默把整行裁掉。
+        let narrow = render(&mut panel, 60, 20);
+        assert!(narrow.contains("Y添加选中的2/3项"), "窄屏丢了确认键：{narrow}");
+        assert!(narrow.contains("N取消"), "窄屏丢了取消键：{narrow}");
+    }
+
     #[test]
     fn danger_label_appears_in_title() {
         let mut panel = ConfirmPanel::new(
