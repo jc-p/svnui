@@ -21,6 +21,8 @@ pub enum Op {
     Resolve,
     Cleanup,
     PurgeMine,
+    /// 加锁 / 解锁。不删任何东西，但会挡住别人的提交。
+    Lock,
 }
 
 impl std::fmt::Display for Op {
@@ -42,6 +44,7 @@ impl std::fmt::Display for Op {
             Op::Resolve => "resolve",
             Op::Cleanup => "cleanup",
             Op::PurgeMine => "purge-mine",
+            Op::Lock => "lock",
         };
         f.write_str(s)
     }
@@ -85,6 +88,9 @@ pub fn danger_of(op: Op) -> Danger {
         Op::Revert => Danger::High,
         // 基础 cleanup 只是解锁，安全；带 remove 参数由调用方升级为 High。
         Op::Cleanup => Danger::Low,
+        // 锁不删文件、不丢改动，但会**挡住同组其他人提交** ——
+        // 误锁一次，全组都得等你解锁。按"影响他人"定中危。
+        Op::Lock => Danger::Medium,
     }
 }
 
@@ -117,6 +123,13 @@ mod tests {
         for op in [Op::Status, Op::Diff, Op::Log, Op::Info] {
             assert_eq!(danger_of(op), Danger::Safe);
         }
+    }
+
+    /// 锁不删文件，但挡住别人提交 —— 按「影响他人」定中危，不能算低危。
+    #[test]
+    fn lock_is_medium_because_it_blocks_others() {
+        assert_eq!(danger_of(Op::Lock), Danger::Medium);
+        assert!(danger_of(Op::Lock).needs_confirm());
     }
 
     #[test]

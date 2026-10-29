@@ -198,6 +198,12 @@ enum BgDone {
     RevDiff(u64, crate::domain::Result<String>),
     /// 冲突三路内容加载完成。
     ConflictContent(crate::domain::Result<String>),
+    /// `svn blame` 结果（展示名, 输出）。
+    Blame(String, crate::domain::Result<String>),
+    /// `svn info` 结果（工作副本信息，只读展示）。
+    Info(crate::domain::Result<crate::domain::RepoInfo>),
+    /// 两个版本之间的 diff（基准版本, 目标版本, 结果）。
+    RangeDiff(u64, u64, crate::domain::Result<String>),
 }
 
 pub struct App {
@@ -1193,6 +1199,70 @@ impl App {
                     }
                 }
 
+                BgDone::Blame(name, Ok(out)) => {
+                    self.busy = None;
+                    if out.trim().is_empty() {
+                        self.notice = Some(Notice::new(format!("{name} 没有可追溯的内容（未纳入版本控制？）")));
+                    } else {
+                        // 全屏看：blame 一屏放不下，右栏太窄。
+                        self.diff = Some(PreviewPanel::blame(name, &out));
+                        self.mode = Mode::Diff;
+                    }
+                }
+                BgDone::Blame(_, Err(e)) => {
+                    self.busy = None;
+                    self.notify_error("svn blame 失败", &e);
+                }
+                BgDone::Info(Ok(info)) => {
+                    self.busy = None;
+                    // 只读展示，不做任何推断：字段没有就写「（无）」，
+                    // 硬凑一个看起来合理的分支名反而误导。
+                    let mut text = String::new();
+                    let mut push = |k: &str, v: &str| {
+                        text.push_str(&format!("{k}：{}\n", if v.is_empty() { "（无）" } else { v }));
+                    };
+                    push("工作副本根", info.root.as_str());
+                    push("URL", &info.url);
+                    push("相对 URL", info.relative_url.as_deref().unwrap_or(""));
+                    push("版本", &format!("r{}", info.revision));
+                    push("仓库根", info.repository_root.as_deref().unwrap_or(""));
+                    push("仓库 UUID", info.uuid.as_deref().unwrap_or(""));
+                    if let Some(b) = info.branch_name() {
+                        push("分支", &b);
+                    }
+                    self.diff = Some(PreviewPanel::with_lines(
+                        crate::tui::panels::preview::Kind::Notice,
+                        "仓库信息",
+                        text.lines()
+                            .map(|l| ratatui::text::Line::raw(l.to_string()))
+                            .collect(),
+                        Some("svn info · Esc 返回".to_string()),
+                    ));
+                    self.mode = Mode::Diff;
+                }
+                BgDone::RangeDiff(from, to, Ok(out)) => {
+                    self.busy = None;
+                    if out.trim().is_empty() {
+                        self.notice = Some(Notice::new(format!("r{from} 到 r{to} 之间没有改动")));
+                    } else {
+                        let name = format!("r{from} → r{to}");
+                        self.diff = Some(PreviewPanel::diff_with_limits(
+                            name,
+                            &shorten_paths(&out, &self.root.to_string_lossy()),
+                            false,
+                            false,
+                        ));
+                        self.mode = Mode::Diff;
+                    }
+                }
+                BgDone::RangeDiff(_, _, Err(e)) => {
+                    self.busy = None;
+                    self.notify_error("读取版本区间改动失败", &e);
+                }
+                BgDone::Info(Err(e)) => {
+                    self.busy = None;
+                    self.notify_error("读取仓库信息失败", &e);
+                }
                 BgDone::ConflictContent(res) => {
                     if let Some(p) = self.conflict.as_mut() {
                         p.set_content(res.unwrap_or_default());
@@ -1632,6 +1702,28 @@ impl App {
                 self.notice = Some(Notice::new("已清空勾选"));
             }
 
+            // Ctrl+B = svn blame：这一行最后是谁改的、在哪一版改的。
+            //
+            // svn 层早就实现了，TUI 一直没入口，想看只能退出去敲命令行。
+            // blame 是联网操作（要问服务器），所以走后台，不卡界面。
+            KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.do_blame();
+            }
+            // I = svn info：当前工作副本到底连着哪个仓库、哪个分支。
+            //
+            // 顶栏那一行只放得下「分支@版本号」，URL / 仓库根 / UUID
+            // 都看不到 —— 连错仓库时最容易犯的错就是没地方核对。
+            KeyCode::Char('I') => self.do_info(),
+
+            // Ctrl+L = svn lock / unlock：锁住文件防止别人同时改。
+            //
+            // 加锁会**影响别人**（别人提交会被拒），所以走确认框。
+            // 加/解用一个开关切换而不是两个快捷键：Ctrl+Shift+L 在多数
+            // 终端里送不出独立的键码，硬分两个键会有一个永远按不到。
+            KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.confirm_lock();
+            }
+
             // Ctrl+K = svn cleanup：只解锁、清中断的操作，不删任何文件。
             //
             // 删除开关原来写死成 false（CLI 有 --remove-unversioned / --remove-ignored），
@@ -1949,6 +2041,16 @@ impl App {
                             self.do_delete_confirmed(paths, keep_local);
                         }
                     }
+                    // unlock 以开关为准：默认加锁，打开开关才解锁。
+                    ConfirmAction::Lock(paths, _) => {
+                        let paths = pick_by(&paths, picked.as_deref());
+                        let unlock = toggles.first().copied().unwrap_or(false);
+                        if paths.is_empty() {
+                            self.notice = Some(Notice::new("没有要加锁/解锁的项"));
+                        } else {
+                            self.do_lock_confirmed(paths, unlock);
+                        }
+                    }
                     ConfirmAction::Cleanup => {
                         let remove_unversioned = toggles.first().copied().unwrap_or(false);
                         let remove_ignored = toggles.get(1).copied().unwrap_or(false);
@@ -2122,6 +2224,40 @@ impl App {
             // 放在历史面板里而不是主界面，是因为"回退到哪一版"这个决定
             // 只能看着历史做 —— 在主界面按 R 得先记住版本号再输一遍，
             // 链路断了，功能等于没有。
+            // d：把当前版本标为对比基准；D：与基准做区间 diff。
+            //
+            // 单版本 diff（Enter）只回答"这一版改了什么"；
+            // "这两个版本之间累计动了多少"要两个版本才能问出来。
+            // 用 d/D 而不是两个对称的键，是因为基准只有一个方向：
+            // svn 的 -r A:B 会自己排序，反着选也能用。
+            KeyCode::Char('d') => {
+                if let Some(rev) = panel.selected_rev() {
+                    if panel.toggle_mark(rev) {
+                        self.notice = Some(Notice::new(format!(
+                            "已把 r{rev} 设为对比基准，移到另一版本按 D 对比"
+                        )));
+                    } else {
+                        self.notice = Some(Notice::new("已取消对比基准"));
+                    }
+                }
+            }
+            KeyCode::Char('D') => {
+                let rev = panel.selected_rev();
+                let mark = panel.mark();
+                match (mark, rev) {
+                    (None, _) => {
+                        self.notice = Some(Notice::new("先按 d 标记一个版本作为对比基准"))
+                    }
+                    (Some(m), Some(r)) if m == r => {
+                        self.notice = Some(Notice::new("基准和当前是同一个版本，先移到另一个版本"))
+                    }
+                    (Some(m), Some(r)) => {
+                        self.spawn_range_diff(m, r);
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+            }
             KeyCode::Char('r') | KeyCode::Char('R') => return self.do_revert_to_rev(),
             KeyCode::Char('j') | KeyCode::Down => panel.move_down(),
             KeyCode::Char('k') | KeyCode::Up => panel.move_up(),
@@ -2701,6 +2837,133 @@ impl App {
         self.spawn_busy("svn revert", move |svn| {
             svn.revert(&paths, false)?;
             Ok(format!("已撤销 {} 个目标的本地改动", n))
+        });
+    }
+
+    /// `D`：两个版本之间的累计改动（`svn diff -r A:B`）。
+    fn spawn_range_diff(&mut self, from: u64, to: u64) {
+        let svn = self.svn.clone();
+        let tx = self.tx.clone();
+        self.busy = Some(format!("对比 r{from} → r{to}"));
+        self.busy_start = Some(Instant::now());
+        std::thread::spawn(move || {
+            let res = svn.rev_range_diff(from, to).map(|o| o.stdout);
+            let _ = tx.send(BgDone::RangeDiff(from, to, res));
+        });
+    }
+
+    /// `Ctrl+B`：`svn blame`。
+    ///
+    /// 对未纳管文件无意义（服务器根本不知道它存在），直接挡掉，
+    /// 免得等一次网络往返只换来一句报错。
+    fn do_blame(&mut self) {
+        let Some(node) = self.tree.selected().cloned() else {
+            self.notice = Some(Notice::new("请先选中要追溯的文件"));
+            return;
+        };
+        if node.is_dir {
+            self.notice = Some(Notice::new("目录不能逐行追溯，请把光标移到文件上"));
+            return;
+        }
+        if matches!(node.sign, '?' | 'I' | 'X') {
+            self.notice = Some(Notice::new(
+                "这个文件还没纳入版本控制，服务器不知道它是谁写的（先按 a 添加）",
+            ));
+            return;
+        }
+        let name = pretty_path(&node.rel, &self.root, 60);
+        let svn = self.svn.clone();
+        let tx = self.tx.clone();
+        let abs = node.abs.clone();
+        self.busy = Some(format!("追溯 {name}"));
+        self.busy_start = Some(Instant::now());
+        std::thread::spawn(move || {
+            let res = svn.blame(&abs);
+            let _ = tx.send(BgDone::Blame(name, res));
+        });
+    }
+
+    /// `I`：`svn info` 只读视图。
+    fn do_info(&mut self) {
+        let svn = self.svn.clone();
+        let tx = self.tx.clone();
+        self.busy = Some("读取仓库信息".to_string());
+        self.busy_start = Some(Instant::now());
+        std::thread::spawn(move || {
+            let res = svn.info();
+            let _ = tx.send(BgDone::Info(res));
+        });
+    }
+
+    /// `Ctrl+L` 加锁 / 解锁（开关切换）。
+    ///
+    /// 范围沿用勾选集合，没有勾选就用当前项 —— 和其他破坏性操作一致，
+    /// 免得每加一个操作就多一套选目标的规矩。
+    fn confirm_lock(&mut self) {
+        let (scope, mut paths) = if self.tree.checked_count() > 0 {
+            let paths: Vec<PathBuf> = self
+                .items
+                .iter()
+                .filter(|item| self.tree.is_checked(&item.rel))
+                .map(|item| self.root.join(&item.rel))
+                .collect();
+            (
+                format!("已勾选 {} 项", paths.len()),
+                paths,
+            )
+        } else if let Some(node) = self.tree.selected() {
+            (
+                format!("当前项 {}", node.rel),
+                vec![node.abs.clone()],
+            )
+        } else {
+            self.notice = Some(Notice::new("请先选中文件或勾选要加锁的项"));
+            return;
+        };
+        paths.sort();
+        paths.dedup();
+        if paths.is_empty() {
+            self.notice = Some(Notice::new("没有可加锁的项"));
+            return;
+        }
+        let entries = paths
+            .iter()
+            .map(|p| {
+                p.strip_prefix(&self.root)
+                    .unwrap_or(p)
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        self.confirm = Some(
+            ConfirmPanel::new(
+                format!("确认加锁/解锁：{} 项", paths.len()),
+                format!(
+                    "范围：{scope}\n\
+                     默认**加锁**：期间别人提交这些文件会被拒绝，改完记得来解锁。\n\
+                     打开下面开关则改为解锁。"
+                ),
+                entries,
+                Op::Lock,
+                ConfirmAction::Lock(paths, false),
+            )
+            .with_toggles(vec![Toggle::with_danger(
+                "解锁（而不是加锁）",
+                false,
+                Danger::Low,
+                Danger::Medium,
+            )])
+            .with_pick(),
+        );
+        self.mode = Mode::Confirm;
+    }
+
+    fn do_lock_confirmed(&mut self, paths: Vec<PathBuf>, unlock: bool) {
+        let n = paths.len();
+        let verb = if unlock { "解锁" } else { "加锁" };
+        self.spawn_busy(format!("svn {} {}", if unlock { "unlock" } else { "lock" }, "").trim(), move |svn| {
+            svn.lock(&paths, unlock)?;
+            Ok(format!("已{} {} 项", verb, n))
         });
     }
 

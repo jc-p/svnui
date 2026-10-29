@@ -404,6 +404,25 @@ impl Svn {
         self.op_no_targets(&["diff".to_string(), "-c".to_string(), r])
     }
 
+    /// `svn diff -r FROM:TO`：两个版本之间改了什么。
+    ///
+    /// 与 `rev_diff`（`-c REV`，单个版本引入的变化）区分开：
+    /// 这个回答的是"从 A 到 B 累计改了哪些"，跨多个提交。
+    pub fn rev_range_diff(&self, from: u64, to: u64) -> Result<RawOutput> {
+        let (a, b) = if from <= to {
+            (from, to)
+        } else {
+            // 反着选也让它能用：svn 的 -r A:B 要求 A<B，
+            // 让用户自己去想"谁在前面"是没必要的心智负担。
+            (to, from)
+        };
+        self.op_no_targets(&[
+            "diff".to_string(),
+            "-r".to_string(),
+            format!("{}:{}", a, b),
+        ])
+    }
+
     pub fn log(&self, limit: usize, paths: &[PathBuf]) -> Result<Vec<LogEntry>> {
         self.log_search(limit, paths, None)
     }

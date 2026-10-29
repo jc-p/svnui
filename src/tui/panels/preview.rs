@@ -32,6 +32,8 @@ pub enum Kind {
     File,
     Notice,
     Image,
+    /// `svn blame`：每行最后一个改动者。
+    Blame,
 }
 
 /// 滚动条命中结果。拖拽滚动条时用。
@@ -164,6 +166,53 @@ impl PreviewPanel {
         let mut p = Self::file(title, content);
         p.banner = Some(banner.into());
         p
+    }
+
+    /// 已渲染行的纯文本（测试用：验证解析结果，不依赖终端绘制）。
+    #[cfg(test)]
+    pub(crate) fn lines_text(&self) -> Vec<String> {
+        self.lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|sp| sp.content.clone())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    /// `svn blame` 结果。
+    ///
+    /// 输出形如 ` 41 pengjiecheng fn main() {`，每行三部分：版本、作者、正文。
+    /// 作者用 `author()` 语义色（和提交历史里同一个色）——
+    /// 同一件事在两个面板里不该是两种颜色。
+    pub fn blame(title: impl Into<String>, content: &str) -> Self {
+        let total = content.lines().count();
+        let lines: Vec<Line<'static>> = content
+            .lines()
+            .take(MAX_LINES)
+            .map(|l| {
+                // svn blame 的前两列是右对齐的定宽字段，但不能假设宽度：
+                // 作者名长度不同时列宽会变，用 split_whitespace 拆更稳。
+                let mut it = l.splitn(3, char::is_whitespace);
+                let rev = it.next().unwrap_or("").to_string();
+                let author = it.next().unwrap_or("").to_string();
+                let rest = it.next().unwrap_or("").trim_start_matches(|c: char| c.is_whitespace());
+                let spans = vec![
+                    Span::styled(format!("{rev:>6} "), theme::Theme::dim()),
+                    Span::styled(format!("{author:<12} "), theme::Theme::author()),
+                    Span::raw(rest.replace('\t', "    ")),
+                ];
+                Line::from(spans)
+            })
+            .collect();
+        let banner = if total > MAX_LINES {
+            Some(format!(" 只显示前 {} 行（共 {} 行）", MAX_LINES, total))
+        } else {
+            None
+        };
+        Self::with_lines(Kind::Blame, title, lines, banner)
     }
 
     /// 直接用现成的着色行构造（历史版本 diff 用）。
@@ -314,6 +363,7 @@ impl PreviewPanel {
             Kind::File => "预览",
             Kind::Notice => "信息",
             Kind::Image => "图片",
+            Kind::Blame => "逐行追溯",
         };
         let block = theme::block()
             .borders(Borders::ALL)
@@ -612,4 +662,32 @@ pub fn read_file(path: &std::path::Path) -> std::io::Result<String> {
         FileContent::Disabled(reason) => reason,
         FileContent::Image { .. } => "图片文件，请使用图片预览面板查看".into(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// blame 的每行是「版本 作者 正文」。作者名长度不固定，
+    /// 所以不能按固定列宽切，必须按空白拆。
+    #[test]
+    fn blame_splits_rev_author_and_text() {
+        let out = "  41   pengjiecheng fn main() {\n  17   alice       let x = 1;";
+        let panel = PreviewPanel::blame("a.rs", out);
+        assert_eq!(panel.kind, Kind::Blame);
+        // 两行都进来了，且正文没被吃掉。
+        let flat: String = panel
+            .lines_text()
+            .join("\n");
+        assert!(flat.contains("fn main() {"), "{flat}");
+        assert!(flat.contains("let x = 1;"), "{flat}");
+        assert!(flat.contains("pengjiecheng"), "{flat}");
+        assert!(flat.contains("alice"), "{flat}");
+    }
+
+    #[test]
+    fn blame_keeps_tab_free_text_readable() {
+        let panel = PreviewPanel::blame("a.rs", "  1   bob\tif (x) {");
+        assert!(!panel.lines_text().join("").contains('\t'));
+    }
 }

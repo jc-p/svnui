@@ -35,6 +35,11 @@ pub struct LogPanel {
     detail: Option<Vec<String>>,
     /// 当前在看的修订号，避免重复请求。
     detail_rev: Option<u64>,
+    /// 区间对比的基准版本（`d` 标记）。
+    ///
+    /// 单版本 diff（Enter）回答"这一版改了什么"；
+    /// "这两个版本之间到底动了多少"只能靠区间。
+    mark: Option<u64>,
 }
 
 
@@ -53,6 +58,7 @@ impl LogPanel {
             state,
             detail: None,
             detail_rev: None,
+            mark: None,
         }
     }
 
@@ -125,6 +131,21 @@ impl LogPanel {
 
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// 基准版本。
+    pub fn mark(&self) -> Option<u64> {
+        self.mark
+    }
+
+    /// 标记/取消基准版本。重复标记同一个版本视为取消。
+    pub fn toggle_mark(&mut self, rev: u64) -> bool {
+        if self.mark == Some(rev) {
+            self.mark = None;
+            return false;
+        }
+        self.mark = Some(rev);
+        true
     }
 
     pub fn selected_rev(&self) -> Option<u64> {
@@ -236,11 +257,18 @@ impl LogPanel {
             }
             (None, None) => format!(" 提交历史（{} 条）", self.entries.len()),
         };
+        // 基准版本要看得见：不然按 D 时用户不知道自己在跟谁比。
+        let title = match self.mark {
+            Some(m) => format!("{title} · 基准 r{m}，按 D 与当前版本对比"),
+            None => title,
+        };
         let list_block = theme::block()
             .borders(Borders::ALL)
             .title(title)
             .title_bottom(
-                Line::from(" j/k 移动 | R 回退到此版本 | / 搜索全部历史 | N 加载更早 | Esc 返回 ")
+                Line::from(
+                    " j/k 移动 | d 设对比基准 | D 区间对比 | R 回退到此版本 | / 搜索 | N 加载更早 | Esc 返回 ",
+                )
                     .alignment(Alignment::Right),
             )
             .border_style(theme::Theme::border_active());
@@ -381,5 +409,34 @@ fn truncate(s: &str, n: usize) -> String {
         s.to_string()
     } else {
         format!("{}…", s.chars().take(n.saturating_sub(1)).collect::<String>())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(rev: u64) -> LogEntry {
+        LogEntry {
+            revision: rev,
+            author: "a".into(),
+            date: "2026-01-01".into(),
+            msg: "m".into(),
+            paths: Vec::new(),
+        }
+    }
+
+    /// 标记是"开关"：同一个版本再按一次应该取消，
+    /// 否则用户改主意想换个基准时得先 Esc 重进。
+    #[test]
+    fn mark_toggles_and_reports_its_state() {
+        let mut panel = LogPanel::new(vec![entry(10), entry(11), entry(12)]);
+        assert_eq!(panel.mark(), None);
+        assert!(panel.toggle_mark(11));
+        assert_eq!(panel.mark(), Some(11));
+        assert!(panel.toggle_mark(12), "换个基准直接生效，不用先取消");
+        assert_eq!(panel.mark(), Some(12));
+        assert!(!panel.toggle_mark(12), "同一个版本再按一次 = 取消");
+        assert_eq!(panel.mark(), None);
     }
 }

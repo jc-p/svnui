@@ -115,6 +115,11 @@ pub enum ConfirmAction {
     /// 反向合并回到指定版本（历史面板里按 R）。
     /// 带版本号是为了确认框里能写清楚"要回到哪一版"。
     RevertToRev(u64),
+    /// `svn lock` / `svn unlock`。第二参数为 `unlock`。
+    ///
+    /// 不删文件、不丢改动，但加锁期间**别人提交会被拒绝** ——
+    /// 影响他人，所以走确认框（危险级由 policy 定）。
+    Lock(Vec<std::path::PathBuf>, bool),
     /// 树冲突的「恢复服务器版本」。
     ///
     /// ⚠ 树冲突**只能** resolve 到 `working` —— `mine-full` / `theirs-full`
@@ -647,6 +652,9 @@ impl ConfirmPanel {
             ConfirmAction::Resolve(_, _) => "应用该方案",
             ConfirmAction::RevertToRev(_) => "回退（需再提交一次）",
             ConfirmAction::RestoreFromRepo(_) => "恢复服务器版本（本地改动将丢失）",
+            ConfirmAction::Lock(_, unlock) => {
+                if *unlock { "解锁（其他人可提交）" } else { "加锁（期间别人提交会被拒）" }
+            }
             ConfirmAction::Cleanup => "执行清理",
         };
         let keys = Line::from(vec![
