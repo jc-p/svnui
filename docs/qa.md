@@ -1,9 +1,9 @@
 # Q&A
 
-适用于 svnui 0.7.1。先运行 `svnui --version`、`command -v svnui`，确认正在使用哪个程序。
+适用于 svnui 0.7.2；历史修复的起始版本在对应章节说明。先运行 `svnui --version`、`command -v svnui`，确认正在使用哪个程序。
 本文集中记录实际遇到的问题；发布与源码步骤另见 [PUBLISH.md](../PUBLISH.md)，配色选项见 [主题配置](theme.md)。
 
-[下载与安装](#manual-install) · [认证与证书](#authentication) · [外观与输入](#appearance) ·
+[下载与安装](#manual-install) · [认证与证书](#authentication) · [AI 提交信息](#ai-commit) · [外观与输入](#appearance) ·
 [文件树与撤销](#selection) · [构建与发布](#publishing) · [其他排查](#other-troubleshooting)
 
 <a id="manual-install"></a>
@@ -21,26 +21,26 @@
 
 ### Q：不用在线安装脚本，怎样手动安装？
 
-以 Apple Silicon 的 0.7.1 为例：将 [安装包](https://github.com/jc-p/svnui/releases/download/0.7.1/svnui-0.7.1-aarch64-apple-darwin.tar.gz)
-和 [SHA256SUMS](https://github.com/jc-p/svnui/releases/download/0.7.1/SHA256SUMS) 下载到 `~/Downloads`。
+以 Apple Silicon 的 0.7.2 为例：将 [安装包](https://github.com/jc-p/svnui/releases/download/0.7.2/svnui-0.7.2-aarch64-apple-darwin.tar.gz)
+和 [SHA256SUMS](https://github.com/jc-p/svnui/releases/download/0.7.2/SHA256SUMS) 下载到 `~/Downloads`。
 
 先校验实际下载的那一个包，预期显示文件名与 `OK`：
 
 ```bash
 cd "$HOME/Downloads"
-awk '$2 == "svnui-0.7.1-aarch64-apple-darwin.tar.gz"' SHA256SUMS | shasum -a 256 -c -
+awk '$2 == "svnui-0.7.2-aarch64-apple-darwin.tar.gz"' SHA256SUMS | shasum -a 256 -c -
 ```
 
 只在校验通过后安装；Intel 用户将文件名中的 `aarch64` 换成 `x86_64`：
 
 ```bash
 mkdir -p "$HOME/.local/bin"
-tar -xzf svnui-0.7.1-aarch64-apple-darwin.tar.gz -C "$HOME/.local/bin" svnui
+tar -xzf svnui-0.7.2-aarch64-apple-darwin.tar.gz -C "$HOME/.local/bin" svnui
 chmod 755 "$HOME/.local/bin/svnui"
 "$HOME/.local/bin/svnui" --version
 ```
 
-预期版本为 `svnui 0.7.1`。校验失败或下载内容不是 tar.gz 时，停止安装并重新下载官方附件。
+预期版本为 `svnui 0.7.2`。校验失败或下载内容不是 tar.gz 时，停止安装并重新下载官方附件。
 不要把 `shasum -c SHA256SUMS` 对“未下载的另一架构包”的缺失提示误认为当前包损坏。
 
 ### Q：GitHub 下载失败，或者下载回来的是 HTML？
@@ -54,11 +54,11 @@ chmod 755 "$HOME/.local/bin/svnui"
 以下 Apple Silicon 命令已验证；Intel 用户将 `aarch64` 替换为 `x86_64`：
 
 ```bash
-mkdir -p "$HOME/Downloads/svnui-0.7.1"
-gh release download 0.7.1 --repo jc-p/svnui \
-  --pattern 'svnui-0.7.1-aarch64-apple-darwin.tar.gz' \
-  --pattern SHA256SUMS --dir "$HOME/Downloads/svnui-0.7.1"
-cd "$HOME/Downloads/svnui-0.7.1"
+mkdir -p "$HOME/Downloads/svnui-0.7.2"
+gh release download 0.7.2 --repo jc-p/svnui \
+  --pattern 'svnui-0.7.2-aarch64-apple-darwin.tar.gz' \
+  --pattern SHA256SUMS --dir "$HOME/Downloads/svnui-0.7.2"
+cd "$HOME/Downloads/svnui-0.7.2"
 ```
 
 此时手动校验命令从当前目录执行，无需再切回 `~/Downloads`。
@@ -217,6 +217,58 @@ svn list --xml --non-interactive "https://svn.example.com/repo/trunk/project/"
 ```
 
 如果这里也失败，先处理底层 SVN 的认证、证书或授权；更换主题和字体不会改变访问权限。
+
+<a id="ai-commit"></a>
+## Codex 生成提交信息
+
+### Q：Codex 已登录，Ctrl+G 为什么还是本地规则？
+
+Codex 通道从 0.7.2 起提供；使用 0.7.1 或更早版本时，先升级再配置 `provider = "codex"`。
+在已有 `[llm]` 段设置 `enabled = true`、`provider = "codex"`，再运行：
+
+```bash
+codex --version
+codex login status
+svnui llm
+svnui llm --test
+```
+
+最后一条会发送一个最小请求，前几条只检查本地状态。生成失败时面板显示回退原因，
+不要把规则候选误认为模型已经接通。Codex 需要出现在启动 svnui 的 PATH 中，
+也可在 `codex_bin` 设置绝对路径；相对的 `./codex` 不受支持，因为任务会切换到临时目录。
+
+### Q：是否需要复制 Codex 的 Key、模型和地址？
+
+不需要。生成通过 Codex CLI 执行，认证的读取和刷新交给 Codex，不复制到 svnui 配置。
+Codex 通道忽略 svnui 原有 HTTP `base_url`、`model`、`api_key_env`；
+`CODEX_HOME` 可指定原有 Codex 配置目录，但必须是绝对路径。
+继承的是 CLI 配置和登录，桌面端某次聊天临时选择的模型或上下文不会自动变成提交任务的上下文。
+
+### Q：为什么没有加载我的项目说明、MCP 或技能？
+
+提交生成是短文本任务，输入由 svnui 的勾选清单决定。为遵守 `send_diff`，
+任务在私有临时目录运行，禁用工程说明、技能说明、MCP、插件、hooks 和内置工具。
+否则模型即使处于只读模式，也可能继续扫描其他文件，扩大分析范围。
+已验证的 CLI 仍附加全局用户说明；工程说明禁用并不会清空全局规则，规则较长时会增加上下文开销。
+个人提交格式要求可写入 svnui 的 `extra_prompt`，不需要给生成任务开放工程操作工具。
+
+### Q：生成超时、CLI 参数不兼容，或结果格式不对？
+
+配置示例给 Codex 90 秒。首次启动、网络或继承的较高推理设置可能增加延迟；
+先用 `svnui llm --test` 区分连通性与实际改动分析，再按需调大 `timeout_secs`。
+失败会回退本地规则，不覆盖手工编辑，不自动重试或切换服务商。
+
+已用 Codex CLI 0.163.0 验证。CLI 需支持 `exec`、`--ephemeral`、`--ignore-rules`、输出 schema 和相应工具禁用开关。
+老版本不兼容时应升级 CLI；不会去掉隔离限制来强行重试。
+CLI 升级后可先用本机替身复核工具隔离（需已构建当前源码，缺少 CLI 时跳过）：
+
+```bash
+python3 -B -m unittest discover -s tests -p codex_cli_wire.py
+```
+
+这个回归只请求本机临时接口，不使用真实模型或凭据。
+任务只采用最终结构化输出，CLI 进度、原始错误和可能含认证信息的诊断不会被填入提交框。
+Unix 上超时会清理本次任务进程组，成功和失败都会清理私有临时目录。
 
 <a id="appearance"></a>
 ## 外观、输入与项目切换

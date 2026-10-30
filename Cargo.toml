@@ -37,6 +37,8 @@ docs = ["dep:csv", "dep:calamine", "dep:docx-lite"]
 ureq = { version = "2", features = ["json"] }
 # 解析 ~/.config/svnui/config.toml
 toml = "0.8"
+# Codex 短任务的私有临时目录与输出文件；沿用测试已使用的依赖。
+tempfile = "3"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -78,8 +80,6 @@ notify = "6"
 # 测试里要构造 Utf8PathBuf / 解析 JSON，所以这两个必须在这里再列一次。
 camino = { version = "1", features = ["serde1"] }
 serde_json = "1"
-# 集成测试造临时工作副本用
-tempfile = "3"
 
 [profile.release]
 strip = true

@@ -20,7 +20,7 @@ Subversion 的 TUI 客户端。用 Rust + [ratatui](https://github.com/ratatui/r
 
 ## 下载与安装
 
-当前正式版 **[0.7.1](https://github.com/jc-p/svnui/releases/tag/0.7.1)**，提供 macOS 11+ 的双架构安装包。
+当前正式版 **[0.7.2](https://github.com/jc-p/svnui/releases/tag/0.7.2)**，提供 macOS 11+ 的双架构安装包。
 下载二进制无需 Rust；使用 SVN 功能需要本机有 `svn`，可先运行 `svn --version --quiet` 检查。
 Linux 等其他系统请[从源码构建](#从源码构建)。
 
@@ -45,7 +45,7 @@ svnui --version
 指定版本或安装目录：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/jc-p/svnui/main/install.sh | bash -s -- --version 0.7.1 --bin-dir "$HOME/.local/bin"
+curl -fsSL https://raw.githubusercontent.com/jc-p/svnui/main/install.sh | bash -s -- --version 0.7.2 --bin-dir "$HOME/.local/bin"
 ```
 
 不想执行在线脚本，可以使用下面的官方安装包，按 [Q&A 的手动安装步骤](docs/qa.md#manual-install) 校验并安装。
@@ -53,13 +53,13 @@ GitHub 网页或脚本域名连接失败时，Q&A 也提供已验证的 GitHub C
 
 ### 直接下载安装包
 
-| Mac 类型 | `uname -m` | 0.7.1 安装包 |
+| Mac 类型 | `uname -m` | 0.7.2 安装包 |
 |---|---|---|
-| Apple Silicon（M 系列） | `arm64` | [下载 ARM64](https://github.com/jc-p/svnui/releases/download/0.7.1/svnui-0.7.1-aarch64-apple-darwin.tar.gz) |
-| Intel，或运行在 Rosetta 下的终端 | `x86_64` | [下载 x86_64](https://github.com/jc-p/svnui/releases/download/0.7.1/svnui-0.7.1-x86_64-apple-darwin.tar.gz) |
+| Apple Silicon（M 系列） | `arm64` | [下载 ARM64](https://github.com/jc-p/svnui/releases/download/0.7.2/svnui-0.7.2-aarch64-apple-darwin.tar.gz) |
+| Intel，或运行在 Rosetta 下的终端 | `x86_64` | [下载 x86_64](https://github.com/jc-p/svnui/releases/download/0.7.2/svnui-0.7.2-x86_64-apple-darwin.tar.gz) |
 
-[SHA256SUMS](https://github.com/jc-p/svnui/releases/download/0.7.1/SHA256SUMS) ·
-[源码提交与产物清单](https://github.com/jc-p/svnui/releases/download/0.7.1/manifest.json) ·
+[SHA256SUMS](https://github.com/jc-p/svnui/releases/download/0.7.2/SHA256SUMS) ·
+[源码提交与产物清单](https://github.com/jc-p/svnui/releases/download/0.7.2/manifest.json) ·
 [查看最新 Release](https://github.com/jc-p/svnui/releases/latest)
 
 选择 `svnui-版本-架构.tar.gz`，Release 页面里的 **Source code** 是源码，不是可直接运行的程序。
@@ -96,7 +96,7 @@ mkdir -p "$HOME/.local/bin"
 ./install-local.sh --no-build --bin-dir "$HOME/.local/bin"
 ```
 
-这会构建 `main` 的当前源码；复现特定发布版本时，在构建前先 `git checkout 0.7.1`。
+这会构建 `main` 的当前源码；复现特定发布版本时，在构建前先 `git checkout 0.7.2`。
 首次构建可能下载依赖；使用 `--locked` 保持依赖版本一致。
 
 ### 本地源码更新
@@ -418,38 +418,57 @@ svnui merge-preview '^/trunk' -r 12:18
 
 ## AI 生成提交信息
 
-提交面板按 `Ctrl+G` 生成可编辑候选，再按一次轮换候选。生成不会自动提交，已有编辑内容不会被覆盖。默认未启用 AI 时使用本地规则。
+提交面板按 `Ctrl+G` 生成可编辑候选，再按一次轮换候选。生成不会自动提交，已有编辑内容不会被覆盖；
+未启用 AI 或请求失败时使用本地规则，并显示当前来源或回退原因。
 
-先查看配置示例（不联网、不写文件，也不要求 SVN 工作副本）：
+### 复用本机 Codex（推荐）
+
+Codex 通道从 **0.7.2** 起提供，安装上面的正式版即可使用，无需从源码编译。
+需要安装 Codex CLI，并在启动 svnui 的同一终端中确认程序和登录可用：
 
 ```bash
-svnui llm --preset zhipu
-svnui llm --preset ollama
+codex --version
+codex login status
+svnui llm --preset codex
 ```
 
-将所需示例合并到 `~/.config/svnui/config.toml` 的 `[llm]` 段；也支持 `SVNUI_CONFIG` 或 `XDG_CONFIG_HOME`。不要重复添加同名段。最小配置：
+最后一条只输出配置示例，不联网、不写配置。将示例合并到已有配置的 `[llm]` 段，避免重复段：
 
 ```toml
 [llm]
 enabled = true
-provider = "zhipu" # 或 "ollama"
-base_url = ""
-model = ""
+provider = "codex"
+codex_bin = "codex"
+timeout_secs = 90
 send_diff = false
 ```
 
-- `zhipu`：预设 `glm-4.7-flash` 与智谱 OpenAI 兼容地址。官网目前将其列为[免费模型](https://docs.bigmodel.cn/cn/guide/models/free/glm-4.7-flash)，调用仍需申请 API Key；可用性、限流和费用以服务商当前政策为准。将 Key 放入 `SVNUI_LLM_KEY` 环境变量，不要写入配置或提交到仓库。
-- `ollama`：预设 `http://localhost:11434/v1`、`qwen2.5-coder:3b`，不需要 Key，也不发送 Authorization。需自行准备 Ollama 服务并下载模型（例如 `ollama pull qwen2.5-coder:3b`）；冷启动较慢时建议 `timeout_secs = 60`。工具不自动安装或启动服务。协议见 [Ollama 文档](https://docs.ollama.com/openai)。
-- `deepseek`：兼容既有默认选择，需要 Key。其他兼容服务继续通过 `base_url`、`model` 覆盖，不必新增 SDK。
-
-**显式地址和模型优先于预设。** 切换 `provider` 时，要清空旧的 `base_url` / `model`，或改成你要的覆盖值。模型覆盖示例：`model = "你的本地模型名称"`。
+无需再填写模型、服务商地址或 API Key：由 Codex CLI 自己读取本机配置与登录，尊重 `CODEX_HOME`。
+`codex_bin` 也可填可执行文件的绝对路径。切换为 Codex 后，原有 `base_url`、`model`、`api_key_env`
+不再参与请求；桌面端某次聊天临时选择的模型不保证等于 CLI 配置，需以 CLI 实际生效配置为准。
 
 ```bash
-svnui llm        # 查看实际生效的预设、地址、模型和 Key 状态
-svnui llm --test # 发送一个最小请求；失败返回非零退出码
+svnui llm        # 查看通道和生效策略，不联网
+svnui llm --test # 只发送最小 OK 请求，验证 Codex 实际连通性
 ```
 
-云端测试需要先在当前终端设置 Key；模型服务未启动、Key 缺失、认证失败、模型不存在、限流或超时都会给出提示。不会自动切换付费模型。测试不会发送工作副本内容；提交面板生成时默认只发送勾选文件的路径与状态。若 `[llm] send_diff = true`，才会读取并发送 diff 正文（受 `max_diff_bytes` 截断，默认 20000 字节）；设为 `true` 前请确认合规允许代码出网。生成失败保留本地规则候选，并在面板中显示回退原因。
+生成在独立临时目录运行，只传入本次勾选的文件清单，启用 `send_diff` 后才附带差异正文。
+任务禁用工程说明、技能说明、MCP、插件、hooks 和内置工具，不执行自动提交；超时返回本地规则。
+Codex CLI 仍可能附加其全局用户说明，这部分也会进入模型上下文；这里不复制或改写你的全局规则。
+Unix 上超时会清理任务所在进程组，临时输出在成功和失败后都会移除。Codex 首次启动和继承的推理设置
+可能增加耗时，可按需调整 `timeout_secs`。本机 CLI 版本兼容性与常见问题见 [Q&A](docs/qa.md#ai-commit)。
+
+### 已有 HTTP 模型配置
+
+已有的 DeepSeek、智谱、Ollama 通道继续兼容；暂不扩展更多模型适配。
+`svnui llm --preset zhipu` / `svnui llm --preset ollama` 可查看原有示例。
+仅这些 HTTP 通道使用 `base_url`、`model` 和 `api_key_env`；显式地址与模型优先于预设。
+云端 Key 默认由 `SVNUI_LLM_KEY` 环境变量提供；Ollama 由用户自行准备本地服务和模型，不发送 Authorization。
+
+所有通道默认只发送勾选文件的路径与状态；配置 `send_diff = true` 后才发送 diff 正文，
+受 `max_diff_bytes` 的 UTF-8 字节预算限制。`--test` 不发送工作副本内容，实际请求会使用对应模型服务的额度。
+生成失败保留本地规则候选，不会自动切换服务商。配置路径支持 `SVNUI_CONFIG`、`XDG_CONFIG_HOME`，
+默认 `~/.config/svnui/config.toml`。
 
 ## 缓存
 
@@ -528,6 +547,7 @@ main → cli → svn::client → svn::command
 - [手动下载安装、选架构、Gatekeeper](docs/qa.md#manual-install)
 - [安装后找不到命令，或升级后仍运行旧版](docs/qa.md#old-version)
 - [SVN 登录、证书和子路径权限](docs/qa.md#authentication)
+- [Codex 生成提交信息、登录、模型继承与超时](docs/qa.md#ai-commit)
 - [主题无颜色、中文 URL、图标与提示详情](docs/qa.md#appearance)
 - [目录批选、隐藏勾选、撤销 E155010](docs/qa.md#selection)
 - [发布遗留锁、离线依赖、Rust 工具链、Homebrew 版本不同步](docs/qa.md#publishing)

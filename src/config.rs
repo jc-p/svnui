@@ -35,6 +35,7 @@ use std::path::PathBuf;
 pub enum LlmProvider {
     #[default]
     Deepseek,
+    Codex,
     Zhipu,
     Ollama,
 }
@@ -43,6 +44,7 @@ impl LlmProvider {
     pub fn name(self) -> &'static str {
         match self {
             Self::Deepseek => "deepseek",
+            Self::Codex => "codex",
             Self::Zhipu => "zhipu",
             Self::Ollama => "ollama",
         }
@@ -51,6 +53,7 @@ impl LlmProvider {
     fn defaults(self) -> (&'static str, &'static str) {
         match self {
             Self::Deepseek => ("https://api.deepseek.com/v1", "deepseek-chat"),
+            Self::Codex => ("Codex CLI（继承本机配置）", "Codex 当前模型"),
             Self::Zhipu => ("https://open.bigmodel.cn/api/paas/v4", "glm-4.7-flash"),
             Self::Ollama => ("http://localhost:11434/v1", "qwen2.5-coder:3b"),
         }
@@ -63,9 +66,10 @@ impl std::str::FromStr for LlmProvider {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "deepseek" => Ok(Self::Deepseek),
+            "codex" => Ok(Self::Codex),
             "zhipu" => Ok(Self::Zhipu),
             "ollama" => Ok(Self::Ollama),
-            _ => Err("可选预设：zhipu、ollama、deepseek".into()),
+            _ => Err("可选预设：codex、zhipu、ollama、deepseek".into()),
         }
     }
 }
@@ -87,6 +91,9 @@ pub struct LlmConfig {
     pub enabled: bool,
 
     pub provider: LlmProvider,
+
+    /// Codex 可执行程序名或绝对路径；仅 provider = "codex" 时使用。
+    pub codex_bin: String,
 
     /// 兼容 OpenAI 的接口地址（不带 `/chat/completions`，代码会拼）。
     pub base_url: String,
@@ -134,6 +141,7 @@ impl Default for LlmConfig {
         Self {
             enabled: false,
             provider: LlmProvider::default(),
+            codex_bin: "codex".to_string(),
             base_url: String::new(),
             model: String::new(),
             api_key_env: "SVNUI_LLM_KEY".to_string(),
@@ -150,7 +158,7 @@ impl Default for LlmConfig {
 impl LlmConfig {
     /// 空值表示采用预设，兼容旧配置的显式 base_url / model。
     pub fn endpoint(&self) -> &str {
-        if self.base_url.trim().is_empty() {
+        if self.provider == LlmProvider::Codex || self.base_url.trim().is_empty() {
             self.provider.defaults().0
         } else {
             self.base_url.trim()
@@ -158,7 +166,7 @@ impl LlmConfig {
     }
 
     pub fn model_name(&self) -> &str {
-        if self.model.trim().is_empty() {
+        if self.provider == LlmProvider::Codex || self.model.trim().is_empty() {
             self.provider.defaults().1
         } else {
             self.model.trim()
@@ -166,11 +174,14 @@ impl LlmConfig {
     }
 
     pub fn requires_key(&self) -> bool {
-        self.provider != LlmProvider::Ollama
+        !matches!(self.provider, LlmProvider::Ollama | LlmProvider::Codex)
     }
 
     /// 只输出配置片段，不写用户文件或读取密钥。
     pub fn preset_example(provider: LlmProvider) -> String {
+        if provider == LlmProvider::Codex {
+            return "# 合并到已有 [llm] 段；模型、地址与认证由 Codex 自己读取。\n[llm]\nenabled = true\nprovider = \"codex\"\ncodex_bin = \"codex\"\ntimeout_secs = 90\nsend_diff = false\nlang = \"zh\"\n".to_string();
+        }
         let (endpoint, model) = provider.defaults();
         format!(
             "# 合并到配置文件的 [llm] 段；不要重复添加同名段。\n# 预设地址：{endpoint}\n# 预设模型：{model}\n[llm]\nenabled = true\nprovider = \"{}\"\n# 留空采用预设；自定义地址或模型时填写。\nbase_url = \"\"\nmodel = \"\"\napi_key_env = \"SVNUI_LLM_KEY\"\ntimeout_secs = {}\nsend_diff = false\nlang = \"zh\"\n",
@@ -305,7 +316,7 @@ const DEFAULT_TOML: &str = r##"# svnui 配置 —— ~/.config/svnui/config.toml
 
 # ── 提交信息生成（LLM）────────────────────────────────
 [llm]
-# 总开关。默认关闭 —— 配好 key 再打开。
+# 总开关。默认关闭 —— Codex 登录或其他服务认证就绪后再打开。
 enabled = false
 
 # 兼容 OpenAI /v1/chat/completions 的地址（不要带 /chat/completions）。
@@ -316,8 +327,12 @@ enabled = false
 #   本地 Ollama http://localhost:11434/v1                            qwen2.5-coder
 #   公司网关    问 IT
 # zhipu：云端免费模型（需要 Key，额度以服务商为准）；ollama：本地免 Key。
-# 查看配置示例：svnui llm --preset zhipu / svnui llm --preset ollama
+# 推荐：svnui llm --preset codex，复用本机 Codex 模型、服务商与登录。
+# 其他配置示例：svnui llm --preset zhipu / svnui llm --preset ollama
 provider = "deepseek"
+# Codex 程序名或绝对路径；Codex 通道建议 timeout_secs = 90。
+codex_bin = "codex"
+# Codex 忽略下面的 HTTP 地址、模型和 Key 配置，始终继承 Codex 配置。
 # 留空使用预设；显式配置优先于预设，切换预设时请清空旧覆盖值。
 base_url = ""
 model = ""

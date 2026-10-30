@@ -1,8 +1,8 @@
-//! LLM 提交信息生成 —— **兼容 OpenAI `/v1/chat/completions`**。
+//! LLM 提交信息生成：Codex CLI，或兼容 OpenAI `/v1/chat/completions` 的 HTTP 服务。
 //!
 //! ## 为什么不绑死某一家
 //!
-//! 只认 `/v1/chat/completions` 这一套协议，换算服务商就改两个字符串
+//! HTTP 通道使用 `/v1/chat/completions`，换服务商可改两个字符串
 //! （`base_url` + `model`），不用改代码。DeepSeek / 通义 / 智谱 /
 //! 本地 Ollama / 公司内网网关都能这么接。
 //!
@@ -18,7 +18,9 @@
 //! 由调用方回退到本地规则。**这里不 panic、不吞错误**，
 //! 因为"生成失败"应该表现为"退回到规则候选"，而不是弹个红框打断流程。
 
-use crate::config::LlmConfig;
+use crate::config::{LlmConfig, LlmProvider};
+
+mod codex;
 
 /// 响应体上限由 ureq 的 `into_string()` 兜住（10MB 级）。
 ///
@@ -45,6 +47,9 @@ pub fn suggest(items: &[Item], diff: Option<&str>, cfg: &LlmConfig) -> Result<Ve
     }
 
     let prompt = build_prompt(items, diff, cfg);
+    if cfg.provider == LlmProvider::Codex {
+        return codex::generate(&prompt, cfg);
+    }
     let url = format!("{}/chat/completions", cfg.endpoint().trim_end_matches('/'));
 
     let body = serde_json::json!({
@@ -87,6 +92,11 @@ pub fn ping(cfg: &LlmConfig) -> Result<String, String> {
         return Err("llm.enabled = false：配置里没打开，当前走的是本地规则".to_string());
     }
 
+    if cfg.provider == LlmProvider::Codex {
+        let start = std::time::Instant::now();
+        let reply = codex::generate("只在 messages 数组中返回一个字符串 OK，不调用工具。", cfg)?;
+        return Ok(format!("连通正常\n  通道: Codex CLI（继承本机配置与认证）\n  耗时: {} ms\n  回复: {}", start.elapsed().as_millis(), reply.join(" / ")));
+    }
     let url = format!("{}/chat/completions", cfg.endpoint().trim_end_matches('/'));
     let body = serde_json::json!({
         "model": cfg.model_name(),
@@ -257,6 +267,9 @@ fn backoff(attempt: u32) -> std::time::Duration {
 
 /// 当前 LLM 配置的文字说明（不联网，只说清"会怎么走"）。
 pub fn describe(cfg: &LlmConfig) -> String {
+    if cfg.provider == LlmProvider::Codex {
+        return format!("LLM 状态\n  预设: codex\n  启用: {}\n  程序: {}\n  模型与认证: 由 Codex CLI 继承（尊重 CODEX_HOME）\n  HTTP 地址、模型、Key 覆盖: 不使用\n  发送 diff: {}\n  超时: {} 秒\n\n先运行 codex login status 检查登录；用 svnui llm --test 验证实际连通性。", cfg.enabled, cfg.codex_bin, cfg.send_diff, cfg.timeout_secs);
+    }
     let key_state = if !cfg.requires_key() {
         "无需 Key（不发送 Authorization）".to_string()
     } else {
@@ -330,9 +343,13 @@ fn build_prompt(items: &[Item], diff: Option<&str>, cfg: &LlmConfig) -> String {
         if cfg.send_diff && !d.trim().is_empty() {
             let mut body = d.to_string();
             if body.len() > cfg.max_diff_bytes {
-                // 按字符截而不是字节：中文路径按字节截会切出半个字
-                let take: String = body.chars().take(cfg.max_diff_bytes).collect();
-                body = format!("{}\n…（diff 过长已截断）", take);
+                // 字节预算退到完整 UTF-8 边界，避免中文被切断或超出额度。
+                let mut end = cfg.max_diff_bytes;
+                while !body.is_char_boundary(end) {
+                    end -= 1;
+                }
+                body.truncate(end);
+                body.push_str("\n…（diff 过长已截断）");
             }
             p.push_str("\ndiff：\n");
             p.push_str(&body);
@@ -488,6 +505,18 @@ mod tests {
         let p = build_prompt(&[("a".into(), 'M')], Some("0123456789ABCDEFGH"), &c);
         assert!(p.contains("截断"));
         assert!(!p.contains("ABCDEFGH"));
+    }
+
+    #[test]
+    fn 中文diff按字节预算截断且不切断字符() {
+        let mut c = cfg();
+        c.provider = LlmProvider::Codex;
+        c.send_diff = true;
+        c.max_diff_bytes = 4;
+        let p = build_prompt(&[("selected.rs".into(), 'M')], Some("中文diff"), &c);
+        let (_, body) = p.split_once("\ndiff：\n").unwrap();
+        assert_eq!(body, "中\n…（diff 过长已截断）\n");
+        assert!(!build_prompt(&[], Some("private diff"), &LlmConfig::default()).contains("private diff"));
     }
 
     #[test]

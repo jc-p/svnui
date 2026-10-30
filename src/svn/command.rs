@@ -127,6 +127,21 @@ pub fn run_with_stdin(
     execute(exe, &args, cwd, opts, Some(input), false, None, None).map(|r| r.output)
 }
 
+/// 独立后台文本任务：Unix 上以独立进程组运行，超时清理继承管道的后代。
+/// stdin 不进入参数或错误信息；普通 SVN 前台入口的 Ctrl+C 语义不变。
+pub fn run_isolated_with_stdin(
+    exe: &Path,
+    args: &[String],
+    cwd: &Path,
+    input: &str,
+    opts: &RunOpts,
+) -> Result<RawOutput> {
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let cancel = CancelToken::default();
+    execute(exe, &args, cwd, opts, Some(input), false, Some(&cancel), None)
+        .map(|r| r.output)
+}
+
 type LineCallback = Box<dyn FnMut(&str) + Send>;
 
 /// 在字节到达时限额，避免先分配整行/全文再截断。

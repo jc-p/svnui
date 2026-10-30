@@ -81,6 +81,7 @@ fn cli(config: &str, args: &[&str], key: Option<&str>) -> Output {
 #[test]
 fn presets_resolve_defaults_and_legacy_overrides_remain_effective() {
     for provider in [
+        LlmProvider::Codex,
         LlmProvider::Zhipu,
         LlmProvider::Ollama,
         LlmProvider::Deepseek,
@@ -103,6 +104,26 @@ fn presets_resolve_defaults_and_legacy_overrides_remain_effective() {
         toml::from_str("[llm]\nprovider='ollama'\nmodel='another-local-model'\n").unwrap();
     assert_eq!(override_cfg.llm.model_name(), "another-local-model");
     assert!(!override_cfg.llm.requires_key());
+}
+
+#[test]
+fn codex_preset_inherits_auth_and_ignores_legacy_http_overrides() {
+    let example = LlmConfig::preset_example(LlmProvider::Codex);
+    let config: Config = toml::from_str(&example).unwrap();
+    assert_eq!(config.llm.codex_bin, "codex");
+    assert_eq!(config.llm.timeout_secs, 90);
+    assert!(!config.llm.requires_key());
+    let mut cfg = config.llm;
+    cfg.base_url = "https://legacy.example/v1".into();
+    cfg.model = "legacy-model".into();
+    assert!(!cfg.endpoint().contains("legacy"));
+    assert!(!cfg.model_name().contains("legacy"));
+    let report = svnui::llm::describe(&cfg);
+    assert!(report.contains("CODEX_HOME"));
+    assert!(!report.contains("legacy"));
+    let output = cli("", &["llm", "--preset", "codex"], None);
+    assert!(output.status.success());
+    assert!(String::from_utf8(output.stdout).unwrap().contains("provider = \"codex\""));
 }
 
 #[test]

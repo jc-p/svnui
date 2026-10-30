@@ -367,7 +367,7 @@ pub enum Cmd {
         #[arg(long, conflicts_with = "preset")]
         test: bool,
 
-        /// 输出 zhipu / ollama / deepseek 配置示例；不写文件、不联网。
+        /// 输出 codex / zhipu / ollama / deepseek 配置示例；不写文件、不联网。
         #[arg(long)]
         preset: Option<crate::config::LlmProvider>,
     },
