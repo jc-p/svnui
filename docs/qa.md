@@ -1,6 +1,6 @@
 # Q&A
 
-适用于 svnui 0.7.3；历史修复的起始版本在对应章节说明。先运行 `svnui --version`、`command -v svnui`，确认正在使用哪个程序。
+适用于 svnui 0.8.0；历史修复的起始版本在对应章节说明。先运行 `svnui --version`、`command -v svnui`，确认正在使用哪个程序。
 本文集中记录实际遇到的问题；发布与源码步骤另见 [PUBLISH.md](../PUBLISH.md)，配色选项见 [主题配置](theme.md)。
 
 [下载与安装](#manual-install) · [认证与证书](#authentication) · [AI 提交信息](#ai-commit) · [外观与输入](#appearance) ·
@@ -21,26 +21,26 @@
 
 ### Q：不用在线安装脚本，怎样手动安装？
 
-以 Apple Silicon 的 0.7.3 为例：将 [安装包](https://github.com/jc-p/svnui/releases/download/0.7.3/svnui-0.7.3-aarch64-apple-darwin.tar.gz)
-和 [SHA256SUMS](https://github.com/jc-p/svnui/releases/download/0.7.3/SHA256SUMS) 下载到 `~/Downloads`。
+以 Apple Silicon 的 0.8.0 为例：将 [安装包](https://github.com/jc-p/svnui/releases/download/0.8.0/svnui-0.8.0-aarch64-apple-darwin.tar.gz)
+和 [SHA256SUMS](https://github.com/jc-p/svnui/releases/download/0.8.0/SHA256SUMS) 下载到 `~/Downloads`。
 
 先校验实际下载的那一个包，预期显示文件名与 `OK`：
 
 ```bash
 cd "$HOME/Downloads"
-awk '$2 == "svnui-0.7.3-aarch64-apple-darwin.tar.gz"' SHA256SUMS | shasum -a 256 -c -
+awk '$2 == "svnui-0.8.0-aarch64-apple-darwin.tar.gz"' SHA256SUMS | shasum -a 256 -c -
 ```
 
 只在校验通过后安装；Intel 用户将文件名中的 `aarch64` 换成 `x86_64`：
 
 ```bash
 mkdir -p "$HOME/.local/bin"
-tar -xzf svnui-0.7.3-aarch64-apple-darwin.tar.gz -C "$HOME/.local/bin" svnui
+tar -xzf svnui-0.8.0-aarch64-apple-darwin.tar.gz -C "$HOME/.local/bin" svnui
 chmod 755 "$HOME/.local/bin/svnui"
 "$HOME/.local/bin/svnui" --version
 ```
 
-预期版本为 `svnui 0.7.3`。校验失败或下载内容不是 tar.gz 时，停止安装并重新下载官方附件。
+预期版本为 `svnui 0.8.0`。校验失败或下载内容不是 tar.gz 时，停止安装并重新下载官方附件。
 不要把 `shasum -c SHA256SUMS` 对“未下载的另一架构包”的缺失提示误认为当前包损坏。
 
 ### Q：GitHub 下载失败，或者下载回来的是 HTML？
@@ -54,11 +54,11 @@ chmod 755 "$HOME/.local/bin/svnui"
 以下 Apple Silicon 命令已验证；Intel 用户将 `aarch64` 替换为 `x86_64`：
 
 ```bash
-mkdir -p "$HOME/Downloads/svnui-0.7.3"
-gh release download 0.7.3 --repo jc-p/svnui \
-  --pattern 'svnui-0.7.3-aarch64-apple-darwin.tar.gz' \
-  --pattern SHA256SUMS --dir "$HOME/Downloads/svnui-0.7.3"
-cd "$HOME/Downloads/svnui-0.7.3"
+mkdir -p "$HOME/Downloads/svnui-0.8.0"
+gh release download 0.8.0 --repo jc-p/svnui \
+  --pattern 'svnui-0.8.0-aarch64-apple-darwin.tar.gz' \
+  --pattern SHA256SUMS --dir "$HOME/Downloads/svnui-0.8.0"
+cd "$HOME/Downloads/svnui-0.8.0"
 ```
 
 此时手动校验命令从当前目录执行，无需再切回 `~/Downloads`。
@@ -287,6 +287,12 @@ Unix 上超时会清理本次任务进程组，成功和失败都会清理私有
 
 <a id="appearance"></a>
 ## 外观、输入与项目切换
+
+### Q：快捷键帮助太长，怎样快速找到对应操作？
+
+0.8.0 起，`F1` / `?` 打开的帮助按九类任务组织。用 `Tab` / `Shift+Tab` 或 `←→` 切换，`1`–`9` 直接选择；当前分类内用 `↑↓` / `j/k` 阅读，`PgUp/PgDn` 翻页，`Home/End` 到首尾。
+宽窗口显示分类侧栏和对齐的键位说明；窄窗口改为上下折行，仍可滚动读到末尾。`Esc` / `q` 只关闭帮助，返回原面板。
+如果仍看到旧版长列表，按[旧版本排查](#old-version)核对程序路径，退出旧界面后重启。完整键位见 [TUI 操作说明](tui-keymap.md)。
 
 ### Q：配置了主题，为什么界面还是没有颜色？
 

@@ -3918,7 +3918,13 @@ impl App {
             }
         }
         if self.show_help {
-            self.help_panel.render(f, theme::centered(area, 70, 80, 30, 8));
+            let mut help_area = theme::centered(area, 86, 84, 30, 8);
+            // 宽窗口中键位可同排显示，限制弹层高度；各分类共用尺寸，切换时不跳动。
+            if help_area.width >= 92 && help_area.height > 18 {
+                help_area.y += (help_area.height - 18) / 2;
+                help_area.height = 18;
+            }
+            self.help_panel.render(f, help_area);
         }
         if self.show_notice {
             if let Some(panel) = self.notice_panel.as_mut() {
@@ -5047,7 +5053,10 @@ mod refresh_tests {
         app.handle_key(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE))
             .unwrap();
         assert!(app.show_help);
-        for code in [KeyCode::Char('C'), KeyCode::Enter, KeyCode::F(4)] {
+        for code in [
+            KeyCode::Char('C'), KeyCode::Enter, KeyCode::F(4), KeyCode::Tab,
+            KeyCode::Right, KeyCode::Left, KeyCode::Char('5'), KeyCode::PageDown,
+        ] {
             app.handle_key(KeyEvent::new(code, KeyModifiers::NONE))
                 .unwrap();
             assert!(app.show_help, "非关闭键不能关帮助或触发底层操作");
