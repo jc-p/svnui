@@ -46,10 +46,10 @@ python3 -B -m unittest discover -s tests -p release_scripts.py
 
 ## 本地发布
 
-先更新并提交更新日志等源码改动，再执行：
+先更新并提交更新日志等源码改动，再执行。以下以尚未发布的 `0.7.2` 为例，替换成实际的新版本；已发布的 `0.7.1` 不要重复发布：
 
 ```bash
-./scripts/release.sh 0.4.2 --offline --tap-dir /绝对路径/homebrew-svnui
+./scripts/release.sh 0.7.2 --offline --tap-dir /绝对路径/homebrew-svnui
 ```
 
 流程依次为：本地版本提交与 tag → 推源码提交 → 双架构构建和二进制版本检查 → 提升 staging 为版本目录 → 指定准确源码提交创建 Release → 回下载并校验所有附件 → 更新显式 tap 的 formula、提交和推送。
@@ -57,7 +57,7 @@ python3 -B -m unittest discover -s tests -p release_scripts.py
 也可以分步执行：
 
 ```bash
-./scripts/bump.sh 0.4.2
+./scripts/bump.sh 0.7.2
 # bump 仅修改 package/lock 的 svnui 版本，提交并创建本地 tag；不构建、不联网。
 git push origin HEAD
 ./scripts/dist.sh --offline --tap-dir /绝对路径/homebrew-svnui
@@ -101,4 +101,18 @@ git push origin HEAD
 brew tap jc-p/svnui
 brew upgrade jc-p/svnui/svnui
 svnui --version
+```
+
+## 发布后的下载与文档核验
+
+- 确认 Release 的双架构附件、`SHA256SUMS`、`manifest.json` 都可下载，且版本与 tag 对应。
+- 更新 [README](README.md) 的当前正式版、双架构直链和指定版本示例，以及 [Q&A](docs/qa.md) 中的手动安装示例和适用版本。
+- 下载脚本 `install.sh` 默认跟随最新正式 Release，无需随版本修改默认值。先跑安装脚本回归，再安装到临时目录验证；不要覆盖现有用户程序作为测试。
+- README 的在线安装命令依赖 `main/install.sh`，推送文档后核对公开脚本可访问。Release 说明应链接 README 下载区及 Q&A。
+- 验证 Homebrew formula 是否同步；未同步时明确告知使用 Release 或下载脚本，不能把 Release 成功当成 tap 成功。
+- 将本次实际遇到的问题、原因、恢复步骤与适用版本补入 Q&A；不覆盖旧版本二进制来修正文档。
+
+```bash
+bash -n install.sh
+python3 -B -m unittest discover -s tests -p install_script.py
 ```

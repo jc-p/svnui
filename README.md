@@ -3,6 +3,8 @@
 Subversion 的 TUI 客户端。用 Rust + [ratatui](https://github.com/ratatui/ratatui) 写的独立终端程序，
 不依赖 yazi，也不需要额外配置就能用。
 
+[下载最新版本](https://github.com/jc-p/svnui/releases/latest) · [安装](#下载与安装) · [快速上手](#快速上手) · [Q&A](docs/qa.md) · [更新日志](CHANGELOG.md)
+
 ```
 ┌─ 文件树 ─────────────┬─ 预览 / diff ────────────────────────┐
 │ [x] M src/main.rs    │ Index: src/main.rs                   │
@@ -16,138 +18,96 @@ Subversion 的 TUI 客户端。用 Rust + [ratatui](https://github.com/ratatui/r
 
 ---
 
-<!-- BEGIN svnui:auth -->
-## SVN 认证配置
+## 下载与安装
 
-svnui 调用 svn 时**强制加 `--non-interactive`** —— TUI 里没法回答
-"是否接受证书 / 请输入用户名"这类交互式提问，不加就会挂死。
-所以凭证和证书都必须**提前处理好**，不能指望运行时现问。
+当前正式版 **[0.7.1](https://github.com/jc-p/svnui/releases/tag/0.7.1)**，提供 macOS 11+ 的双架构安装包。
+下载二进制无需 Rust；使用 SVN 功能需要本机有 `svn`，可先运行 `svn --version --quiet` 检查。
+Linux 等其他系统请[从源码构建](#从源码构建)。
 
-### 凭证存在哪
-
-```
-~/.subversion/auth/svn.simple/     # 按 realm（服务器 + 路径）分文件存放
-```
-
-第一次连接某个服务器时，先交互式认证一次把凭证存下来：
+### 一条命令安装或升级（推荐）
 
 ```bash
-svn info <仓库 URL>          # 按提示输入用户名密码，之后就不问了
-# 或
-svnui login                  # 走 svnui 自己的登录流程
+curl -fsSL https://raw.githubusercontent.com/jc-p/svnui/main/install.sh | bash
 ```
 
-存下之后 svnui 的所有命令都用缓存，不再索要用户名密码。
-**检出面板里的"用户名 / 密码"可以留空**，留空就不传 `--username/--password`，
-svn 自己按 realm 挑缓存里的那条。
+脚本识别当前终端架构，下载官方最新正式 Release，校验 SHA256 和二进制版本，
+再安装到 `~/.local/bin/svnui`。不需要 sudo，不修改 shell 配置；下载、校验或新程序启动失败时保留旧安装。
 
-缓存不对或过期：删掉 `svn.simple/` 下对应的文件，或重跑 `svnui login`。
-
-### 自建 / 内网服务器：自签名证书
-
-症状：
-
-```
-svnui update
-SSL 证书校验失败（svn 退出码 1）
-```
-
-原因就是开头那句 —— 命令行 `svn` 遇到证书会弹 `(p)` 让你永久接受，
-svnui 不能弹，于是直接失败。
-
-解法（二选一）：
+首次安装后，将用户目录加入当前终端的 PATH 并核对版本：
 
 ```bash
-svnui update --trust-cert                  # 单次
-export SVNUI_TRUST_CERT=1                  # 长期，写进 ~/.zshrc
+export PATH="$HOME/.local/bin:$PATH"
+hash -r
+svnui --version
 ```
 
-对应的 svn 参数是
-`--trust-server-cert-failures=unknown-ca,cn-mismatch,expired,not-yet-valid,other`。
+需要永久生效时，将 `export PATH="$HOME/.local/bin:$PATH"` 加入 `~/.zshrc`（Bash 用户用 `~/.bashrc`）。
+指定版本或安装目录：
 
-> 改完 `~/.zshrc` 要 `exec zsh` 或重开窗口才生效。
-> 用 `env | grep SVNUI` 确认，没输出就是没生效。
->
-> 放行证书等于放弃防中间人，只对自己确认过的内网服务器这么干。
+```bash
+curl -fsSL https://raw.githubusercontent.com/jc-p/svnui/main/install.sh | bash -s -- --version 0.7.1 --bin-dir "$HOME/.local/bin"
+```
 
-### 错误码速查
+不想执行在线脚本，可以使用下面的官方安装包，按 [Q&A 的手动安装步骤](docs/qa.md#manual-install) 校验并安装。
+GitHub 网页或脚本域名连接失败时，Q&A 也提供已验证的 GitHub CLI 下载方式。
 
-svn 的报错有个坑：**它把"结果"放在前面、"原因"放在后面**。
-同时出现两个码时，第一个往往是结果，照它排查会跑偏。
+### 直接下载安装包
 
-| 错误码 | 真实含义 | 怎么办 |
+| Mac 类型 | `uname -m` | 0.7.1 安装包 |
 |---|---|---|
-| `E170013` | 连不上（多半是**结果**） | 往下看有没有 `E175013` |
-| `E175013` | 该路径**无权访问** | 见下面"按子树授权" |
-| `E230001` | 证书问题 | `--trust-cert` |
-| `E170001` | 没有可用用户名 | 先做一次交互式认证缓存凭证 |
-| `E215004` | 凭证不对 / 过期 | 删缓存重登 |
-| `E155007` | 不是工作副本 | `cd` 进工作副本再跑 |
-| `E000111` | 连接被拒 | 查 `~/.subversion/servers` 里的 `http-proxy` |
+| Apple Silicon（M 系列） | `arm64` | [下载 ARM64](https://github.com/jc-p/svnui/releases/download/0.7.1/svnui-0.7.1-aarch64-apple-darwin.tar.gz) |
+| Intel，或运行在 Rosetta 下的终端 | `x86_64` | [下载 x86_64](https://github.com/jc-p/svnui/releases/download/0.7.1/svnui-0.7.1-x86_64-apple-darwin.tar.gz) |
 
-### 按子树授权：能进子目录，但看不了仓库根
+[SHA256SUMS](https://github.com/jc-p/svnui/releases/download/0.7.1/SHA256SUMS) ·
+[源码提交与产物清单](https://github.com/jc-p/svnui/releases/download/0.7.1/manifest.json) ·
+[查看最新 Release](https://github.com/jc-p/svnui/releases/latest)
 
-很多 SVN 是按路径授权的。你能访问 `/trunk/A8_Patch/...`，
-不代表能 `svn list` 仓库根 `/JR/KAMP` —— 后者会报 `E175013 forbidden`。
+选择 `svnui-版本-架构.tar.gz`，Release 页面里的 **Source code** 是源码，不是可直接运行的程序。
+不确定架构时先执行 `uname -m`，不要凭文件名猜。
 
-仓库浏览面板（`V`）**从当前工作副本的 URL 起始**，而不是仓库根，
-就是为了避开这个。往上退到无权的一层会自动返回上一层并提示。
-
-### 诊断命令
-
-```bash
-# 仓库根（注意是 repos-root-url，不是 repository-root）
-svn info --show-item repos-root-url
-
-# 复现 svnui 的调用方式：非交互 + 放行证书
-svn list --xml --non-interactive \
-  --trust-server-cert-failures=unknown-ca,cn-mismatch,expired,not-yet-valid,other \
-  "<URL>"
-```
-
-### 环境变量
-
-| 变量 | 作用 |
-|---|---|
-| `SVNUI_TRUST_CERT=1` | 放行自签名 / 内网证书 |
-| `SVN_CONFIG_DIR` | 指定 svn 配置目录（不搜 `~/.subversion`） |
-<!-- END svnui:auth -->
-## 安装
-
-### Homebrew（推荐）
+### Homebrew
 
 ```bash
 brew tap jc-p/svnui
-brew trust jc-p/svnui      # 第三方 tap 需要显式信任，见「注意」
-brew install svnui
+brew install jc-p/svnui/svnui
 ```
 
-升级：
+若 Homebrew 提示第三方 tap 未受信任，再按提示执行 `brew trust --tap jc-p/svnui`。
+升级前先核对 formula 提供的版本：
 
 ```bash
-brew upgrade svnui
+brew update
+brew info jc-p/svnui/svnui
+brew upgrade jc-p/svnui/svnui
 ```
 
-### 从源码
+GitHub Release 与 Homebrew tap 分别发布；如果 formula 尚未提供需要的版本，使用上面的安装脚本或直接下载。
+不混用安装来源时更容易升级；已有多个 `svnui` 时见 [Q&A：升级后仍运行旧版](docs/qa.md#old-version)。
+
+### 从源码构建
+
+需要 Rust 1.88+、Git，以及使用 SVN 功能时所需的 `svn`。
 
 ```bash
 git clone https://github.com/jc-p/svnui.git
 cd svnui
-cargo build --release
-sudo cp target/release/svnui /usr/local/bin/
+cargo build --release --locked
+mkdir -p "$HOME/.local/bin"
+./install-local.sh --no-build --bin-dir "$HOME/.local/bin"
 ```
+
+这会构建 `main` 的当前源码；复现特定发布版本时，在构建前先 `git checkout 0.7.1`。
+首次构建可能下载依赖；使用 `--locked` 保持依赖版本一致。
 
 ### 本地源码更新
 
-修改源码后，在项目根目录运行一键更新脚本：
-
 ```bash
-./install-local.sh
+mkdir -p "$HOME/.local/bin"
+./install-local.sh --bin-dir "$HOME/.local/bin"
 ```
 
-脚本离线编译 Release，安装到 `/usr/local/bin/svnui`，需要时提示输入 sudo
-密码，并核对安装后的二进制和 PATH。编译或安装失败会立即停止。
-依赖需已缓存在本机；已编译好时可加 `--no-build` 直接安装。
+`install-local.sh` 离线构建当前源码，校验安装结果与 PATH；它与下载预编译包的 `install.sh` 用途不同。
+依赖未缓存时先执行 `cargo fetch --locked`。省略 `--bin-dir` 时安装到 `/usr/local/bin`，可能需要 sudo。
 更新完成后退出旧界面，重新运行 `svnui tui`。
 
 ---
@@ -159,8 +119,8 @@ cd 你的工作副本
 svnui tui
 ```
 
-> 子命令是必填的，直接敲 `svnui` 会报 clap 的参数错误。
-> 嫌长可以加 alias：`alias s='svnui tui'`。
+也可直接运行 `svnui`：交互式终端中默认进入 TUI；不在工作副本中时进入项目选择或检出界面。
+首次连接服务器前，先按 [Q&A：认证与证书](docs/qa.md#authentication) 配置 SVN 凭证。
 
 首次建议先跑自检：
 
@@ -189,19 +149,13 @@ svnui --trust-cert preview "https://svn.example.com/repo/trunk/project/"
 支持文本、图片和办公文档，沿用 2 MiB 上限；压缩包、大文件和不支持的二进制
 显示提示。`j/k`、方向键和 `d/u` 滚动，`q` / `Esc` / `Ctrl+C` 退出。
 
-### 内网自签名证书（公司 SVN 常见）
+### 外观与提示
 
-如果报 `E230001: Server SSL certificate verification failed`：
+在已有 `~/.config/svnui/config.toml` 的 `[ui]` 段内设置 `theme = "catppuccin"`，重启后生效。
+支持 Nord、Tokyo Night、终端配色和无色模式，完整选项见 [主题配置](docs/theme.md)。
 
-```bash
-export SVNR_TRUST_CERT=1          # 写进 ~/.zshrc 永久生效
-# 或单次：svnui --trust-cert login -u 你的账号
-```
-
-等价于 svn 的
-`--trust-server-cert-failures=unknown-ca,cn-mismatch,expired,not-yet-valid,other`。
-
-> ⚠️ 这等于放弃对中间人攻击的防护，只在确认是**自己的内网服务器**时启用。
+`●` / `○` 表示面板焦点，`◆` / `◇` 区分当前工作副本和其他项目，无需专用图标字体。
+普通通知显示在右上角；`F4` 查看详情，工作流内用 `Shift+F4`，`y` 复制全文，`Esc` 关闭。
 
 ---
 
@@ -525,7 +479,7 @@ svnui llm --test # 发送一个最小请求；失败返回非零退出码
 ```toml
 [features]
 default = ["tui", "docs"]
-tui     = ["dep:ratatui", "dep:crossterm", "dep:tui-textarea", "dep:ratatui-image", "dep:image"]
+tui     = ["dep:ratatui", "dep:ratatui-themekit", "dep:crossterm", "dep:tui-textarea", "dep:ratatui-image", "dep:image"]
 docs    = ["dep:csv", "dep:calamine", "dep:docx-lite"]
 ```
 
@@ -562,37 +516,22 @@ main → cli → svn::client → svn::command
 2. **`svn` 是唯一能 spawn 进程的地方** — 别处不许 `Command::new`
 3. **永不 `sh -c`** — 全部参数数组传递，防注入
 
-文档：`docs/cli.md`（命令参考）、`docs/keymap.md`、`docs/theme.md`、`docs/troubleshooting.md`。
-发布流程见 `PUBLISH.md`。
+文档：[命令参考](docs/cli.md)、[快捷键](docs/keymap.md)、[主题配置](docs/theme.md)、[Q&A](docs/qa.md)、[专项故障排查](docs/troubleshooting.md)。
+发布流程见 [PUBLISH.md](PUBLISH.md)。
 
 ---
 
-## 注意：macOS 上的两个坑
+## Q&A
 
-**1. Gatekeeper**
+安装、认证、主题、文件树、撤销和发布中遇到的问题统一记录在 **[Q&A](docs/qa.md)**，按“现象 → 原因 → 处理 → 验证”维护。
 
-通过 brew 安装的二进制带 quarantine 属性，首次运行会弹「无法打开，因为来自身份不明的开发者」：
-
-```bash
-sudo xattr -d com.apple.quarantine $(which svnui)
-```
-
-或者：系统设置 → 隐私与安全性 → 点「仍要打开」。
-本地 `cargo build` 出来的没有这个问题，所以自己编译可能从来没遇到过。
-
-**2. Homebrew 的 rust 装不了交叉编译 target**
-
-如果机器上同时有 `/opt/homebrew/bin/cargo` 和 `~/.cargo/bin/cargo`（rustup），
-`rustup target add x86_64-apple-darwin` 装进的是 rustup 那套，
-而 `cargo build` 可能用的是 Homebrew 那套，于是报
-`can't find crate for core` + 一句误导性的 `the target may not be installed`。
-
-确认并修复：
-
-```bash
-which -a cargo                                    # ~/.cargo/bin 应该排第一
-echo 'export PATH="$HOME/.cargo/bin:$PATH"' >> ~/.zshrc
-```
+- [手动下载安装、选架构、Gatekeeper](docs/qa.md#manual-install)
+- [安装后找不到命令，或升级后仍运行旧版](docs/qa.md#old-version)
+- [SVN 登录、证书和子路径权限](docs/qa.md#authentication)
+- [主题无颜色、中文 URL、图标与提示详情](docs/qa.md#appearance)
+- [目录批选、隐藏勾选、撤销 E155010](docs/qa.md#selection)
+- [发布遗留锁、离线依赖、Rust 工具链、Homebrew 版本不同步](docs/qa.md#publishing)
+- [Yazi、缓存、daemon 和工作副本排查](docs/qa.md#other-troubleshooting)
 
 ---
 

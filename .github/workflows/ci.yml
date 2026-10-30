@@ -32,7 +32,8 @@ jobs:
         run: |
           cargo check --offline --locked --no-default-features --all-targets
           cargo check --offline --locked --no-default-features --features tui --all-targets
-      - name: Release script regressions
+      - name: Install and release script regressions
         run: |
-          bash -n scripts/dist.sh scripts/release.sh scripts/bump.sh
+          bash -n install.sh scripts/dist.sh scripts/release.sh scripts/bump.sh
           python3 -B -m unittest discover -s tests -p release_scripts.py
+          python3 -B -m unittest discover -s tests -p install_script.py

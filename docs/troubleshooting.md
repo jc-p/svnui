@@ -1,5 +1,8 @@
 # 故障排查
 
+下载、升级、认证、TUI 外观与发布中遇到的问题，先看 [Q&A](qa.md)。
+本文保留 Yazi 集成、缓存、daemon 与底层 SVN 的专项排查。
+
 ## 染色不生效
 
 **症状**：按 `vd` 能弹 diff，但列表里看不到 `M`/`A`/`D` 标记。
@@ -17,6 +20,7 @@ echo 'require("svnui"):setup {}' >> ~/.config/yazi/init.lua
 
 ---
 
+<a id="yazi-plugin"></a>
 ## 插件报错 / 状态栏空白
 
 **症状**：yazi 启动时报 Lua 错误。
@@ -91,6 +95,7 @@ diff /tmp/a /tmp/b    # 必须为空
 
 ---
 
+<a id="tree-conflict"></a>
 ## 树冲突（T）
 
 SVN 独有的一类麻烦：本地删除/移动 vs 远端修改。
@@ -146,14 +151,14 @@ svnui daemon status         # 看状态 + socket 路径
 - **inotify 句柄耗尽**：`watch()` 失败。不影响服务，只是退化成靠 TTL/手动 rescan。
 
 ```bash
-# 强制重来
+# 重启由 svnui 管理的 daemon
 svnui daemon stop
-rm -f /tmp/svnui-*.sock /tmp/svnui-*.pid    # 或 $XDG_RUNTIME_DIR 下
 svnui daemon start
 ```
 
 ---
 
+<a id="svn-path"></a>
 ## svn 未安装 / 找不到
 
 ```bash
