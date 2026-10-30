@@ -127,8 +127,18 @@ impl ProjectsPanel {
 
     /// 换一份项目清单（登记/移除之后）。保留过滤词和当前项标记。
     pub fn refresh(&mut self, all: Vec<crate::projects::Project>) {
+        let selected = self.selected().map(|p| p.path.clone());
         self.all = all;
+        // 新清单可能排序或删行，旧索引不能再表示原来那个项目。
+        self.state.select(None);
         self.refilter();
+        if let Some(path) = selected {
+            if let Some(pos) = self.rows.iter().position(|r| {
+                r.is_some_and(|i| self.all[i].path == path)
+            }) {
+                self.state.select(Some(pos));
+            }
+        }
     }
 
     fn move_by(&mut self, delta: isize) {
@@ -376,6 +386,18 @@ mod tests {
         p.move_by(1);
         assert!(p.selected().is_none(), "最后一行不是项目");
         assert!(matches!(p.handle_key(key(KeyCode::Enter)), ProjectsAction::Checkout));
+    }
+
+    #[test]
+    fn refresh_keeps_the_same_project_after_reordering() {
+        let mut p = ProjectsPanel::new(
+            vec![proj("a", "/a"), proj("b", "/b")],
+            Some(PathBuf::from("/b")),
+        );
+        p.refresh(vec![proj("b", "/b"), proj("a", "/a")]);
+        assert_eq!(p.selected().unwrap().path, PathBuf::from("/b"));
+        p.refresh(vec![proj("a", "/a")]);
+        assert_eq!(p.selected().unwrap().path, PathBuf::from("/a"));
     }
 
     #[test]

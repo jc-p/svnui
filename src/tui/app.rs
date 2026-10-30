@@ -495,8 +495,16 @@ impl App {
                 Ok(())
             }
             crate::tui::panels::projects::ProjectsAction::Open(path) => {
-                self.projects = None;
-                self.switch_to(path)
+                // 失效的登记或扫描错误只影响本次打开，不能退出整个 TUI。
+                match self.switch_to(path) {
+                    Ok(()) => self.projects = None,
+                    Err(e) => {
+                        if let Some(p) = self.projects.as_mut() {
+                            p.set_notice(format!("打开失败：{}", crate::cli::hint::human_hint(&e)));
+                        }
+                    }
+                }
+                Ok(())
             }
             crate::tui::panels::projects::ProjectsAction::Checkout => {
                 self.projects = None;
@@ -508,14 +516,28 @@ impl App {
         }
     }
 
+    /// 写入配置后只同步项目清单，保留本次运行的其他设置和当前副本。
+    fn refresh_project_list(&mut self) -> Result<(), String> {
+        self.cfg.projects = crate::config::Config::load_checked()?.projects;
+        let mut all = crate::projects::list(&self.cfg);
+        crate::projects::ensure_current(&mut all, &self.svn.root);
+        if let Some(p) = self.projects.as_mut() {
+            p.refresh(all);
+        }
+        Ok(())
+    }
+
     /// 把当前工作副本登记进项目清单。
     fn register_current(&mut self) -> crate::domain::Result<()> {
         match crate::projects::add(&self.svn.root, None) {
             Ok(msg) => {
+                let notice = match self.refresh_project_list() {
+                    Ok(()) => msg.lines().next().unwrap_or("已登记").to_string(),
+                    Err(e) => format!("登记已写入，但列表刷新失败：{e}"),
+                };
                 if let Some(p) = self.projects.as_mut() {
-                    p.refresh(crate::projects::list(&self.cfg));
                     // add 的输出有好几行，面板底部只放得下一句。
-                    p.set_notice(msg.lines().next().unwrap_or("已登记").to_string());
+                    p.set_notice(notice);
                 }
             }
             Err(e) => {
@@ -548,9 +570,12 @@ impl App {
         let name = dir_name_of(&path);
         match crate::projects::remove(&path) {
             Ok(_) => {
+                let notice = match self.refresh_project_list() {
+                    Ok(()) => format!("已移除 {name}"),
+                    Err(e) => format!("移除已写入，但列表刷新失败：{e}"),
+                };
                 if let Some(p) = self.projects.as_mut() {
-                    p.refresh(crate::projects::list(&self.cfg));
-                    p.set_notice(format!("已移除 {name}"));
+                    p.set_notice(notice);
                 }
             }
             Err(e) => {
@@ -564,19 +589,23 @@ impl App {
 
     /// 切到另一个工作副本。
     ///
-    /// 和启动时"用真工作副本替换裸 svn"是同一段序列（`app.rs` 的构造里），
-    /// 走同一条路径才不会出现"启动正常、切换后少做一步"。
+    /// 先准备新副本的监听和首帧数据，成功后再替换当前状态。
     fn switch_to(&mut self, root: PathBuf) -> crate::domain::Result<()> {
         // 超时和 trust_cert 都从当前 Svn 继承：不继承的话切过去的仓库
         // 会悄悄用上默认超时、丢掉证书信任配置。
         let svn = crate::svn::Svn::discover(&root, self.svn.timeout(), self.svn.trust_cert)?;
+        // 只有 .svn 目录不代表有效副本，status 对空 .svn 也可能返回成功。
+        let title = Self::info_title(&svn.info()?);
+        // 先监听再扫描；任何准备失败都保留旧副本、文件树和面板。
+        let watch = super::refresh::RefreshWatch::new(svn.root.as_path());
+        let (items, root) = Self::fetch(&svn, self.sort)?;
         self.svn = svn;
-
-        // 与启动同序：先监听再扫描，免得扫描期间丢掉外部修改。
-        match super::refresh::RefreshWatch::new(self.svn.root.as_path()) {
-            Ok(w) => self.refresh_watch = Some(w),
-            Err(e) => self.watch_error = Some(e.to_string()),
-        }
+        let (watch, error) = match watch {
+            Ok(w) => (Some(w), None),
+            Err(e) => (None, Some(e.to_string())),
+        };
+        self.refresh_watch = watch;
+        self.watch_error = error;
 
         // 清掉一切绑定旧仓库的状态。这份清单是"切换"最容易埋 bug 的地方 ——
         // 漏掉任何一个，都会表现为"切过去了但屏幕上还留着上一个项目"。
@@ -597,11 +626,14 @@ impl App {
         self.query.clear();
         self.mode = Mode::Browse;
 
-        self.reload_sync()?;
-        self.title = Self::fetch_title(&self.svn);
-        if self.tree.selected().is_some() {
-            self.spawn_preview();
-        }
+        self.items = items;
+        self.root = root;
+        self.rebuild_tree_keep_mode();
+        self.last_refresh = Some(Instant::now());
+        self.scan_failed = false;
+        self.title = title;
+        // 空项目也必须使旧预览失效，不能等到有选中项才取消旧请求。
+        self.spawn_preview();
         self.set_notice(format!("已切换到 {}", dir_name_of(&self.svn.root)));
         Ok(())
     }
@@ -611,13 +643,15 @@ impl App {
     }
 
     fn fetch_title(svn: &Svn) -> String {
+        svn.info().map(|info| Self::info_title(&info)).unwrap_or_else(|_| "SVN".to_string())
+    }
+
+    fn info_title(info: &crate::domain::RepoInfo) -> String {
         let mut t = "SVN".to_string();
-        if let Ok(info) = svn.info() {
-            if let Some(rel) = info.relative_url.as_deref() {
-                t.push_str(&format!(" {}", rel.trim_start_matches("^/")));
-            }
-            t.push_str(&format!("@r{}", info.revision));
+        if let Some(rel) = info.relative_url.as_deref() {
+            t.push_str(&format!(" {}", rel.trim_start_matches("^/")));
         }
+        t.push_str(&format!("@r{}", info.revision));
         t
     }
 
@@ -4890,6 +4924,104 @@ mod refresh_tests {
         assert!(text.contains("项目"), "面板标题要出现，实际：{text}");
         assert!(text.contains("wc"), "当前副本要在列表里，实际：{text}");
         assert!(text.contains("当前"), "当前副本要有标记，实际：{text}");
+    }
+
+    #[test]
+    #[ignore = "需要 svn + svnadmin；仅操作临时本地仓库"]
+    fn project_switch_failure_preserves_the_current_project_and_panel() {
+        let (tmp, mut app) = temporary_app();
+        let old_root = app.svn.root.clone();
+        let old_title = app.title.clone();
+        app.query = "原项目过滤词".into();
+        let corrupt = tmp.path().join("corrupt");
+        std::fs::create_dir_all(corrupt.join(".svn")).unwrap();
+
+        // 分别覆盖 discover 失败和 discover 成功、工作副本校验失败。
+        for path in [tmp.path().join("missing"), corrupt] {
+            app.projects = Some(crate::tui::panels::projects::ProjectsPanel::new(
+                vec![crate::projects::Project {
+                    path,
+                    name: "失效项目".into(),
+                    source: crate::projects::Source::Registered,
+                    state: crate::projects::State::Missing,
+                }],
+                Some(old_root.clone()),
+            ));
+            app.mode = Mode::Projects;
+            let result = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            assert!(result.is_ok(), "切换失败应在面板内提示，不能退出 TUI：{result:?}");
+            assert_eq!(app.svn.root, old_root);
+            assert_eq!(app.root, old_root);
+            assert_eq!(app.title, old_title);
+            assert_eq!(app.query, "原项目过滤词");
+            assert_eq!(app.mode, Mode::Projects);
+            assert!(app.projects.is_some());
+            assert!(!app.should_quit());
+        }
+    }
+
+    #[test]
+    #[ignore = "需要 svn + svnadmin；子进程隔离临时配置和缓存"]
+    fn project_registration_and_removal_refresh_the_live_list() {
+        const TEST: &str = "tui::app::refresh_tests::project_registration_and_removal_refresh_the_live_list";
+        // 不修改测试进程的全局环境，避免影响并行运行的其他配置测试。
+        if std::env::var("SVNUI_PROJECTS_TEST_CHILD").ok().as_deref() != Some(TEST) {
+            let tmp = tempfile::tempdir().unwrap();
+            let out = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--ignored", "--nocapture"])
+                .env("SVNUI_PROJECTS_TEST_CHILD", TEST)
+                .env("SVNUI_CONFIG", tmp.path().join("config.toml"))
+                .env("SVNR_CACHE_DIR", tmp.path().join("cache"))
+                .output().unwrap();
+            assert!(out.status.success(), "{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+            return;
+        }
+
+        let other = tempfile::tempdir().unwrap();
+        let other_root = other.path().canonicalize().unwrap();
+        crate::projects::add(&other_root, Some("另一个项目")).unwrap();
+        let (_tmp, mut app) = temporary_app();
+        app.open_projects();
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)).unwrap();
+        let panel = app.projects.as_ref().unwrap();
+        assert_eq!(panel.selected().unwrap().source, crate::projects::Source::Registered);
+        assert!(app.cfg.projects.iter().any(|p| p.path == crate::projects::short_path(&app.svn.root)));
+
+        let project = crate::projects::list(&app.cfg).into_iter()
+            .find(|p| p.path == other_root).unwrap();
+        app.projects = Some(crate::tui::panels::projects::ProjectsPanel::new(
+            vec![project], Some(app.svn.root.clone()),
+        ));
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)).unwrap();
+        assert!(!app.cfg.projects.iter().any(|p| p.path == crate::projects::short_path(&other_root)));
+        assert_eq!(app.projects.as_ref().unwrap().selected().unwrap().path, app.svn.root);
+        app.open_projects();
+        assert!(!crate::projects::list(&app.cfg).iter().any(|p| p.path == other_root));
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)).unwrap();
+        assert!(app.cfg.projects.iter().any(|p| p.path == crate::projects::short_path(&app.svn.root)), "当前副本仍不能移除");
+    }
+
+    #[test]
+    #[ignore = "需要 svn + svnadmin；仅操作临时本地仓库"]
+    fn project_switch_to_clean_copy_rejects_old_preview() {
+        let (tmp, mut app) = temporary_app();
+        let url = format!("file://{}/repo", tmp.path().display());
+        run("svn", &["checkout", "--non-interactive", &url, "clean"], tmp.path());
+        let generation = app.preview_gen;
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        app.preview_worker.submit(generation, move |cancel| {
+            started_tx.send(cancel.clone()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            Some(PreviewPanel::file("旧项目", "迟到的结果"))
+        });
+        let token = started_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        app.switch_to(tmp.path().join("clean")).unwrap();
+        release_tx.send(()).unwrap();
+        assert!(app.tree.selected().is_none());
+        assert!(token.is_cancelled(), "切换必须取消旧项目的预览任务");
+        app.apply_preview(generation, PreviewPanel::file("旧项目", "迟到的结果"));
+        assert!(app.preview.is_none(), "空项目不能接收旧项目的预览");
     }
 
     /// 切换要把所有绑定旧仓库的状态清掉 ——
