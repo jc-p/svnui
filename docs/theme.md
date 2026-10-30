@@ -1,5 +1,37 @@
 # 配色
 
+## 内置 TUI 主题
+
+svnui 的终端界面通过 `ratatui-themekit` 统一配色。在 `~/.config/svnui/config.toml`
+的已有 `[ui]` 段内设置主题，然后重新启动 svnui：
+
+```toml
+[ui]
+theme = "catppuccin"
+```
+
+可选名称：`catppuccin`、`dracula`、`nord`、`gruvbox`、`one-dark`、`solarized`、
+`tailwind`、`tokyo-night`、`rose-pine`、`terminal`、`no-color`。
+
+- 旧配置省略 `theme` 时使用 `catppuccin`，无需迁移。
+- 名称拼错时回退到 `catppuccin`，界面会提示检查 `[ui].theme`。
+- `terminal` 使用终端自身的 ANSI 配色，适合希望跟随终端设置的用户。
+- `no-color` 关闭颜色；设置了 `NO_COLOR` 环境变量时也会优先使用无色模式。
+  无色模式仍通过粗体、下划线、反显及状态符号区分危险等级、冲突两侧和选中项。
+
+主题覆盖主界面、项目列表、检出、提交、确认、通知与本地文件预览。
+RGB 主题的次要文字会校正对比度，避免路径和说明在选中行中看不清。
+主题只改变显示，不改变 SVN 状态语义、操作权限或业务行为。
+
+面板标题用 `●` / `○` 区分激活和未激活，项目列表用 `◆` / `◇` 标出当前工作副本和其他项目。
+这些标记使用普通 Unicode 字符，不需要专用图标字体，无色模式也可通过形状辨认。
+
+普通通知显示在右上角；按 `F4` 查看完整详情，工作流内使用 `Shift+F4`。
+详情支持 `↑↓`、`PgUp/PgDn` 滚动，`Home/End` 跳转首尾，`y` 复制全文，`Esc` 关闭。
+信息和成功提示 8 秒后消失，警告保留 15 秒；错误自动打开详情并保留诊断原文。
+
+下文的 `theme.toml` 属于 Yazi 集成，独立于内置 TUI 的 `[ui].theme`。
+
 ## 状态符号与语义
 
 | 符号 | 含义 | 默认色 |

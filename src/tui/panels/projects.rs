@@ -17,7 +17,7 @@ use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
     Frame,
 };
 
@@ -201,10 +201,10 @@ impl ProjectsPanel {
     }
 
     pub fn render(&mut self, f: &mut Frame, area: Rect) {
-        f.render_widget(Clear, area);
+        theme::clear(f, area);
 
         let n = self.all.len();
-        let block = theme::block().borders(Borders::ALL).title(theme::focus_title(
+        let block = theme::block().border_style(theme::Theme::border_active()).borders(Borders::ALL).title(theme::focus_title(
             format!(" 项目 · {n} 个 "),
             true,
         ));
@@ -264,7 +264,7 @@ impl ProjectsPanel {
         f.render_stateful_widget(list, area, &mut self.state);
     }
 
-    /// 一行：`▸ 名称   路径   守护   状态`
+    /// 一行：`◆/◇ 名称   路径   守护   状态`；当前位置与列表选中状态独立。
     fn row_line(p: &crate::projects::Project, width: usize, current: bool) -> Line<'static> {
         let name_w = 16usize;
         // 右边留给守护标记（2）和状态文字（最多 8）。
@@ -275,7 +275,12 @@ impl ProjectsPanel {
         let path = theme::fit(&crate::projects::short_path(&p.path), path_w);
 
         let mut spans = vec![
-            Span::styled(format!("  {name:<name_w$}"), theme::Theme::body()),
+            // 当前项目的标记放在行首，窄窗口裁掉右侧状态时仍能辨认。
+            Span::styled(
+                if current { "◆ " } else { "◇ " },
+                if current { theme::Theme::hotkey() } else { theme::Theme::dim() },
+            ),
+            Span::styled(format!("{name:<name_w$}"), theme::Theme::body()),
             Span::styled(format!(" {path:<path_w$}"), theme::Theme::dim()),
         ];
 

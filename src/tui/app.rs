@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Borders, Clear, Paragraph};
+use ratatui::widgets::{Borders, Paragraph};
 use ratatui::Frame;
 use crate::tui::image_support::ImageSupport;
 use super::preview_worker::PreviewWorker;
@@ -329,6 +329,7 @@ impl App {
     ) -> crate::domain::Result<Self> {
         let (tx, rx) = channel();
         let cfg = crate::config::Config::load();
+        let theme_notice = theme::initialize(&cfg.ui.theme);
         // ⚠️ 必须在构造 Self 之前取：svn 马上要 move 进去，之后借不到了
         // 配置文件里的 `trust_cert` 与命令行 `--trust-cert` 是同一个开关的
         // 两个入口：内网自签名证书每次都要敲 `--trust-cert` 太烦，配一次就好。
@@ -395,6 +396,9 @@ impl App {
             should_quit: false,
         };
 
+        if let Some(notice) = theme_notice {
+            app.set_notice(notice);
+        }
         if let Some(url) = repo_url {
             // 以调用者提供的目录为浏览边界，避免访问无权限的仓库祖先。
             // RepoPanel 保留已有 percent-encoding，不对传入 URL 二次编码。
@@ -649,7 +653,8 @@ impl App {
     fn info_title(info: &crate::domain::RepoInfo) -> String {
         let mut t = "SVN".to_string();
         if let Some(rel) = info.relative_url.as_deref() {
-            t.push_str(&format!(" {}", rel.trim_start_matches("^/")));
+            // SVN URL 保持编码以供请求使用；标题在截断之前解码，避免拆开中文编码。
+            t.push_str(&format!(" {}", percent_decode(rel.trim_start_matches("^/"))));
         }
         t.push_str(&format!("@r{}", info.revision));
         t
@@ -1636,7 +1641,9 @@ impl App {
             }
             return Ok(());
         }
-        if key.code == KeyCode::F(4) && self.mode != Mode::Workflow {
+        // 工作流保留 F4 合并预演，Shift+F4 仍能查看通知。
+        if key.code == KeyCode::F(4)
+            && (self.mode != Mode::Workflow || key.modifiers.contains(KeyModifiers::SHIFT)) {
             self.show_notice = self.notice_panel.is_some();
             return Ok(());
         }
@@ -1899,9 +1906,7 @@ impl App {
                     }));
                 }
                 None => {
-                    // 不能勾的原因有很多（目录/无改动/未版本化/忽略），
-                    // 统一问 tree 要，别在这儿写死一句"目录不能勾选"——
-                    // 那样用户看到的是错误的原因。
+                    // 目录无可选后代、干净或未纳管文件分别给出实际原因。
                     self.notice = Some(Notice::new(
                         self.tree
                             .check_block_reason()
@@ -1911,23 +1916,20 @@ impl App {
                 }
             },
 
-            // Ctrl+A 分级全选 / i 反选 / Ctrl+R 清空
-            //
-            // 全选原来直接把所有可提交项（含折叠、搜索过滤之外的）勾上，
-            // 树上看不见它们，用户却要为它们负责 —— 提交范围里混进
-            // 没看过的文件是最容易出事的一种。
-            //
-            // 改成两级：先勾看得见的；再按一次才把隐藏的也带进来，
-            // 并且明确告诉你多带了多少。
+            // 批选遵守搜索范围，包含折叠项；重复全选不扩大到搜索之外。
             KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.check_all_escalating();
+                let added = self.tree.check_scope();
+                self.notice = Some(Notice::new(format!(
+                    "已全选当前筛选内的文件改动（含折叠项，新增 {} 项，共 {} 项）",
+                    added, self.tree.checked_count()
+                )));
             }
-            // i：反选看得见的可提交项。
+            // i：反选当前搜索范围，折叠不影响选择。
             // 「勾 3 个」和「除了这 3 个都要」是两种心情，后者原本只能
             // 先 Ctrl+A 再挨个取消。
             KeyCode::Char('i') => {
-                let n = self.tree.invert_visible();
-                self.notice = Some(Notice::new(format!("已反选当前可见项，现在勾着 {} 项", n)));
+                let n = self.tree.invert_scope();
+                self.notice = Some(Notice::new(format!("已反选当前筛选内的文件改动（含折叠项），共 {} 项", n)));
             }
             KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.tree.clear_check();
@@ -1970,17 +1972,10 @@ impl App {
             // T：变更树 ↔ 全量文件树
             KeyCode::Char('t') | KeyCode::Char('T') => {
                 let next = match self.tree.mode() {
-                    TreeMode::Changed => {
-                        // 切到全量：先读根目录
-                        let _ = self.tree.load_dir("");
-                        TreeMode::All
-                    }
-                    TreeMode::All => {
-                        self.tree.build_from_items(&self.items, &self.root);
-                        TreeMode::Changed
-                    }
+                    TreeMode::Changed => TreeMode::All,
+                    TreeMode::All => TreeMode::Changed,
                 };
-                self.tree.set_mode(next);
+                self.tree.switch_mode(next, &self.items, &self.root);
                 self.spawn_preview();
                 self.notice = Some(Notice::new(match next {
                     TreeMode::Changed => "已切换到变更视图",
@@ -2825,7 +2820,7 @@ impl App {
             .collect();
 
         // 提交信息生成用的改动清单（相对路径 + 状态符号）。
-        // 和 paths 同序（都按 visible 走），清单对得上。
+        // 和 paths 同序（按路径排序，包含折叠和过滤外的已有勾选）。
         let changes: Vec<Change> = self
             .tree
             .checked_changes()
@@ -3106,7 +3101,7 @@ impl App {
     fn do_revert_confirmed(&mut self, paths: Vec<PathBuf>) {
         let n = paths.len();
         self.spawn_busy("svn revert", move |svn| {
-            svn.revert(&paths, false)?;
+            svn.revert_exact(&paths)?;
             Ok(format!("已撤销 {} 个目标的本地改动", n))
         });
     }
@@ -3236,40 +3231,6 @@ impl App {
             svn.lock(&paths, unlock)?;
             Ok(format!("已{} {} 项", verb, n))
         });
-    }
-
-    /// `Ctrl+A`：先勾看得见的，再按一次才扩到全部。
-    ///
-    /// 返回给用户的每一句话都写清范围 —— 「已全选」这种说法
-    /// 在树上有折叠和过滤时是假的。
-    fn check_all_escalating(&mut self) {
-        let visible_total = self.tree.visible_committable_count();
-        let visible_checked = self
-            .items
-            .iter()
-            .filter(|i| self.tree.is_checked(&i.rel))
-            .count()
-            .min(visible_total);
-        if visible_checked < visible_total {
-            let added = self.tree.check_visible();
-            let hidden = self.tree.committable_count().saturating_sub(visible_total);
-            let msg = if hidden > 0 {
-                format!(
-                    "已勾选当前可见项（新增 {} 项）；折叠/过滤外还有 {} 项，再按 Ctrl+A 一起勾上",
-                    added, hidden
-                )
-            } else {
-                format!("已勾选当前可见项（新增 {} 项）", added)
-            };
-            self.notice = Some(Notice::new(msg));
-            return;
-        }
-        let added = self.tree.check_all_committable();
-        self.notice = Some(Notice::new(if added == 0 {
-            "可提交的项已经全部勾上了".to_string()
-        } else {
-            format!("已把折叠/过滤外的 {} 项也勾上（共 {} 项）", added, self.tree.checked_count())
-        }));
     }
 
     /// `Ctrl+K`：先确认再 cleanup。
@@ -3731,6 +3692,7 @@ impl App {
     // ── 渲染 ──────────────────────────────────────────────
 
     pub fn render(&mut self, f: &mut Frame, area: Rect) {
+        f.render_widget(ratatui::widgets::Block::default().style(theme::Theme::base()), area);
         self.sync_notice();
         // 矮到一定程度时任何布局都会把某一块压成 0 行，画出半个界面
         // 比明说"窗口太小"更让人困惑（表现为"按了没反应"）。
@@ -3748,32 +3710,23 @@ impl App {
             .constraints([
                 Constraint::Length(1),
                 Constraint::Min(3),
-                Constraint::Length(u16::from(self.notice.is_some())),
                 Constraint::Length(footer_height),
             ])
             .split(area);
 
         self.render_top(f, chunks[0]);
         self.render_body(f, chunks[1]);
-        self.render_bottom(f, chunks[3], vec![footer_row], footer_truncated);
-
-        if let Some(notice) = &self.notice {
-            let rect = chunks[2];
-            f.render_widget(
-                Paragraph::new(NoticePanel::summary(&notice.text, notice.level, rect.width)),
-                rect,
-            );
-        }
+        self.render_bottom(f, chunks[2], vec![footer_row], footer_truncated);
 
         // 搜索输入条：浮在底部上方
         if let Some(target) = self.searching {
-            let y = chunks[3].y.saturating_sub(2);
+            let y = chunks[2].y.saturating_sub(2);
             let rect = Rect::new(area.x + 2, y, area.width.saturating_sub(4), 1);
             let label = match target {
                 SearchFor::Tree => "搜索文件",
                 SearchFor::Log => "搜索提交",
             };
-            f.render_widget(Clear, rect);
+            theme::clear(f, rect);
             f.render_widget(
                 Paragraph::new(Line::from(vec![
                     Span::styled(format!(" {}：", label), theme::Theme::props()),
@@ -3789,7 +3742,8 @@ impl App {
             panel.render(f, theme::centered(area, 80, 85, 30, 8));
         }
         if let Some(panel) = self.diff.as_mut() {
-            if panel.kind() != PreviewKind::Image || (!self.show_help && !self.show_notice) {
+            if panel.kind() != PreviewKind::Image
+                || (!self.show_help && !self.show_notice && self.notice.is_none()) {
                 panel.render(f, theme::centered(area, 92, 92, 30, 8));
             }
         }
@@ -3803,7 +3757,7 @@ impl App {
         // 日志：加载中 / 失败 / 正常，三种状态都要有明确画面
         if self.mode == Mode::Log && self.logpanel.is_none() {
             let rect = theme::centered(area, 60, 40, 30, 8);
-            f.render_widget(Clear, rect);
+            theme::clear(f, rect);
 
             // 失败优先于"加载中"：错误已经有了，别再转圈
             if let Some((summary, detail)) = &self.log_error {
@@ -3852,7 +3806,7 @@ impl App {
         }
         if self.mode == Mode::Conflict && self.conflict.is_none() {
             let rect = theme::centered(area, 60, 25, 30, 8);
-            f.render_widget(Clear, rect);
+            theme::clear(f, rect);
             loading::Loading::new("扫描冲突", self.busy_ms())
                 .detail(Some("正在检查工作副本的冲突标记"))
                 .render(f, rect);
@@ -3878,7 +3832,7 @@ impl App {
                 None => {
                     // panel 还没建好（理论上不会），至少别黑屏
                     let rect = theme::centered(area, 60, 25, 30, 8);
-                    f.render_widget(Clear, rect);
+                    theme::clear(f, rect);
                     loading::Loading::new("连接仓库", self.busy_ms())
                         .detail(Some("正在读取远端目录"))
                         .render(f, rect);
@@ -3892,6 +3846,11 @@ impl App {
         if self.show_notice {
             if let Some(panel) = self.notice_panel.as_mut() {
                 panel.render(f, area);
+            }
+        } else if !self.show_help {
+            if let Some(panel) = self.notice_panel.as_mut() {
+                let key = if self.mode == Mode::Workflow { "Shift+F4" } else { "F4" };
+                panel.render_toast(f, area, key);
             }
         }
     }
@@ -4045,7 +4004,8 @@ impl App {
 
         match self.preview.as_mut() {
             Some(p) if p.kind() != PreviewKind::Image
-                || (self.mode == Mode::Browse && !self.show_help && !self.show_notice && self.searching.is_none()) => {
+                || (self.mode == Mode::Browse && !self.show_help && !self.show_notice
+                    && self.notice.is_none() && self.searching.is_none()) => {
                 p.render_pane(f, preview_area, self.preview_focused)
             }
             _ => {
@@ -4084,7 +4044,7 @@ impl App {
                 "a 添加当前   A 批量添加   Enter 打开   R 刷新   ? 帮助   q 退出"
             }
             Some(n) if n.is_dir => {
-                "Enter 展开/折叠   r 撤销目录改动   a 添加目录内新增   T 切换视图   R 刷新   ? 帮助   q 退出"
+                "Space 批选目录改动   Enter 展开/折叠   Ctrl+A 全选   T 切换视图   a 添加新增   ? 帮助   q 退出"
             }
             Some(n) if matches!(n.sign, 'C' | 'T') => {
                 "冲突 · X 处理冲突   Space 勾选   Enter 查看   R 刷新   ? 帮助"
@@ -4573,6 +4533,43 @@ mod path_tests {
     use super::*;
 
     #[test]
+    fn repository_title_displays_decoded_chinese_without_changing_the_url() {
+        let relative = "^/A8%E5%8D%87%E7%BA%A7%E5%8C%85/%E8%BF%90%E8%90%A5";
+        let info = crate::domain::RepoInfo {
+            root: "/workspace/wc".into(),
+            url: format!("https://svn.example.invalid/{}", &relative[2..]),
+            relative_url: Some(relative.into()),
+            revision: 144056,
+            repository_root: Some("https://svn.example.invalid".into()),
+            uuid: None,
+        };
+        let original = info.clone();
+        assert_eq!(App::info_title(&info), "SVN A8升级包/运营@r144056");
+        assert_eq!(info, original, "解码只能影响显示，不能修改实际仓库 URL");
+    }
+
+    #[test]
+    fn repository_title_decodes_once_and_preserves_literal_plus_and_bad_encoding() {
+        let mut info = crate::domain::RepoInfo {
+            root: "/workspace/wc".into(),
+            url: "https://svn.example.invalid".into(),
+            relative_url: None,
+            revision: 7,
+            repository_root: None,
+            uuid: None,
+        };
+        assert_eq!(App::info_title(&info), "SVN@r7");
+        for (url, title) in [
+            ("^/a%20b/A+B/100%25/%2520", "SVN a b/A+B/100%/%20@r7"),
+            ("^/a%ZZb", "SVN a%ZZb@r7"),
+            ("^/a%FFb", "SVN a%FFb@r7"),
+        ] {
+            info.relative_url = Some(url.into());
+            assert_eq!(App::info_title(&info), title);
+        }
+    }
+
+    #[test]
     fn decodes_percent_encoding() {
         // svn 对非 ASCII 路径会输出百分号编码
         assert_eq!(percent_decode("%E4%B8%AD%E6%96%87.txt"), "中文.txt");
@@ -4902,6 +4899,26 @@ mod refresh_tests {
         (tmp, app)
     }
 
+    #[test]
+    #[ignore = "需要 svn + svnadmin；验证网页复制的编码 URL 只在标题显示时解码"]
+    fn encoded_checkout_url_renders_a_readable_repository_title() {
+        let (tmp, mut app) = temporary_app();
+        let url = format!("file://{}/repo/A8升级包/运营", tmp.path().display());
+        run("svn", &["mkdir", "--parents", "--non-interactive", &url, "-m", "中文目录"], tmp.path());
+        let encoded = format!("file://{}/repo/A8%E5%8D%87%E7%BA%A7%E5%8C%85/%E8%BF%90%E8%90%A5", tmp.path().display());
+        run("svn", &["checkout", "--non-interactive", &encoded, "wc-chinese"], tmp.path());
+        app.switch_to(tmp.path().join("wc-chinese")).unwrap();
+        let info = app.svn.info().unwrap();
+        assert!(info.relative_url.as_deref().unwrap().contains("%E5"));
+        assert!(app.title.contains("A8升级包/运营"));
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(110, 28)).unwrap();
+        let frame = terminal.draw(|f| app.render(f, f.area())).unwrap();
+        let title: String = frame.buffer.content[..110].iter().flat_map(|c| c.symbol().chars())
+            .filter(|c| !c.is_whitespace()).collect();
+        assert!(title.contains("A8升级包/运营"), "顶部实际显示：{title}");
+        assert!(!title.contains("%E5"));
+    }
+
     /// `Ctrl+P` 要真的画出项目面板，而且**当前所在的副本必须在列表里** ——
     /// 它可能既没登记、也没留下缓存，但"我现在在哪儿"是面板必须能回答的。
     #[test]
@@ -5053,6 +5070,34 @@ mod refresh_tests {
         // 草稿按副本存：新的没有，旧的还在
         assert!(!app.commit_drafts.contains_key(&app.svn.root));
         assert_eq!(app.commit_drafts.len(), 1, "上个项目的草稿要留着");
+    }
+
+    #[test]
+    #[ignore = "需要 svn + svnadmin；仅操作临时本地仓库"]
+    fn notice_toast_keeps_main_layout_and_keyboard_focus() {
+        let (_tmp, mut app) = temporary_app();
+        app.notice = None;
+        app.notice_panel = None;
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+        let before = terminal.draw(|f| app.render(f, f.area())).unwrap().buffer.clone();
+        app.set_notice("已切换到 A8_V26.1.12.4_ZZJR");
+        assert!(!app.show_notice, "成功提示不能抢焦点");
+        let frame = terminal.draw(|f| app.render(f, f.area())).unwrap();
+        for y in 0..24 {
+            for x in 0..30 {
+                assert_eq!(frame.buffer[(x, y)], before[(x, y)], "主界面不能因通知挤掉一行");
+            }
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE)).unwrap();
+        assert!(app.searching.is_some(), "通知显示时仍可操作文件树");
+        app.handle_key(KeyEvent::new(KeyCode::F(4), KeyModifiers::NONE)).unwrap();
+        assert!(app.show_notice);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+        assert!(!app.show_notice);
+        assert!(app.searching.is_some(), "关闭详情应返回原操作");
+        app.mode = Mode::Workflow;
+        app.handle_key(KeyEvent::new(KeyCode::F(4), KeyModifiers::SHIFT)).unwrap();
+        assert!(app.show_notice, "工作流内也必须能打开提示详情");
     }
 
     #[test]
@@ -5270,13 +5315,18 @@ mod refresh_tests {
                 .flat_map(|c| c.symbol().chars())
                 .filter(|c| !c.is_whitespace())
                 .collect();
-            assert!(text.contains("自动刷新"));
-            assert!(text.contains("未纳管1"));
+            assert!(text.contains("自动刷新"), "{width}×{height} 缺少刷新状态");
+            assert!(text.contains("new.txt"), "{width}×{height} 必须能看到文件");
             if width >= 40 {
                 assert!(text.contains("a添加当前"));
-                assert!(text.contains("A批量添加"));
                 assert!(text.contains("?帮助"));
                 assert!(text.contains("q退出"));
+            }
+            // 单行底栏在窄窗裁剪中间项；空间足够时才要求显示批量添加。
+            if width >= 80 {
+                assert!(text.contains("A批量添加"));
+                // 顶栏也按宽度裁剪；窄窗优先保留项目名和刷新状态。
+                assert!(text.contains("未纳管1"));
             }
         }
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
@@ -5415,7 +5465,7 @@ mod refresh_tests {
         assert!(!app.preview.as_ref().unwrap().is_empty());
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 24)).unwrap();
         let frame = terminal.draw(|f| app.render(f, f.area())).unwrap();
-        assert!(frame.buffer.content.iter().any(|cell| matches!(cell.fg, Color::Rgb(..)) || matches!(cell.bg, Color::Rgb(..))), "兼容模式应绘制图片色块");
+        assert!(frame.buffer.content.iter().any(|cell| cell.fg == Color::Rgb(210, 40, 70) || cell.bg == Color::Rgb(210, 40, 70)), "兼容模式应绘制图片色块");
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)).unwrap();
         assert!(app.browse_hint().contains("图片"));
         app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE)).unwrap();
@@ -5445,7 +5495,7 @@ mod refresh_tests {
         wait_until(&mut app, |a| a.preview.as_ref().is_some_and(|p| p.kind() == PreviewKind::Image));
         app.show_help = true;
         let frame = terminal.draw(|f| app.render(f, f.area())).unwrap();
-        assert!(!frame.buffer.content.iter().any(|cell| matches!(cell.fg, Color::Rgb(..)) || matches!(cell.bg, Color::Rgb(..))), "帮助弹层显示时暂停图片绘制");
+        assert!(!frame.buffer.content.iter().any(|cell| cell.fg == Color::Rgb(30, 150, 90) || cell.bg == Color::Rgb(30, 150, 90)), "帮助弹层显示时暂停图片绘制");
         app.show_help = false;
 
         std::fs::File::create(app.root.join("large.png")).unwrap().set_len(file_preview::MAX_BYTES + 1).unwrap();
@@ -5573,6 +5623,8 @@ mod refresh_tests {
             ConfirmAction::Add(paths) => assert_eq!(paths, &expected),
             _ => panic!("应为添加确认"),
         }
+        assert_eq!(app.confirm.as_ref().unwrap().picked_count(), Some((1, 2)),
+            "搜索范围外的新增项列入清单，但不能默认选中");
         assert!(!app.is_busy());
         app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE))
             .unwrap();
@@ -5587,6 +5639,10 @@ mod refresh_tests {
             ConfirmAction::Add(paths) => assert_eq!(paths, &expected),
             _ => panic!("确认期间不能替换添加目标"),
         }
+        // 搜索外的项必须由用户在确认框里显式选中；后来出现的文件不在冻结清单中。
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL))
+            .unwrap();
+        assert_eq!(app.confirm.as_ref().unwrap().picked_count(), Some((2, 2)));
         app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
             .unwrap();
         wait_for_scan(&mut app);
@@ -5747,6 +5803,107 @@ mod refresh_tests {
     }
 
     #[test]
+    #[ignore = "需要 svn + svnadmin；目录批选只提交具体文件，折叠/搜索不漏项"]
+    fn directory_batch_selection_commits_hidden_files_without_unselected_siblings() {
+        let (_tmp, mut app) = temporary_app();
+        let root = app.root.clone();
+        std::fs::create_dir_all(root.join("group/nested")).unwrap();
+        std::fs::create_dir(root.join("group2")).unwrap();
+        for rel in [
+            "group/a.txt",
+            "group/nested/b.txt",
+            "group/keep.txt",
+            "group2/c.txt",
+        ] {
+            std::fs::write(root.join(rel), "original\n").unwrap();
+        }
+        run("svn", &["add", "group", "group2"], &root);
+        run(
+            "svn",
+            &["commit", "--non-interactive", "-m", "setup batch"],
+            &root,
+        );
+        for rel in ["group/a.txt", "group/nested/b.txt", "group2/c.txt"] {
+            std::fs::write(root.join(rel), "changed\n").unwrap();
+        }
+        std::fs::write(root.join("group/new.txt"), "untracked\n").unwrap();
+        app.reload_sync().unwrap();
+        select_path(&mut app, "group");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.tree.checked_count(), 2);
+
+        // 切换到完整树时，已有改动子节点不能掩盖干净的 keep.txt。
+        app.handle_key(KeyEvent::new(KeyCode::Char('T'), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        select_path(&mut app, "group/keep.txt");
+        assert!(!app.tree.is_checkable("group/keep.txt"));
+        app.handle_key(KeyEvent::new(KeyCode::Char('T'), KeyModifiers::NONE))
+            .unwrap();
+
+        // 搜索结果之外的旧勾选仍应进入提交面板，但不能把当前未选文件带入。
+        app.tree.set_filter(Some("c.txt".into()));
+        app.handle_key(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.mode, Mode::Commit);
+        assert_eq!(
+            app.commit_paths,
+            vec![root.join("group/a.txt"), root.join("group/nested/b.txt")]
+        );
+        app.svn
+            .commit("directory batch", &app.commit_paths)
+            .unwrap();
+        assert_eq!(fresh_sign(&app, "group2/c.txt"), 'M');
+        assert_eq!(fresh_sign(&app, "group/new.txt"), '?');
+        let remaining = App::fetch(&app.svn, app.sort).unwrap().0;
+        assert!(
+            !remaining
+                .iter()
+                .any(|i| matches!(i.rel.as_str(), "group/a.txt" | "group/nested/b.txt")),
+            "已提交的两个文件应从 SVN 改动清单消失"
+        );
+    }
+
+    #[test]
+    #[ignore = "需要 svn + svnadmin；全选重复按不扩大搜索范围"]
+    fn batch_keys_respect_search_and_preserve_picks_when_switching_views() {
+        let (_tmp, mut app) = temporary_app();
+        let root = app.root.clone();
+        std::fs::write(root.join("b.txt"), "original\n").unwrap();
+        run("svn", &["add", "b.txt"], &root);
+        run(
+            "svn",
+            &["commit", "--non-interactive", "-m", "setup"],
+            &root,
+        );
+        for rel in ["a.txt", "b.txt"] {
+            std::fs::write(root.join(rel), "changed\n").unwrap();
+        }
+        app.reload_sync().unwrap();
+        app.tree.set_filter(Some("a.txt".into()));
+        for _ in 0..2 {
+            app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL))
+                .unwrap();
+        }
+        assert_eq!(app.tree.checked_count(), 1);
+        assert!(!app.tree.is_checked("b.txt"));
+        for _ in 0..2 {
+            app.handle_key(KeyEvent::new(KeyCode::Char('T'), KeyModifiers::NONE))
+                .unwrap();
+            assert_eq!(app.tree.filter().map(String::as_str), Some("a.txt"));
+            assert_eq!(app.tree.selected().unwrap().rel, "a.txt");
+            assert_eq!(app.tree.checked_count(), 1);
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.tree.checked_count(), 0);
+    }
+
+    #[test]
     #[ignore = "需要 svn + svnadmin；目录撤销恢复修改/删除，普通新增保留文件且不碰相似前缀"]
     fn revert_directory_restores_baseline_and_preserves_added_and_unversioned_files() {
         let (_tmp, mut app) = temporary_app();
@@ -5786,7 +5943,19 @@ mod refresh_tests {
         wait_for_scan(&mut app);
         assert_eq!(app.mode, Mode::Confirm);
         match app.confirm.as_ref().unwrap().action() {
-            ConfirmAction::Revert(paths) => assert_eq!(paths, &vec![root.join("group")]),
+            ConfirmAction::Revert(paths) => {
+                // 确认范围必须逐项列出，包含目录属性与新增目录，执行时不递归带入其他文件。
+                let expected: Vec<_> = [
+                    "group",
+                    "group/deleted.txt",
+                    "group/missing.txt",
+                    "group/modified.txt",
+                    "group/new",
+                    "group/new/nested",
+                    "group/new/nested/added.txt",
+                ].into_iter().map(|rel| root.join(rel)).collect();
+                assert_eq!(paths, &expected);
+            }
             _ => panic!("应确认当前目录范围"),
         }
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
@@ -5818,6 +5987,7 @@ mod refresh_tests {
             "keep unversioned\n"
         );
         assert_eq!(fresh_sign(&app, "group2.txt"), 'M');
+        assert!(!app.show_notice, "撤销应成功完成并刷新，不得出现部分执行后的错误详情");
         assert!(!app.items.iter().any(|item| item.rel == "group"), "目录属性改动也应撤销");
     }
 

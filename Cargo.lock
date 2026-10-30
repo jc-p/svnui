@@ -1885,6 +1885,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ratatui-themekit"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "add55c1a2dce84b0fbc98bad03721a70a91213c27709986be3c31df912f47655"
+dependencies = [
+ "ratatui",
+]
+
+[[package]]
 name = "ratatui-widgets"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2265,7 +2274,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "svnui"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "calamine",
  "camino",
@@ -2278,6 +2287,7 @@ dependencies = [
  "quick-xml 0.36.2",
  "ratatui",
  "ratatui-image",
+ "ratatui-themekit",
  "serde",
  "serde_json",
  "tempfile",

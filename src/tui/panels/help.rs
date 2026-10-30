@@ -6,7 +6,7 @@
 use ratatui::{
     layout::{Alignment, Rect},
     text::{Line, Span},
-    widgets::{Borders, Clear, Paragraph},
+    widgets::{Borders, Paragraph},
     Frame,
 };
 
@@ -53,7 +53,7 @@ const GROUPS: &[Group] = &[
             ("Enter", "打开：目录=展开折叠，文件=全屏看内容"),
             ("图片预览", "PNG/JPEG/WebP/GIF 首帧/BMP/ICO，自动适应窗口；Enter 全屏"),
             ("预览限制", "压缩包及超过 2 MiB 的文件关闭内容预览，图片和办公文档同样受限"),
-            ("Space", "勾选/取消当前可提交文件"),
+            ("Space", "勾选文件；目录批选后代文件改动（含折叠项，遵守搜索）"),
             ("E", "用外部编辑器打开（$VISUAL / $EDITOR / vim）"),
             ("o", "用系统默认应用打开当前文件（图片全屏内也可用）"),
         ],
@@ -61,7 +61,7 @@ const GROUPS: &[Group] = &[
     Group {
         title: "查看",
         keys: &[
-            ("T", "切换「只看变更」和「完整文件树」"),
+            ("T", "切换「改动」和「全部文件」，保留筛选、有效勾选并尽量定位原路径"),
             ("S", "排序循环：按状态 → 按路径 → 按文件名"),
             ("L", "提交历史（右侧显示每个版本改了什么）"),
             ("Ctrl+B", "svn blame：这一行最后是谁改的、在哪一版改的"),
@@ -100,9 +100,9 @@ const GROUPS: &[Group] = &[
     Group {
         title: "提交",
         keys: &[
-            ("Space", "在文件树上勾选/取消提交或撤销的文件"),
-            ("Ctrl+A", "先勾当前可见项；再按一次，把折叠/搜索过滤外的也勾上"),
-            ("i", "反选当前可见项（「除了这几个都要」不用先全选再挨个取消）"),
+            ("Space", "勾选文件或批选目录；[-] 表示目录内部分选中，再按补齐"),
+            ("Ctrl+A", "全选当前筛选内的文件改动，包含折叠项；重复按不扩大范围"),
+            ("i", "反选当前筛选内的文件改动，包含折叠项"),
             ("Ctrl+R", "清空勾选"),
             ("C", "打开提交面板（只写说明，文件清单在上面）"),
             ("Ctrl+G", "生成提交信息（配了 llm 走模型，否则本地规则；再按轮换候选）"),
@@ -114,7 +114,7 @@ const GROUPS: &[Group] = &[
         title: "其他",
         keys: &[
             ("?", "显示/隐藏本帮助"),
-            ("F4", "查看完整提示：自动换行；↑↓/PgUp/PgDn 滚动，Home/End 首尾，y 复制全文，Esc 关闭"),
+            ("F4 / Shift+F4", "查看右上角提示详情（工作流用 Shift+F4）；↑↓/PgUp/PgDn 滚动，Home/End 首尾，y 复制全文，Esc 关闭"),
             ("", ""),
             ("子面板内（只在对应面板里生效）：", ""),
             ("X 冲突面板", "Enter 保留现状 / m 用我的 / t 用服务器的 / 1 2 3 仅切换预览"),
@@ -140,7 +140,7 @@ pub struct HelpPanel;
 
 impl HelpPanel {
     pub fn render(f: &mut Frame, area: Rect) {
-        f.render_widget(Clear, area);
+        theme::clear(f, area);
 
         let mut lines: Vec<Line> = Vec::new();
 

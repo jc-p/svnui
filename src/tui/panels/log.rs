@@ -7,7 +7,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     text::{Line, Span},
     widgets::{
-        Borders, Clear, List, ListItem, ListState, Paragraph,
+        Borders, List, ListItem, ListState, Paragraph,
         ScrollbarOrientation, ScrollbarState,
     },
     Frame,
@@ -203,7 +203,7 @@ impl LogPanel {
     }
 
     pub fn render(&mut self, f: &mut Frame, area: Rect) {
-        f.render_widget(Clear, area);
+        theme::clear(f, area);
 
         // 左栏固定 28 列：内容就是 "2026-05-12 pengjiecheng"，定宽，
         // 用百分比的话终端一宽就多余、一窄又挤。

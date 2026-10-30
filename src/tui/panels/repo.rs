@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     text::{Line, Span},
-    widgets::{Borders, Clear, List, ListItem, ListState, Paragraph,
+    widgets::{Borders, List, ListItem, ListState, Paragraph,
               ScrollbarOrientation},
     Frame,
 };
@@ -486,7 +486,7 @@ impl RepoPanel {
     // ------------------------------------------------------------ 渲染
 
     pub fn render(&mut self, f: &mut Frame, area: Rect) {
-        f.render_widget(Clear, area);
+        theme::clear(f, area);
 
         let rows = Layout::default()
             .direction(Direction::Vertical)

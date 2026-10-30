@@ -585,6 +585,20 @@ impl Svn {
         self.paths_op_owned(&args, paths)
     }
 
+    /// 撤销确认清单中的精确目标；目录不递归带入已被用户剔除的后代。
+    pub fn revert_exact(&self, paths: &[PathBuf]) -> Result<RawOutput> {
+        if paths.is_empty() {
+            return Ok(RawOutput { stdout: String::new(), stderr: String::new(), code: Some(0) });
+        }
+        let mut targets = paths.to_vec();
+        // 先取消新增子项，再取消其父目录，避免父目录先解除纳管后子项报 E155010。
+        targets.sort_by(|a, b| b.components().count().cmp(&a.components().count())
+            .then_with(|| a.cmp(b)));
+        targets.dedup();
+        let args = vec!["revert".to_string(), "--depth".to_string(), "empty".to_string(), "--".to_string()];
+        self.paths_op_owned(&args, &targets)
+    }
+
     /// `svn commit -F -`。提交信息走 stdin，避免 shell 转义问题。
     ///
     /// ⚠️ 这里**故意不用** `command::run` —— 那条路径强制 `stdin=null`，

@@ -11,7 +11,7 @@
 //! "可见节点列表"（只含祖先都展开的），光标在这个扁平列表上移动。
 //! 这样 `j/k` 就是简单的下标加减，不需要递归查找。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use ratatui::{
     text::{Line, Span},
@@ -53,6 +53,10 @@ pub struct TreePanel {
     nodes: HashMap<String, Node>,
     /// 扁平化后的可见节点（相对路径），光标在这上面移动。
     visible: Vec<String>,
+    /// 压缩行只改变展示，节点与操作目标仍使用真实相对路径。
+    compact_rows: HashMap<String, (String, usize)>,
+    /// 有变更子节点不代表读过目录，必须单独记录磁盘加载状态。
+    loaded_dirs: HashSet<String>,
     state: ListState,
     mode: TreeMode,
     /// 搜索关键词（小写，用于包含匹配）。
@@ -81,6 +85,8 @@ impl TreePanel {
         Self {
             nodes: HashMap::new(),
             visible: Vec::new(),
+            compact_rows: HashMap::new(),
+            loaded_dirs: HashSet::new(),
             state: ListState::default(),
             mode: TreeMode::Changed,
             filter: None,
@@ -101,8 +107,11 @@ impl TreePanel {
         let rel = self.visible.get(self.state.selected()?)?;
         let n = self.nodes.get(rel)?;
         if n.is_dir {
-            // 提交目录：svn 会递归整棵子树，范围不可控。
-            return Some("目录不能勾选，请把光标移到文件上");
+            return if self.directory_targets(rel).is_empty() {
+                Some("此目录在当前筛选内没有可选的文件改动；未纳管项请先按 a 添加")
+            } else {
+                None
+            };
         }
         if is_committable_sign(n.sign) {
             return None;
@@ -131,12 +140,23 @@ impl TreePanel {
 
     /// 切换当前项的勾选状态。返回切换后是否勾选。
     pub fn toggle_check(&mut self) -> Option<bool> {
-        // 不能勾的（目录 / 无改动 / 未版本化 / 忽略 / 外部）直接挡掉，
-        // 具体原因让调用方用 check_block_reason 去问。
         if self.check_block_reason().is_some() {
             return None;
         }
         let rel = self.visible.get(self.state.selected()?)?.clone();
+        if self.nodes.get(&rel)?.is_dir {
+            let targets = self.directory_targets(&rel);
+            let on = !targets.iter().all(|p| self.checked.contains(p));
+            // 目录只是选择分组，绝不把目录路径作为递归提交目标。
+            for path in targets {
+                if on {
+                    self.checked.insert(path);
+                } else {
+                    self.checked.remove(&path);
+                }
+            }
+            return Some(on);
+        }
         if self.checked.contains(&rel) {
             self.checked.remove(&rel);
             Some(false)
@@ -154,6 +174,60 @@ impl TreePanel {
     /// 勾选数量。
     pub fn checked_count(&self) -> usize {
         self.checked.len()
+    }
+
+    fn directory_targets(&self, rel: &str) -> Vec<String> {
+        let prefix = format!("{rel}/");
+        self.scope_committable()
+            .into_iter()
+            .filter(|p| p.starts_with(&prefix))
+            .collect()
+    }
+
+    /// 搜索约束选择范围；目录折叠只影响展示，不影响批选。
+    fn scope_committable(&self) -> Vec<String> {
+        self.nodes
+            .keys()
+            .filter(|p| self.is_checkable(p) && self.matches_filter(p))
+            .cloned()
+            .collect()
+    }
+
+    pub fn check_scope(&mut self) -> usize {
+        let before = self.checked.len();
+        let targets = self.scope_committable();
+        self.checked.extend(targets);
+        self.checked.len() - before
+    }
+
+    pub fn invert_scope(&mut self) -> usize {
+        for path in self.scope_committable() {
+            if !self.checked.remove(&path) {
+                self.checked.insert(path);
+            }
+        }
+        self.checked.len()
+    }
+
+    pub fn hidden_checked_count(&self) -> usize {
+        let visible: HashSet<&String> = self.visible.iter().collect();
+        self.checked.iter().filter(|p| !visible.contains(p)).count()
+    }
+
+    /// 一次按祖先累加，避免渲染每个目录时反复扫描整棵树。
+    fn directory_counts(&self) -> HashMap<String, (usize, usize)> {
+        let mut counts = HashMap::new();
+        for path in self.scope_committable() {
+            let selected = usize::from(self.checked.contains(&path));
+            let mut parent = path.as_str();
+            while let Some((ancestor, _)) = parent.rsplit_once('/') {
+                let count = counts.entry(ancestor.to_string()).or_insert((0, 0));
+                count.0 += selected;
+                count.1 += 1;
+                parent = ancestor;
+            }
+        }
+        counts
     }
 
     /// 清空勾选。
@@ -176,54 +250,6 @@ impl TreePanel {
         self.checked.clear();
     }
 
-    /// 当前**看得见**的可提交条目（过滤与折叠之后的）。
-    fn visible_committable(&self) -> Vec<String> {
-        self.visible
-            .iter()
-            .filter(|r| self.is_checkable(r))
-            .cloned()
-            .collect()
-    }
-
-    /// 看得见的可提交条目数。
-    pub fn visible_committable_count(&self) -> usize {
-        self.visible.iter().filter(|r| self.is_checkable(r)).count()
-    }
-
-    /// 全部可提交条目数（含折叠、搜索过滤之外的）。
-    pub fn committable_count(&self) -> usize {
-        self.nodes
-            .values()
-            .filter(|n| !n.is_dir && is_committable_sign(n.sign))
-            .count()
-    }
-
-    /// 勾选当前看得见的可提交项。返回**本次新勾上**的数量。
-    ///
-    /// 只补勾、不清空已勾的 —— 已经用 Space 挑好的不该被"全选"冲掉。
-    pub fn check_visible(&mut self) -> usize {
-        let targets = self.visible_committable();
-        let mut added = 0;
-        for rel in targets {
-            if self.checked.insert(rel) {
-                added += 1;
-            }
-        }
-        added
-    }
-
-    /// 反选当前看得见的可提交项。返回反选后的勾选总数。
-    pub fn invert_visible(&mut self) -> usize {
-        for rel in self.visible_committable() {
-            if self.checked.contains(&rel) {
-                self.checked.remove(&rel);
-            } else {
-                self.checked.insert(rel);
-            }
-        }
-        self.checked.len()
-    }
-
     /// 勾选全部可提交项（含折叠、搜索过滤之外的）。返回新勾上的数量。
     ///
     /// `?`（未版本化）永远不自动勾 —— 它还没纳入版本控制，
@@ -244,32 +270,32 @@ impl TreePanel {
         added
     }
 
-    /// 勾选的绝对路径（按 visible 顺序，便于展示时稳定）。
+    /// 全部有效勾选按路径排序，折叠和过滤不能让已选项漏出提交清单。
     ///
     /// 再过滤一次 is_checkable 是保险：勾选之后状态可能变了
     /// （比如勾了 M 文件又按 R 还原，sign 变成空格），
     /// 这时它还在 checked 里，但已经不该提交。
     /// 光靠 UI 不画框不够 —— 状态变化后旧勾选还在集合里。
     pub fn checked_abs(&self) -> Vec<std::path::PathBuf> {
-        self.visible
-            .iter()
-            .filter(|r| self.checked.contains(*r))
-            .filter(|r| self.is_checkable(r))
-            .filter_map(|r| self.nodes.get(r).map(|n| n.abs.clone()))
+        self.checked_changes()
+            .into_iter()
+            .filter_map(|(rel, _)| self.nodes.get(&rel).map(|n| n.abs.clone()))
             .collect()
     }
 
     /// 勾选项的「相对路径 + 状态符号」，供提交信息生成（`Ctrl+G`）用。
     ///
-    /// 与 `checked_abs` 同序（都按 `visible` 走）—— 清单和待提交路径
+    /// 与 `checked_abs` 同序（按相对路径排序）—— 清单和待提交路径
     /// 顺序一致，对照着看不会错位。
     pub fn checked_changes(&self) -> Vec<(String, char)> {
-        self.visible
+        let mut changes: Vec<_> = self
+            .checked
             .iter()
-            .filter(|r| self.checked.contains(*r))
             .filter(|r| self.is_checkable(r))
             .filter_map(|r| self.nodes.get(r).map(|n| (n.rel.clone(), n.sign)))
-            .collect()
+            .collect();
+        changes.sort_by(|a, b| a.0.cmp(&b.0));
+        changes
     }
 
     /// 清掉已经不可提交的勾选（revert / commit 之后状态会变）。
@@ -299,11 +325,13 @@ impl TreePanel {
 
     pub fn set_mode(&mut self, mode: TreeMode) {
         self.mode = mode;
-        // 两种模式内容完全不同，上次的搜索词留着没有意义，
-        // 还会让人以为"搜到了但列表是空的"。
-        self.filter = None;
         self.search_loaded = false;
         self.rebuild_visible();
+    }
+
+    pub fn switch_mode(&mut self, mode: TreeMode, items: &[Item], root: &std::path::Path) {
+        self.mode = mode;
+        self.refresh_from_items(items, root);
     }
 
     // ── 构建 ──────────────────────────────────────────────
@@ -319,7 +347,14 @@ impl TreePanel {
             .nodes
             .values()
             .filter(|n| n.is_dir)
-            .map(|n| (n.rel.clone(), n.expanded, !n.children.is_empty(), n.depth))
+            .map(|n| {
+                (
+                    n.rel.clone(),
+                    n.expanded,
+                    self.loaded_dirs.contains(&n.rel),
+                    n.depth,
+                )
+            })
             .collect();
         dirs.sort_by_key(|d| d.3);
 
@@ -360,6 +395,7 @@ impl TreePanel {
     /// 它的 sign 由子节点冒泡 —— 父目录显示最严重的那个子状态。
     pub fn build_from_items(&mut self, items: &[Item], root: &std::path::Path) {
         self.nodes.clear();
+        self.loaded_dirs.clear();
         self.nodes.insert(
             String::new(),
             Node {
@@ -395,7 +431,11 @@ impl TreePanel {
                         abs: root.join(&child_rel),
                         is_dir: !is_last || item.is_dir,
                         sign: if is_last { item.sign } else { ' ' },
-                        xy: if is_last { item.xy.clone() } else { String::new() },
+                        xy: if is_last {
+                            item.xy.clone()
+                        } else {
+                            String::new()
+                        },
                         depth: i,
                         // 中间目录默认全展开：变更树通常不深，展开比折叠有用
                         expanded: true,
@@ -470,18 +510,23 @@ impl TreePanel {
     /// 重新算可见节点列表（祖先都展开的）。
     fn rebuild_visible(&mut self) {
         self.visible.clear();
+        self.compact_rows.clear();
         // ⚠️ 先 clone 出来：直接 `match self.filter.as_deref()` 会让不可变借用
         //    一直活到 match 结束，而分支里要调 &mut self 的方法，必然冲突。
         let f = self.filter.clone();
         match f.as_deref() {
             Some(f) if !f.is_empty() => self.collect_matched(f),
-            _ => self.collect_visible(String::new()),
+            _ => self.collect_visible(String::new(), 0),
         }
 
         if self.visible.is_empty() {
             self.state.select(None);
         } else {
-            let i = self.state.selected().unwrap_or(0).min(self.visible.len() - 1);
+            let i = self
+                .state
+                .selected()
+                .unwrap_or(0)
+                .min(self.visible.len() - 1);
             self.state.select(Some(i));
         }
     }
@@ -537,24 +582,42 @@ impl TreePanel {
         self.visible = list;
     }
 
-    fn collect_visible(&mut self, rel: String) {
-        let Some(node) = self.nodes.get(&rel).cloned() else {
+    fn collect_visible(&mut self, rel: String, depth: usize) {
+        let Some(mut node) = self.nodes.get(&rel).cloned() else {
             return;
         };
-
-        // ⚠️ 顺序很重要：先把自己加进可见列表，再决定要不要递归子节点。
-        //    写在 `if !node.expanded { return }` 后面的话，折叠的目录连自己
-        //    都不显示 —— 看起来就像"树没生效"（只剩几个展开的叶子）。
-        // 根不显示。
-        if !rel.is_empty() && self.matches_filter(&rel) {
-            self.visible.push(rel.clone());
+        if rel.is_empty() {
+            for child in node.children {
+                self.collect_visible(child, depth);
+            }
+            return;
         }
-
+        let mut label = node.name.clone();
+        // 改动树已知完整状态，可以压缩单目录链；完整工程树保留逐级导航，
+        // 避免把尚未加载的干净兄弟节点误当作不存在。
+        while self.mode == TreeMode::Changed
+            && node.expanded
+            && node.is_dir
+            && node.xy.trim().is_empty()
+            && node.children.len() == 1
+        {
+            let Some(child) = self.nodes.get(&node.children[0]) else {
+                break;
+            };
+            if !child.is_dir || !child.xy.trim().is_empty() {
+                break;
+            }
+            label.push('/');
+            label.push_str(&child.name);
+            node = child.clone();
+        }
+        self.compact_rows.insert(node.rel.clone(), (label, depth));
+        self.visible.push(node.rel.clone());
         if !node.expanded {
             return;
         }
         for c in node.children.clone() {
-            self.collect_visible(c);
+            self.collect_visible(c, depth + 1);
         }
     }
 
@@ -608,7 +671,12 @@ impl TreePanel {
 
     /// 展开/折叠。返回 true 表示需要重新扫描（全量模式懒加载）。
     pub fn toggle(&mut self) -> bool {
-        let Some(rel) = self.state.selected().and_then(|i| self.visible.get(i)).cloned() else {
+        let Some(rel) = self
+            .state
+            .selected()
+            .and_then(|i| self.visible.get(i))
+            .cloned()
+        else {
             return false;
         };
         let Some(node) = self.nodes.get(&rel) else {
@@ -624,13 +692,8 @@ impl TreePanel {
         }
 
         // 全量模式：展开时才读目录（懒加载，避免一次遍历整个仓库）
-        let need_load = now_expanded
-            && self.mode == TreeMode::All
-            && self
-                .nodes
-                .get(&rel)
-                .map(|n| n.children.is_empty())
-                .unwrap_or(false);
+        let need_load =
+            now_expanded && self.mode == TreeMode::All && !self.loaded_dirs.contains(&rel);
 
         self.rebuild_visible();
         need_load
@@ -692,6 +755,19 @@ impl TreePanel {
                 }
             }
         }
+        self.loaded_dirs.insert(rel.to_string());
+        let mut children = self
+            .nodes
+            .get(rel)
+            .map(|n| n.children.clone())
+            .unwrap_or_default();
+        children.sort_by_cached_key(|path| {
+            let node = &self.nodes[path];
+            (!node.is_dir, node.name.to_lowercase(), node.name.clone())
+        });
+        if let Some(parent) = self.nodes.get_mut(rel) {
+            parent.children = children;
+        }
         Ok(())
     }
 
@@ -712,7 +788,7 @@ impl TreePanel {
                 break;
             }
             let (depth, loaded, children) = match self.nodes.get(&rel) {
-                Some(n) => (n.depth, !n.children.is_empty(), n.children.clone()),
+                Some(n) => (n.depth, self.loaded_dirs.contains(&rel), n.children.clone()),
                 None => continue,
             };
             if depth >= max_depth {
@@ -753,10 +829,22 @@ impl TreePanel {
         self.filter.as_ref()
     }
 
-
     // ── 渲染 ──────────────────────────────────────────────
 
+    fn title(&self) -> &'static str {
+        match self.mode {
+            TreeMode::Changed => " [改动] / 全部文件 · T切换 ",
+            TreeMode::All => " 改动 / [全部文件] · T切换 ",
+        }
+    }
+
     pub fn render(&mut self, f: &mut Frame, area: ratatui::layout::Rect, focused: bool) {
+        let hidden = self.hidden_checked_count();
+        let selection = if hidden > 0 {
+            format!(" 已选 {} · 隐藏 {} ", self.checked_count(), hidden)
+        } else {
+            format!(" 已选 {} ", self.checked_count())
+        };
         if self.visible.is_empty() {
             let message = if self.filter.is_some() {
                 "无匹配项，按 / 修改过滤词，Esc 清空过滤"
@@ -765,15 +853,24 @@ impl TreePanel {
             } else {
                 "目录为空，按 R 重新扫描"
             };
-            let block = theme::block().borders(Borders::ALL)
-                .title(theme::focus_title(
-                    if self.mode == TreeMode::Changed { " 变更 " } else { " 文件树 " },
-                    focused,
-                ))
-                .border_style(if focused { theme::Theme::border_active() } else { theme::Theme::border() });
-            f.render_widget(Paragraph::new(message).style(theme::Theme::dim()).block(block), area);
+            let block = theme::block()
+                .borders(Borders::ALL)
+                .title(theme::focus_title(self.title(), focused))
+                .title_bottom(Line::from(selection))
+                .border_style(if focused {
+                    theme::Theme::border_active()
+                } else {
+                    theme::Theme::border()
+                });
+            f.render_widget(
+                Paragraph::new(message)
+                    .style(theme::Theme::dim())
+                    .block(block),
+                area,
+            );
             return;
         }
+        let counts = self.directory_counts();
         let items: Vec<ListItem> = self
             .visible
             .iter()
@@ -784,29 +881,35 @@ impl TreePanel {
             .map(|(rel, node)| {
                 let style = theme::for_sign(node.sign);
 
-                let indent = "  ".repeat(node.depth);
+                let (label, depth) = self
+                    .compact_rows
+                    .get(rel)
+                    .map(|(name, depth)| (name.as_str(), *depth))
+                    .unwrap_or((&node.name, node.depth));
+                let indent = "  ".repeat(depth);
                 // 目录：三角 + 名字 + 尾斜杠
                 let (mark, name) = if node.is_dir {
                     let m = if node.expanded { "▾ " } else { "▸ " };
-                    (m, format!("{}/", node.name))
+                    (m, format!("{label}/"))
                 } else {
-                    ("  ", node.name.clone())
+                    ("  ", label.to_string())
                 };
 
-                // 勾选框：只有"真能提交"的文件才画。
-                //
-                // 目录、干净文件、未版本化(?)、忽略(I)、外部(X) 一律留空：
-                // 给它们画一个 [ ] 是骗人的 —— 勾上也不会进提交，
-                // 用户会以为勾选生效了，结果是空提交或者漏提交。
-                //
-                // 留三个空格而不是不画：要保持这一列对齐，
-                // 否则有框和没框的文件名会错开一列。
-                let checkbox = if !self.is_checkable(rel) {
-                    Span::raw("   ")
-                } else if self.checked.contains(rel) {
-                    Span::styled("[x] ", theme::Theme::checked())
+                let (selected, total) = counts.get(rel).copied().unwrap_or_default();
+                let checkbox = if node.is_dir && total > 0 {
+                    match selected {
+                        0 => Span::styled("[ ] ", theme::Theme::unchecked()),
+                        n if n == total => Span::styled("[x] ", theme::Theme::checked()),
+                        _ => Span::styled("[-] ", theme::Theme::checked()),
+                    }
+                } else if self.is_checkable(rel) {
+                    if self.checked.contains(rel) {
+                        Span::styled("[x] ", theme::Theme::checked())
+                    } else {
+                        Span::styled("[ ] ", theme::Theme::unchecked())
+                    }
                 } else {
-                    Span::styled("[ ] ", theme::Theme::unchecked())
+                    Span::raw("    ")
                 };
 
                 let mut spans = vec![
@@ -818,7 +921,19 @@ impl TreePanel {
                     Span::styled(name, style),
                 ];
 
-                if !node.is_dir && !node.xy.trim().is_empty() {
+                if node.is_dir && total > 0 {
+                    spans.push(Span::styled(
+                        format!("  {selected}/{total}"),
+                        theme::Theme::dim(),
+                    ));
+                }
+                // 单一状态已在名前显示；仅补充属性等不同的第二状态。
+                if !node.is_dir
+                    && node
+                        .xy
+                        .chars()
+                        .any(|c| c != ' ' && c != '_' && c != node.sign)
+                {
                     spans.push(Span::styled(
                         format!("  {}", node.xy.trim_end()),
                         theme::Theme::dim(),
@@ -829,17 +944,17 @@ impl TreePanel {
             })
             .collect();
 
-        let title = match self.mode {
-            TreeMode::Changed => " 变更 ",
-            TreeMode::All => " 文件树 ",
-        };
-
         let list = List::new(items)
             .block(
                 theme::block()
                     .borders(Borders::ALL)
-                    .title(theme::focus_title(title, focused))
-                    .border_style(if focused { theme::Theme::border_active() } else { theme::Theme::border() }),
+                    .title(theme::focus_title(self.title(), focused))
+                    .title_bottom(Line::from(selection))
+                    .border_style(if focused {
+                        theme::Theme::border_active()
+                    } else {
+                        theme::Theme::border()
+                    }),
             )
             .highlight_style(theme::Theme::selected());
 
@@ -943,10 +1058,9 @@ mod refresh_state_tests {
         assert!(!tree.nodes["src/nested"].expanded);
     }
 
-    /// 全选不该勾上树上看不见的东西：过滤之后还把隐藏项算进来，
-    /// 用户就是在为没看过的文件负责。
+    /// 全选受搜索约束，重复按不扩大范围；显式全量方法仍供无勾选提交使用。
     #[test]
-    fn check_visible_stops_at_what_the_user_can_see() {
+    fn check_scope_respects_search_and_keeps_existing_picks() {
         let mut tree = TreePanel::new();
         let root = Path::new("/wc");
         tree.build_from_items(
@@ -958,16 +1072,21 @@ mod refresh_state_tests {
             ],
             root,
         );
-        assert_eq!(tree.committable_count(), 3, "未纳管的 tmp/d.tmp 不算可提交");
+        assert_eq!(
+            tree.scope_committable().len(),
+            3,
+            "未纳管的 tmp/d.tmp 不算可提交"
+        );
 
         // 关键词含 `/` 才按整条路径匹配；只写 "src" 匹配的是文件名。
         tree.set_filter(Some("src/".into()));
-        assert_eq!(tree.visible_committable_count(), 2);
-        assert_eq!(tree.check_visible(), 2);
+        assert_eq!(tree.scope_committable().len(), 2);
+        assert_eq!(tree.check_scope(), 2);
         assert!(tree.is_checked("src/a.txt"));
         assert!(!tree.is_checked("docs/c.txt"), "过滤外的不该被勾上");
 
-        // 再按一次才扩到全部（含过滤外）。
+        // 重复全选不扩大搜索范围；提交入口仍可显式选择全部。
+        assert_eq!(tree.check_scope(), 0);
         assert_eq!(tree.check_all_committable(), 1);
         assert!(tree.is_checked("docs/c.txt"));
         assert!(!tree.is_checked("tmp/d.tmp"), "未纳管永远不自动勾");
@@ -977,26 +1096,26 @@ mod refresh_state_tests {
         assert_eq!(tree.checked_count(), 3);
     }
 
-    /// 反选只作用于可见范围，否则「除了这几个都要」会把过滤外的也翻进来。
+    /// 反选遵守搜索范围，不影响搜索之外的勾选。
     #[test]
-    fn invert_only_flips_the_visible_range() {
+    fn invert_only_flips_the_search_range() {
         let mut tree = TreePanel::new();
         tree.build_from_items(
             &[item("a.txt", 'M'), item("b.txt", 'M'), item("c.txt", 'M')],
             Path::new("/wc"),
         );
         tree.set_filter(Some("a".into()));
-        assert_eq!(tree.invert_visible(), 1);
+        assert_eq!(tree.invert_scope(), 1);
         assert!(tree.is_checked("a.txt"));
 
         // 再反一次：a 取消，b/c 不受影响（它们不在可见范围内）。
-        assert_eq!(tree.invert_visible(), 0);
+        assert_eq!(tree.invert_scope(), 0);
         assert!(!tree.is_checked("a.txt"));
     }
 
     /// 已经用 Space 挑好的不该被「全选」冲掉 —— 全选只补勾。
     #[test]
-    fn check_visible_adds_without_clearing_manual_picks() {
+    fn check_scope_adds_without_clearing_manual_picks() {
         let mut tree = TreePanel::new();
         tree.build_from_items(
             &[item("a.txt", 'M'), item("b.txt", 'M'), item("c.txt", 'M')],
@@ -1004,7 +1123,7 @@ mod refresh_state_tests {
         );
         tree.set_checked("b.txt", true);
         tree.set_filter(Some("a".into()));
-        assert_eq!(tree.check_visible(), 1);
+        assert_eq!(tree.check_scope(), 1);
         assert!(tree.is_checked("b.txt"), "手动勾的还在");
         assert!(tree.is_checked("a.txt"));
     }
@@ -1022,5 +1141,155 @@ mod refresh_state_tests {
         tree.refresh_from_items(&[], root);
         assert!(tree.selected().is_none());
         assert_eq!(tree.state.offset(), 0);
+    }
+
+    #[test]
+    fn directory_space_selects_folded_descendants_without_siblings_or_untracked() {
+        let mut tree = TreePanel::new();
+        tree.build_from_items(
+            &[
+                item("src/a.txt", 'M'),
+                item("src/nested/b.txt", 'A'),
+                item("src/new.txt", '?'),
+                item("src/ignored.txt", 'I'),
+                item("src/external.txt", 'X'),
+                item("src2/c.txt", 'M'),
+            ],
+            Path::new("/wc"),
+        );
+        select(&mut tree, "src");
+        tree.toggle();
+        assert!(!tree.visible.contains(&"src/nested/b.txt".into()));
+        assert_eq!(tree.toggle_check(), Some(true));
+        assert_eq!(tree.checked_count(), 2);
+        assert_eq!(
+            tree.checked_abs(),
+            vec![
+                Path::new("/wc/src/a.txt"),
+                Path::new("/wc/src/nested/b.txt")
+            ]
+        );
+        assert_eq!(
+            tree.checked_changes(),
+            vec![("src/a.txt".into(), 'M'), ("src/nested/b.txt".into(), 'A')]
+        );
+        assert_eq!(tree.hidden_checked_count(), 2);
+        assert_eq!(tree.toggle_check(), Some(false));
+        assert_eq!(tree.checked_count(), 0);
+    }
+
+    #[test]
+    fn partial_directory_selection_and_search_do_not_expand_scope() {
+        let mut tree = TreePanel::new();
+        tree.build_from_items(
+            &[
+                item("src/a.sql", 'M'),
+                item("src/b.sql", 'D'),
+                item("src/keep.txt", 'M'),
+                item("other/c.sql", 'M'),
+            ],
+            Path::new("/wc"),
+        );
+        tree.set_checked("src/a.sql", true);
+        assert_eq!(tree.directory_counts()["src"], (1, 3));
+        tree.set_filter(Some(".sql".into()));
+        select(&mut tree, "src");
+        assert_eq!(tree.toggle_check(), Some(true));
+        assert_eq!(tree.directory_counts()["src"], (2, 2));
+        assert!(!tree.is_checked("src/keep.txt"));
+        assert!(!tree.is_checked("other/c.sql"));
+        tree.set_filter(Some("keep".into()));
+        assert_eq!(tree.checked_abs().len(), 2, "搜索不丢失先前的勾选");
+        assert_eq!(tree.hidden_checked_count(), 2);
+        assert_eq!(tree.check_scope(), 1);
+        assert_eq!(tree.check_scope(), 0);
+        assert_eq!(tree.invert_scope(), 2);
+        assert!(tree.is_checked("src/a.sql"));
+    }
+
+    #[test]
+    fn check_scope_includes_folds_and_empty_directory_cannot_be_checked() {
+        let mut tree = TreePanel::new();
+        tree.build_from_items(
+            &[item("src/a.txt", 'M'), item("new/b.txt", '?')],
+            Path::new("/wc"),
+        );
+        select(&mut tree, "src");
+        tree.toggle();
+        assert_eq!(tree.check_scope(), 1);
+        assert_eq!(tree.invert_scope(), 0);
+        select(&mut tree, "new");
+        assert!(tree.check_block_reason().is_some());
+        assert_eq!(tree.toggle_check(), None);
+    }
+
+    #[test]
+    fn compact_tree_renders_partial_counts_and_keeps_actual_file_targets() {
+        let mut tree = TreePanel::new();
+        tree.build_from_items(
+            &[
+                item("db/mysql/omc/a.sql", 'M'),
+                item("db/mysql/omc/b.sql", 'M'),
+            ],
+            Path::new("/wc"),
+        );
+        assert_eq!(
+            tree.visible,
+            vec!["db/mysql/omc", "db/mysql/omc/a.sql", "db/mysql/omc/b.sql"]
+        );
+        tree.set_checked("db/mysql/omc/a.sql", true);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(70, 10)).unwrap();
+        let frame = terminal.draw(|f| tree.render(f, f.area(), true)).unwrap();
+        let text: String = frame.buffer.content.iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("[-] M db/mysql/omc/  1/2"));
+        select(&mut tree, "db/mysql/omc");
+        assert_eq!(tree.toggle_check(), Some(true));
+        assert_eq!(tree.checked_count(), 2);
+        tree.toggle();
+        assert_eq!(tree.checked_abs().len(), 2);
+        assert!(tree.checked_abs().iter().all(|p| p.extension().is_some()));
+    }
+
+    #[test]
+    fn full_tree_loads_clean_siblings_even_when_changed_children_exist() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/changed.txt"), "changed").unwrap();
+        std::fs::write(tmp.path().join("src/clean.txt"), "clean").unwrap();
+        std::fs::create_dir(tmp.path().join("src/subdir")).unwrap();
+        let mut tree = TreePanel::new();
+        let mut changed = item("src/changed.txt", 'M');
+        changed.abs = tmp.path().join(&changed.rel);
+        let items = [changed];
+        tree.build_from_items(&items, tmp.path());
+        tree.set_checked("src/changed.txt", true);
+        select(&mut tree, "src/changed.txt");
+        tree.switch_mode(TreeMode::All, &items, tmp.path());
+        assert_eq!(tree.selected().unwrap().rel, "src/changed.txt");
+        assert!(tree.visible.contains(&"src/clean.txt".into()));
+        assert!(!tree.is_checkable("src/clean.txt"));
+        assert_eq!(tree.nodes["src"].children[0], "src/subdir");
+        tree.set_filter(Some("changed".into()));
+        tree.switch_mode(TreeMode::Changed, &items, tmp.path());
+        assert_eq!(tree.selected().unwrap().rel, "src/changed.txt");
+        assert_eq!(tree.filter().map(String::as_str), Some("changed"));
+        assert_eq!(tree.checked_count(), 1);
+        assert!(!tree.nodes.contains_key("src/clean.txt"));
+    }
+
+    #[test]
+    fn full_tree_expands_unloaded_directory_with_changed_children() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/clean.txt"), "clean").unwrap();
+        let mut tree = TreePanel::new();
+        tree.build_from_items(&[item("src/changed.txt", 'M')], tmp.path());
+        tree.set_mode(TreeMode::All);
+        select(&mut tree, "src");
+        assert!(!tree.toggle(), "折叠不加载");
+        assert!(tree.toggle(), "展开时即使已有改动子节点也要读磁盘");
+        tree.load_dir("src").unwrap();
+        assert!(tree.visible.contains(&"src/clean.txt".into()));
     }
 }

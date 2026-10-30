@@ -18,7 +18,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Borders, Clear, List, ListItem, ListState, Paragraph},
+    widgets::{Borders, List, ListItem, ListState, Paragraph},
     Frame,
 };
 
@@ -195,7 +195,7 @@ impl ConflictPanel {
 
     pub fn render(&mut self, f: &mut Frame, area: Rect, root: &std::path::Path) {
         let pop = theme::centered(area, 85, 85, 40, 10);
-        f.render_widget(Clear, pop);
+        theme::clear(f, pop);
 
         let n = self.files.len();
         let block = theme::block()
@@ -402,13 +402,13 @@ mod tests {
     /// 三路对比翻页后靠位置记哪边是谁会搞反，两个标记必须自带身份。
     #[test]
     fn conflict_markers_carry_which_side_they_are() {
-        let fg_of = |line: &str| colorize(line).spans[0].style.fg;
-        let mine = fg_of("<<<<<<< .mine");
-        let theirs = fg_of(">>>>>>> .r10");
-        assert_eq!(mine, theme::Theme::danger_bold().fg);
-        assert_eq!(theirs, theme::Theme::conflict_theirs().fg);
-        assert_ne!(mine, theirs, "两侧撞色就分不出哪份是谁的");
-        assert_eq!(fg_of("======="), theme::Theme::hotkey().fg);
+        let style_of = |line: &str| colorize(line).spans[0].style;
+        let mine = style_of("<<<<<<< .mine");
+        let theirs = style_of(">>>>>>> .r10");
+        assert_eq!(mine, theme::Theme::danger_bold());
+        assert_eq!(theirs, theme::Theme::conflict_theirs());
+        assert_ne!(mine, theirs, "无色模式也必须能区分冲突两侧");
+        assert_eq!(style_of("======="), theme::Theme::hotkey());
     }
 
     /// 正文不能带底色：一整片青底会把内容压得读不出来。

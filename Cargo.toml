@@ -1,6 +1,6 @@
 [package]
 name = "svnui"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2021"
 rust-version = "1.88"
 description = "Subversion with a real TUI: status, diff, commit, conflicts"
@@ -23,7 +23,7 @@ path = "src/lib.rs"
 # TUI 是主形态，但用 feature 隔离：不要 TUI 的场景（CI、最小化构建）
 # 可以 --no-default-features 关掉，省掉 crossterm 那堆依赖。
 default = ["tui", "docs"]
-tui = ["dep:ratatui", "dep:crossterm", "dep:tui-textarea", "dep:ratatui-image", "dep:image"]
+tui = ["dep:ratatui", "dep:ratatui-themekit", "dep:crossterm", "dep:tui-textarea", "dep:ratatui-image", "dep:image"]
 
 # 办公文档预览（CSV / Excel / Word）。
 # 关掉能省掉 calamine + csv + docx-lite 的编译时间；
@@ -50,6 +50,7 @@ camino = { version = "1", features = ["serde1"] }
 # （官方 backends 文档明确警告过：不同主版本各自维护事件队列和 raw mode）。
 # 所以这里显式钉 0.29，并用 tui-textarea-2（支持 ratatui 0.30+ 的维护分支）。
 ratatui = { version = "0.30", optional = true }
+ratatui-themekit = { version = "0.6.1", optional = true }
 crossterm = { version = "0.29", optional = true }
 tui-textarea = { package = "tui-textarea-2", version = "0.13", optional = true }
 # 图片只启用常见格式；不引入 chafa 系统库或全部解码器。

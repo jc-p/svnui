@@ -4,7 +4,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     layout::Rect,
     text::{Line, Span},
-    widgets::{Borders, Clear, Paragraph, Wrap},
+    widgets::{Borders, Paragraph, Wrap},
     Frame,
 };
 
@@ -102,7 +102,7 @@ impl WorkflowPanel {
     }
 
     pub fn render(&self, f: &mut Frame, area: Rect) {
-        f.render_widget(Clear, area);
+        theme::clear(f, area);
         let block = theme::block()
             .borders(Borders::ALL)
             .title(format!(" 分支工作流 · {} ", self.operation.title()))

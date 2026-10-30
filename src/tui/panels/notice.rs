@@ -2,10 +2,10 @@
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
-    layout::Rect,
+    layout::{Alignment, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Borders, Clear, Paragraph, ScrollbarOrientation, ScrollbarState},
+    widgets::{Borders, Paragraph, ScrollbarOrientation, ScrollbarState},
     Frame,
 };
 
@@ -66,7 +66,7 @@ impl Level {
     }
 }
 
-/// 底栏上那条通知。
+/// 右上角通知；普通回执不抢焦点，完整原文独立保留。
 ///
 /// 之前只有 `Option<String>`：等级靠 `Level::of()` 从文案里猜
 /// （路径含"失败"就会误判成错误），而且没有生命周期 ——
@@ -149,6 +149,7 @@ pub struct NoticePanel {
     scroll: usize,
     viewport: usize,
     feedback: Option<(Level, String)>,
+    content_width: u16,
 }
 
 impl NoticePanel {
@@ -160,6 +161,13 @@ impl NoticePanel {
     }
 
     pub fn with_level(message: String, level: Level) -> Self {
+        // 消息只在创建时测量；长诊断不在每帧重复扫描。
+        let content_width = message
+            .lines()
+            .map(|s| Line::from(s).width())
+            .max()
+            .unwrap_or(0)
+            .min(92) as u16;
         Self {
             level,
             message,
@@ -168,6 +176,7 @@ impl NoticePanel {
             scroll: 0,
             viewport: 0,
             feedback: None,
+            content_width,
         }
     }
 
@@ -208,88 +217,111 @@ impl NoticePanel {
         Action::None
     }
 
-    /// 摘要明确显示省略号，并为详情入口预留宽度；不修改独立保存的完整原文。
-    pub fn summary(message: &str, level: Level, width: u16) -> Line<'static> {
-        let prefix = format!("[{}] ", level.label());
-        let suffix = "  F4 详情";
-        let reserved = Line::from(prefix.as_str()).width() + Line::from(suffix).width();
-        if usize::from(width) <= reserved {
-            return Line::from(Span::styled("F4 详情", level.style()));
+    fn prepare_rows(&mut self, width: u16) {
+        if self.wrap_width != Some(width) {
+            self.rows = wrap_text(&self.message, width);
+            self.wrap_width = Some(width);
         }
-        let text = message.lines().next().unwrap_or("");
-        let available = usize::from(width) - reserved;
-        let truncated = Line::from(text).width() > available || message.contains('\n');
-        let limit = available.saturating_sub(usize::from(truncated));
-        let mut visible = String::new();
-        let mut used = 0;
-        for ch in text.chars() {
-            let cells = Line::from(ch.to_string()).width();
-            if used + cells > limit {
-                break;
+    }
+
+    /// 非模态通知最多三行正文；省略只影响显示，F4 仍可读取、复制全文。
+    pub fn render_toast(&mut self, f: &mut Frame, area: Rect, details_key: &str) {
+        let width = (self.content_width + 4).clamp(32, 60);
+        let bounds = corner_area(area, width, 5);
+        if bounds.width < 6 || bounds.height < 3 {
+            return;
+        }
+        self.prepare_rows(bounds.width.saturating_sub(4));
+        let height = (self.rows.len().min(3) as u16 + 2).min(bounds.height);
+        let pop = Rect::new(bounds.x, bounds.y, bounds.width, height);
+        theme::clear(f, pop);
+        let block = theme::block()
+            .borders(Borders::ALL)
+            .title(Span::styled(
+                format!(" {} ", self.level.label()),
+                self.level.style(),
+            ))
+            .title_bottom(
+                Line::from(Span::styled(
+                    format!(" {details_key} 详情 "),
+                    theme::Theme::dim(),
+                ))
+                .alignment(Alignment::Right),
+            )
+            .border_style(self.level.style().remove_modifier(Modifier::BOLD));
+        let body = padded_body(block.inner(pop));
+        f.render_widget(block, pop);
+        let mut lines = self
+            .rows
+            .iter()
+            .take(body.height as usize)
+            .cloned()
+            .collect::<Vec<_>>();
+        if self.rows.len() > lines.len() {
+            if let Some(last) = lines.last_mut() {
+                *last = theme::fit(&format!("{last}…"), body.width as usize);
             }
-            visible.push(ch);
-            used += cells;
         }
-        if truncated {
-            visible.push('…');
-        }
-        Line::from(vec![
-            Span::styled(prefix, level.style()),
-            Span::styled(visible, level.style().remove_modifier(Modifier::BOLD)),
-            Span::styled(suffix, level.style()),
-        ])
+        f.render_widget(
+            Paragraph::new(lines.into_iter().map(Line::from).collect::<Vec<_>>())
+                .style(theme::Theme::body()),
+            body,
+        );
     }
 
     pub fn render(&mut self, f: &mut Frame, area: Rect) {
-        let pad_x = if area.width >= 40 { 2 } else { 0 };
-        let pad_y = u16::from(area.height >= 8);
-        let pop = Rect::new(
-            area.x + pad_x,
-            area.y + pad_y,
-            area.width.saturating_sub(pad_x * 2),
-            area.height.saturating_sub(pad_y * 2),
-        );
-        f.render_widget(Clear, pop);
-        let block = theme::block()
-            .borders(Borders::ALL)
-            .title(format!(" {} · 完整提示 ", self.level.label()))
-            .border_style(self.level.style());
-        let inner = block.inner(pop);
-        f.render_widget(block, pop);
-        if inner.width == 0 || inner.height == 0 {
+        // 短消息详情也按内容收紧；长错误最多占窗口约三分之二，留出仓库上下文。
+        let max_width = ((u32::from(area.width) * 2 / 3) as u16).clamp(40, 96);
+        let width = (self.content_width + 4).clamp(40, max_width);
+        let max_height = ((u32::from(area.height) * 2 / 3) as u16).max(5);
+        let bounds = corner_area(area, width, max_height);
+        if bounds.width < 6 || bounds.height < 3 {
             return;
         }
-
-        let keys = if inner.width >= 80 {
-            "↑↓ 滚动  PgUp/PgDn 翻页  Home/End 首尾  y 复制全文  Esc 关闭"
-        } else {
-            "↑↓ 滚动  PgUp/PgDn 翻页\nHome/End 首尾  y 复制全文\nEsc 关闭"
-        };
-        let mut footer = self
-            .feedback
-            .as_ref()
-            .map(|(level, text)| (text.clone(), *level))
-            .into_iter()
-            .collect::<Vec<_>>();
-        footer.extend(
-            wrap_text(keys, inner.width)
-                .into_iter()
-                .map(|s| (s, Level::Info)),
-        );
-        let footer_height = footer.len().min(inner.height.saturating_sub(1) as usize) as u16;
-        let body = Rect::new(
-            inner.x,
-            inner.y,
-            inner.width.saturating_sub(1),
-            inner.height - footer_height,
-        );
-        // 换行结果按宽度缓存；只在尺寸改变时重新处理长诊断文本。
-        if self.wrap_width != Some(body.width) {
-            self.rows = wrap_text(&self.message, body.width);
-            self.wrap_width = Some(body.width);
-        }
+        self.prepare_rows(bounds.width.saturating_sub(4));
+        let feedback_height = u16::from(self.feedback.is_some() && bounds.height >= 4);
+        let height = self
+            .rows
+            .len()
+            .saturating_add(2 + feedback_height as usize)
+            .min(bounds.height as usize) as u16;
+        let pop = Rect::new(bounds.x, bounds.y, bounds.width, height);
+        let mut body = padded_body(Rect::new(
+            pop.x + 1,
+            pop.y + 1,
+            pop.width.saturating_sub(2),
+            pop.height.saturating_sub(2),
+        ));
+        body.height = body.height.saturating_sub(feedback_height);
         self.viewport = body.height as usize;
         self.scroll = self.scroll.min(self.max_scroll());
+        let scrolling = self.rows.len() > self.viewport;
+        let keys = if scrolling && pop.width >= 36 {
+            " ↑↓ 滚动 · y 复制 · Esc 关闭 "
+        } else {
+            " y 复制 · Esc 关闭 "
+        };
+        let mut block = theme::block()
+            .borders(Borders::ALL)
+            .title(Span::styled(
+                format!(" {} · 详情 ", self.level.label()),
+                self.level.style(),
+            ))
+            .title_bottom(
+                Line::from(Span::styled(keys, theme::Theme::dim())).alignment(Alignment::Right),
+            )
+            .border_style(self.level.style().remove_modifier(Modifier::BOLD));
+        if scrolling && pop.width >= 48 {
+            block = block.title_top(
+                Line::from(Span::styled(
+                    format!(" ↑↓ PgUp/PgDn · {}/{} ", self.scroll + 1, self.rows.len()),
+                    theme::Theme::dim(),
+                ))
+                .alignment(Alignment::Right),
+            );
+        }
+        theme::clear(f, pop);
+        f.render_widget(block, pop);
         let lines = self
             .rows
             .iter()
@@ -297,32 +329,50 @@ impl NoticePanel {
             .take(self.viewport)
             .map(|s| Line::from(s.as_str()))
             .collect::<Vec<_>>();
-        f.render_widget(
-            Paragraph::new(lines).style(theme::Theme::body()),
-            body,
-        );
-        if self.rows.len() > self.viewport && inner.width > 1 {
+        f.render_widget(Paragraph::new(lines).style(theme::Theme::body()), body);
+        if scrolling {
             let mut state = ScrollbarState::new(self.rows.len())
                 .position(self.scroll)
                 .viewport_content_length(self.viewport);
             f.render_stateful_widget(
                 theme::scrollbar(ScrollbarOrientation::VerticalRight),
-                Rect::new(inner.x, inner.y, inner.width, body.height),
+                Rect::new(body.x, body.y, body.width + 1, body.height),
                 &mut state,
             );
         }
-        let footer_area = Rect::new(inner.x, body.bottom(), inner.width, footer_height);
-        f.render_widget(
-            Paragraph::new(
-                footer
-                    .into_iter()
-                    .take(footer_height as usize)
-                    .map(|(text, level)| Line::from(Span::styled(text, level.style())))
-                    .collect::<Vec<_>>(),
-            ),
-            footer_area,
-        );
+        if let Some((level, text)) = &self.feedback {
+            let footer = Rect::new(body.x, body.bottom(), body.width, feedback_height);
+            f.render_widget(
+                Paragraph::new(theme::fit(text, body.width as usize)).style(level.style()),
+                footer,
+            );
+        }
     }
+}
+
+/// 避开顶栏与主体边框；极窄、极矮窗口按实际空间缩小，支持非零原点。
+fn corner_area(area: Rect, width: u16, height: u16) -> Rect {
+    let margin = u16::from(area.width >= 12);
+    let top = if area.height >= 8 { 2 } else { 0 };
+    let width = width.min(area.width.saturating_sub(margin * 2));
+    Rect::new(
+        area.right().saturating_sub(margin + width),
+        area.y + top,
+        width,
+        height.min(
+            area.height
+                .saturating_sub(top + u16::from(area.height >= 8)),
+        ),
+    )
+}
+
+fn padded_body(inner: Rect) -> Rect {
+    Rect::new(
+        inner.x + u16::from(inner.width > 0),
+        inner.y,
+        inner.width.saturating_sub(2),
+        inner.height,
+    )
 }
 
 /// 按终端列宽硬换行，保留多行、空格和长路径；不使用 Paragraph 的 u16 滚动偏移。
@@ -352,7 +402,6 @@ fn wrap_text(text: &str, width: u16) -> Vec<String> {
 mod tests {
     use super::*;
     use crossterm::event::KeyModifiers;
-    use ratatui::style::Color;
     use ratatui::{backend::TestBackend, Terminal};
 
     #[test]
@@ -372,19 +421,38 @@ mod tests {
     }
 
     #[test]
-    fn notice_colors_and_summary_keep_details_entry() {
+    fn notice_colors_and_toasts_keep_details_entry() {
         for (message, level, color) in [
-            ("提交失败：/a/path/失败.sql", Level::Error, Color::LightRed),
-            ("已提交 3 项", Level::Success, Color::Green),
-            ("⚠️ 实际提交了 0 项", Level::Warning, Color::Yellow),
-            ("排序：状态", Level::Info, Color::Cyan),
+            (
+                "提交失败：/a/path/失败.sql",
+                Level::Error,
+                theme::Theme::danger().fg,
+            ),
+            ("已提交 3 项", Level::Success, theme::Theme::success().fg),
+            (
+                "⚠️ 实际提交了 0 项",
+                Level::Warning,
+                theme::Theme::caution().fg,
+            ),
+            ("排序：状态", Level::Info, theme::Theme::info().fg),
         ] {
             assert_eq!(Level::of(message), level);
             for width in [20, 40, 100] {
-                let line = NoticePanel::summary(message, level, width);
-                assert!(line.width() <= width as usize);
-                assert!(line.to_string().contains("F4 详情"));
-                assert_eq!(line.spans[0].style.fg, Some(color));
+                let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+                let mut panel = NoticePanel::with_level(message.into(), level);
+                let frame = terminal
+                    .draw(|f| panel.render_toast(f, f.area(), "F4"))
+                    .unwrap();
+                let text = frame
+                    .buffer
+                    .content
+                    .iter()
+                    .flat_map(|c| c.symbol().chars())
+                    .filter(|c| !c.is_whitespace())
+                    .collect::<String>();
+                assert!(text.contains("F4详情"));
+                assert!(text.contains(level.label()));
+                assert!(frame.buffer.content.iter().any(|c| Some(c.fg) == color));
             }
         }
         assert_eq!(Level::of("已复制：/失败.sql"), Level::Success);
@@ -443,9 +511,121 @@ mod tests {
                 .buffer
                 .content
                 .iter()
-                .any(|cell| cell.fg == Color::LightRed));
+                .any(|cell| Some(cell.fg) == theme::Theme::danger().fg));
             panel.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
             assert_eq!(panel.scroll, 0);
+        }
+    }
+
+    #[test]
+    fn short_notices_and_details_stay_compact_in_the_upper_right() {
+        for (width, height) in [(30, 10), (80, 24), (180, 60)] {
+            for details in [false, true] {
+                let mut panel =
+                    NoticePanel::with_level("已切换到 A8_V26.1.12.4_ZZJR".into(), Level::Success);
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                let area = Rect::new(2, 1, width - 4, height - 2);
+                let frame = terminal
+                    .draw(|f| {
+                        f.render_widget(
+                            Paragraph::new(
+                                vec![".".repeat(width as usize); height as usize].join("\n"),
+                            ),
+                            f.area(),
+                        );
+                        if details {
+                            panel.render(f, area);
+                        } else {
+                            panel.render_toast(f, area, "F4");
+                        }
+                    })
+                    .unwrap();
+                let changed = frame
+                    .buffer
+                    .content
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| c.symbol() != ".")
+                    .map(|(i, _)| ((i % width as usize) as u16, (i / width as usize) as u16))
+                    .collect::<Vec<_>>();
+                let left = changed.iter().map(|(x, _)| *x).min().unwrap();
+                let right = changed.iter().map(|(x, _)| *x).max().unwrap();
+                let top = changed.iter().map(|(_, y)| *y).min().unwrap();
+                let bottom = changed.iter().map(|(_, y)| *y).max().unwrap();
+                assert_eq!(right, area.right() - 2);
+                assert_eq!(top, area.y + 2);
+                assert!(bottom - top < 5, "短消息不能占满高度");
+                assert!(left >= area.x);
+                assert!(right - left < 60, "宽窗口中的短消息仍须紧凑");
+                let text = frame
+                    .buffer
+                    .content
+                    .iter()
+                    .flat_map(|c| c.symbol().chars())
+                    .filter(|c| !c.is_whitespace())
+                    .collect::<String>();
+                assert!(text.contains("成功"));
+                assert!(text.contains(if details { "Esc关闭" } else { "F4详情" }));
+                assert_eq!(panel.message(), "已切换到 A8_V26.1.12.4_ZZJR");
+            }
+        }
+    }
+
+    #[test]
+    fn long_toast_is_capped_and_details_keep_copy_and_scroll() {
+        let message = format!("已完成：{}\nTAIL", "中文路径/".repeat(100));
+        let mut panel = NoticePanel::with_level(message.clone(), Level::Info);
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        let frame = terminal
+            .draw(|f| panel.render_toast(f, f.area(), "F4"))
+            .unwrap();
+        let text = frame
+            .buffer
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(text.contains('…'));
+        assert!(!text.contains("TAIL"));
+        assert!(matches!(
+            panel.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)),
+            Action::Copy
+        ));
+        assert_eq!(panel.message(), message);
+        terminal.draw(|f| panel.render(f, f.area())).unwrap();
+        panel.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        let frame = terminal.draw(|f| panel.render(f, f.area())).unwrap();
+        assert!(frame
+            .buffer
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>()
+            .contains("TAIL"));
+        panel.feedback(Level::Success, "已复制完整提示".into());
+        let frame = terminal.draw(|f| panel.render(f, f.area())).unwrap();
+        let text = frame
+            .buffer
+            .content
+            .iter()
+            .flat_map(|c| c.symbol().chars())
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>();
+        assert!(text.contains("已复制完整提示"));
+        assert_eq!(panel.message(), message);
+    }
+
+    #[test]
+    fn notice_render_survives_tiny_windows() {
+        for width in [0, 1, 5, 12, 20] {
+            for height in [0, 1, 2, 3, 7] {
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                let mut panel = NoticePanel::new("错误：中文路径\nTAIL".into());
+                terminal
+                    .draw(|f| panel.render_toast(f, f.area(), "F4"))
+                    .unwrap();
+                terminal.draw(|f| panel.render(f, f.area())).unwrap();
+            }
         }
     }
 }

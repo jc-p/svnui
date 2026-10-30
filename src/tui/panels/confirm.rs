@@ -16,7 +16,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Borders, Clear, List, ListItem, Paragraph, Wrap},
+    widgets::{Borders, List, ListItem, Paragraph, Wrap},
     Frame,
 };
 
@@ -420,10 +420,7 @@ impl ConfirmPanel {
         let cursor = p.cursor == owner;
         // 未选中的条目压暗：一眼看出「这批里剔掉了哪几个」。
         let style = if cursor {
-            Style::default()
-                .fg(Color::Black)
-                .bg(accent)
-                .add_modifier(Modifier::BOLD)
+            theme::Theme::on_accent(accent)
         } else if on {
             Style::default().fg(accent)
         } else {
@@ -452,7 +449,7 @@ impl ConfirmPanel {
         } else {
             theme::centered(area, 70, 80, 30, 8)
         };
-        f.render_widget(Clear, pop);
+        theme::clear(f, pop);
 
         let accent = self.accent();
         // 危险级写进标题：`svn rm` 关掉「保留本地文件」时这里从「中危」变「高危·不可撤销」。
@@ -551,7 +548,7 @@ impl ConfirmPanel {
             //    用在多行列表上会变成一整片蓝底，既刺眼也盖住文字。
             //    文件列表就用普通前景色，危险性由标题和边框的红色表达。
             f.render_widget(
-                List::new(items).style(Style::default().fg(Color::Gray)),
+                List::new(items).style(theme::Theme::text()),
                 chunks[1],
             );
         }
@@ -570,10 +567,7 @@ impl ConfirmPanel {
                     Span::styled(
                         t.label.clone(),
                         if focused {
-                            Style::default()
-                                .fg(Color::Black)
-                                .bg(accent)
-                                .add_modifier(Modifier::BOLD)
+                            theme::Theme::on_accent(accent)
                         } else {
                             Style::default().fg(accent)
                         },
@@ -595,10 +589,7 @@ impl ConfirmPanel {
                             fld.value.clone()
                         },
                         if focused {
-                            Style::default()
-                                .fg(Color::Black)
-                                .bg(accent)
-                                .add_modifier(Modifier::BOLD)
+                            theme::Theme::on_accent(accent)
                         } else {
                             Style::default().fg(accent)
                         },
@@ -728,7 +719,7 @@ pub(crate) fn danger_color(d: Danger) -> Color {
         Danger::High => theme::Theme::danger(),
     };
     // 色阶每一格都设了前景色；取不到就退回普通前景，不用默认色。
-    style.fg.unwrap_or(Color::Gray)
+    style.fg.unwrap_or(Color::Reset)
 }
 
 /// 按终端列宽预先换行，详细确认框据此分配说明和清单高度。

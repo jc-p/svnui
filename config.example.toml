@@ -54,6 +54,9 @@ svn_path = ""
 
 # ── 界面 ─────────────────────────────────────────────
 [ui]
+# TUI 主题：catppuccin / nord / tokyo-night / terminal / no-color 等。
+# 修改后重新启动；NO_COLOR 环境变量优先。
+theme = "catppuccin"
 # 启动时是否捕获鼠标。
 # 开了能拖滚动条，代价是终端的文本选择复制失效 ——
 # diff 里复制路径是刚需，所以默认关。TUI 里按 M 可随时切换。

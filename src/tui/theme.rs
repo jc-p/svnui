@@ -1,229 +1,261 @@
-//! 配色 —— 界面里所有颜色的唯一出处。
-//!
-//! 面板不许自己写 `Color::`：同一个"红"如果确认框里读作"危险"、
-//! 提示条里读作"普通失败"，用户就得靠位置猜严重程度。
-//! 语义在这里定义一次，各处按语义取用。
+//! 基于 themekit 的统一主题入口；面板只使用 SVN 和界面语义样式。
+
+use std::sync::OnceLock;
 
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Paragraph, Scrollbar, ScrollbarOrientation};
+use ratatui::widgets::{Block, BorderType, Clear, Paragraph, Scrollbar, ScrollbarOrientation};
+use ratatui::Frame;
+use ratatui_themekit::{Theme as KitTheme, ThemeExt};
 
-/// 所有面板共用圆角边框；标题、颜色和边框范围仍由各面板决定。
-pub fn block<'a>() -> Block<'a> {
-    Block::default().border_type(BorderType::Rounded)
+// 一次启动固定一套主题，后台预览线程与 UI 线程共享，避免预览串色。
+static ACTIVE: OnceLock<ThemeState> = OnceLock::new();
+
+struct ThemeState {
+    palette: Box<dyn KitTheme>,
+    dim: Style,
 }
 
-/// 状态语义色。
-///
-/// 命名沿用 SVN porcelain 的符号，方便对照。
+impl ThemeState {
+    fn new(palette: Box<dyn KitTheme>) -> Self {
+        // 次要信息也必须在背景和选中底色上可读；对比度计算只做一次。
+        let dim = Style::default().fg(readable_secondary(palette.as_ref()));
+        Self { palette, dim }
+    }
+}
+
+fn resolve(id: &str, no_color: bool) -> (Box<dyn KitTheme>, Option<String>) {
+    if no_color || id == "no-color" {
+        return (Box::new(ratatui_themekit::NO_COLOR), None);
+    }
+    let known = ratatui_themekit::available_theme_ids().contains(&id);
+    let notice = (!known).then(|| format!("未知主题 {id:?}，已使用 catppuccin；请检查 [ui].theme"));
+    let theme = ratatui_themekit::BUILTIN_THEMES
+        .iter()
+        .find(|t| t.id == id)
+        .copied()
+        .unwrap_or(ratatui_themekit::CATPPUCCIN_MOCHA);
+    (Box::new(theme), notice)
+}
+
+/// 只在启动时初始化；未知名称回退并通知，NO_COLOR 优先于配置。
+pub fn initialize(id: &str) -> Option<String> {
+    let (theme, notice) = resolve(id.trim(), ratatui_themekit::no_color_active());
+    let _ = ACTIVE.set(ThemeState::new(theme));
+    notice
+}
+
+fn state() -> &'static ThemeState {
+    ACTIVE.get_or_init(|| {
+        let cfg = crate::config::Config::load();
+        ThemeState::new(resolve(cfg.ui.theme.trim(), ratatui_themekit::no_color_active()).0)
+    })
+}
+
+fn palette() -> &'static dyn KitTheme {
+    state().palette.as_ref()
+}
+
+/// Clear 仍负责清除旧内容和图片标记，随后恢复主题背景，防止弹框露出终端底色。
+pub fn clear(f: &mut Frame, area: Rect) {
+    f.render_widget(Clear, area);
+    f.render_widget(Block::default().style(Theme::base()), area);
+}
+
+/// 圆角、背景、正文和边框都从同一主题获取。
+pub fn block<'a>() -> Block<'a> {
+    Block::default()
+        .border_type(BorderType::Rounded)
+        .style(Theme::base())
+        .border_style(Theme::border())
+        .title_style(Theme::title())
+}
+
 pub struct Theme;
 
 impl Theme {
-    /// `?` 未版本化 —— 暗淡，它不是"问题"，只是还没纳入管理。
+    pub fn base() -> Style {
+        palette().style_base()
+    }
     pub fn unversioned() -> Style {
-        Style::default().fg(Color::DarkGray)
+        Self::dim()
     }
-
-    /// `A` 新增 —— 绿。
     pub fn added() -> Style {
-        Style::default().fg(Color::Green)
+        Style::default().fg(palette().diff_added())
     }
-
-    /// `M` 修改 —— 黄。
     pub fn modified() -> Style {
-        Style::default().fg(Color::Yellow)
+        Self::caution()
     }
-
-    /// `D` / `!` 删除或缺失 —— 红。
     pub fn deleted() -> Style {
-        Style::default().fg(Color::Red)
+        Style::default().fg(palette().diff_removed())
     }
 
-    /// `C` / `T` 冲突 —— 红字加粗，这是唯一需要立刻处理的。
-    ///
-    /// 不铺红底：底色会把整行（连同选中态）一起盖掉，深色主题下
-    /// 连续几行红块时既读不出字、也看不出光标停在哪一行。
+    /// 冲突仍通过粗体与普通删除区分，避免状态色变成唯一线索。
     pub fn conflicted() -> Style {
-        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+        Self::deleted().add_modifier(Modifier::BOLD)
     }
-
-    /// `R` 替换、`~` 阻碍等 —— 品红，表示"结构变了"。
     pub fn structural() -> Style {
-        Style::default().fg(Color::Magenta)
+        palette().style_accent()
     }
-
-    /// `I` / `X` / `_M` 属性类 —— 青。
     pub fn props() -> Style {
-        Style::default().fg(Color::Cyan)
+        Self::info()
     }
-
-    /// 干净 / 无改动。
     pub fn clean() -> Style {
-        Style::default().fg(Color::Green)
+        Self::success()
     }
-
-    // ── 严重度色阶 ──
-    //
-    // 提示条（notice）、确认面板（confirm 的危险等级）、读取失败面板
-    // （app / repo）三处共用这一套：黄→亮黄→亮红是同一把尺子上的三个刻度。
-    // 分开各写一遍的话，值也许碰巧一样，但没有任何一处能说明
-    // "确认框的这个红 = 提示条的那个红"。
-
-    /// 信息 —— 青。
     pub fn info() -> Style {
-        Style::default().fg(Color::Cyan)
+        palette().style_info()
     }
-
-    /// 成功 —— 绿。
     pub fn success() -> Style {
-        Style::default().fg(Color::Green)
+        palette().style_success()
     }
-
-    /// 注意 —— 黄：可以继续，但得知道刚刚发生了什么。
-    ///
-    /// 对应确认面板的 `Danger::Low`、提示条的警告级。
     pub fn caution() -> Style {
-        Style::default().fg(Color::Yellow)
+        palette().style_warning()
     }
 
-    /// 警戒 —— 亮黄：会动到别人的东西或丢掉本地内容。
-    ///
-    /// 对应确认面板的 `Danger::Medium`。比 `caution()` 亮一档，
-    /// 让人在按下之前多停半秒。
+    /// themekit 只有一档警告色；用粗体保留低、中危险等级的区别。
     pub fn warning() -> Style {
-        Style::default().fg(Color::LightYellow)
+        Self::caution().add_modifier(Modifier::BOLD)
     }
-
-    /// 危险 / 失败 —— 亮红：这一步不可逆，或者已经出错了。
-    ///
-    /// 既用于"还没发生的危险"（确认面板 `Danger::High`），
-    /// 也用于"已经发生的失败"（读取日志/目录失败）——
-    /// 对用户来说两者的处置方式一样：停下来看清楚。
     pub fn danger() -> Style {
-        Style::default().fg(Color::LightRed)
+        let style = palette().style_error();
+        if palette().id() == "no-color" {
+            style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        } else {
+            style
+        }
     }
-
-    /// 危险强调 —— 亮红加粗。
-    ///
-    /// 只给标题、徽标这类短文本：整段正文加粗会糊成一片，
-    /// 但标题不加粗的话，危险面板和普通面板扫一眼分不出来。
     pub fn danger_bold() -> Style {
-        Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD)
+        Self::danger().add_modifier(Modifier::BOLD)
     }
-
-    /// 键位提示 / 当前页签 —— 黄加粗。
-    ///
-    /// 用 `caution()` 的黄：它和"注意"是同一个意思（"看这里"），
-    /// 加粗只是为了在暗色说明文字里跳出来。
     pub fn hotkey() -> Style {
-        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        palette().style_accent().add_modifier(Modifier::BOLD)
     }
-
-    /// 冲突里"服务器的"那一侧（`>>>>>>>`）—— 亮绿加粗。
-    ///
-    /// 和"我的"（`danger_bold()`）成对：三路对比时两侧必须一眼可分，
-    /// 靠位置记容易在翻页后搞反。
     pub fn conflict_theirs() -> Style {
-        Style::default()
-            .fg(Color::LightGreen)
-            .add_modifier(Modifier::BOLD)
+        Self::success().add_modifier(Modifier::BOLD)
     }
-
-    /// 目录标记 `▸` —— 亮蓝。
     pub fn dir() -> Style {
-        Style::default().fg(Color::LightBlue)
+        palette().style_accent()
     }
-
-    /// 正文白字 —— 必须看得清、但又不是标题的地方。
-    ///
-    /// 和 `text()`（灰）的区别：`text()` 适合大段上下文行，
-    /// 但铺在 `selected()` 的深灰底上会糊掉（深灰叠深灰），
-    /// 列表里那些不能被高亮吃掉的字要用白。
     pub fn body() -> Style {
-        Style::default().fg(Color::White)
+        palette().style_bright()
     }
-
-    /// 边框（普通面板）。
     pub fn border() -> Style {
-        Style::default().fg(Color::DarkGray)
+        palette().style_border()
     }
-
-    /// 边框（当前聚焦面板） —— 用亮色区分焦点。
     pub fn border_active() -> Style {
-        Style::default().fg(Color::Cyan)
+        palette().style_accent().add_modifier(Modifier::BOLD)
     }
-
-    /// 标题。
     pub fn title() -> Style {
-        Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+        Self::body().add_modifier(Modifier::BOLD)
     }
 
-    /// 选中行（列表光标）。
+    /// 高亮只覆盖背景，保留行内的 SVN 状态色；无色模式仍能看见光标。
     pub fn selected() -> Style {
-        Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD)
+        if palette().id() == "no-color" {
+            Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+        } else {
+            Style::default()
+                .bg(palette().surface())
+                .add_modifier(Modifier::BOLD)
+        }
     }
 
-    /// 已勾选（提交面板里的 [x]）。
     pub fn checked() -> Style {
-        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+        Self::success().add_modifier(Modifier::BOLD)
     }
-
-    /// 未勾选。
     pub fn unchecked() -> Style {
-        Style::default().fg(Color::DarkGray)
+        Self::dim()
     }
-
-    /// 正文文本（diff 的上下文行等）。
-    ///
-    /// 和 `status_bar()` 区分开：那个是"黑字青底"的条状样式，
-    /// 用在正文上会变成一整片蓝。
     pub fn text() -> Style {
-        Style::default().fg(Color::Gray)
+        Style::default().fg(palette().text())
     }
-
-    /// 帮助行 / 次要信息。
     pub fn dim() -> Style {
-        Style::default().fg(Color::DarkGray)
+        state().dim
     }
 
-    /// 顶部状态栏。
+    /// 强调色底上的文字需选高对比前景；无色模式只使用反显。
+    pub fn on_accent(color: Color) -> Style {
+        if palette().id() == "no-color" {
+            Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+        } else {
+            Style::default()
+                .fg(contrast_text(color))
+                .bg(color)
+                .add_modifier(Modifier::BOLD)
+        }
+    }
+
     pub fn status_bar() -> Style {
-        Style::default().fg(Color::Black).bg(Color::Cyan)
+        Self::on_accent(palette().accent())
     }
-
-    /// 输入框里的正文 —— **白字**。
-    ///
-    /// 之前输入框用的是 `status_bar()`（黑字青底）：那是给顶部条状区域
-    /// 设计的，铺在输入框里是一整片青底，字被底色压住反而看不清。
-    /// 输入框就是要白字，"当前焦点"交给 Block 的边框色去表达。
     pub fn input() -> Style {
-        Style::default().fg(Color::White)
+        palette().input_styles().text
     }
-
-    /// 提交作者。
-    ///
-    /// 以前直接借 `modified()`（"M 修改"的黄）显示作者名 —— 语义串台：
-    /// 黄色在状态列里代表"文件被改过"，挪到作者列就成了"这个人有改动"。
     pub fn author() -> Style {
-        Style::default().fg(Color::LightBlue)
+        palette().style_accent()
     }
-    /// 空状态：标题与说明。
-    ///
-    /// 空不是错误 —— 用暗淡色而不是红色，避免"没有数据"看起来像"出事了"。
     pub fn empty_title() -> Style {
-        Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)
+        Self::text().add_modifier(Modifier::BOLD)
     }
-
-    /// 输入框正文（聚焦中）—— 白字加粗，和未聚焦的框拉开差别。
-    ///
-    /// 只有边框变色不够：四个框排在一起时，用户要盯着边框找焦点。
-    /// 字本身加粗，余光就能定位。
     pub fn input_active() -> Style {
-        Style::default()
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD)
+        Self::input().add_modifier(Modifier::BOLD)
     }
+}
+
+/// RGB 按相对亮度选择黑/白文字；ANSI 主题使用终端原生黑字与明亮强调色。
+fn contrast_text(color: Color) -> Color {
+    match color {
+        Color::Reset => Color::Reset,
+        Color::Rgb(r, g, b) => {
+            if luminance(r, g, b) > 0.179 {
+                Color::Black
+            } else {
+                Color::White
+            }
+        }
+        Color::Black | Color::DarkGray | Color::Blue | Color::Red | Color::Magenta => Color::White,
+        _ => Color::Black,
+    }
+}
+
+fn luminance(r: u8, g: u8, b: u8) -> f64 {
+    let linear = |v: u8| {
+        let v = f64::from(v) / 255.0;
+        if v <= 0.04045 {
+            v / 12.92
+        } else {
+            ((v + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b)
+}
+
+fn contrast(a: Color, b: Color) -> Option<f64> {
+    let (Color::Rgb(ar, ag, ab), Color::Rgb(br, bg, bb)) = (a, b) else {
+        return None;
+    };
+    let (a, b) = (luminance(ar, ag, ab), luminance(br, bg, bb));
+    Some((a.max(b) + 0.05) / (a.min(b) + 0.05))
+}
+
+fn readable_secondary(t: &dyn KitTheme) -> Color {
+    let dim = t.text_dim();
+    let (Color::Rgb(r, g, b), Color::Rgb(tr, tg, tb)) = (dim, t.text()) else {
+        return dim;
+    };
+    for step in 0..=16u16 {
+        let mix = |a: u8, z: u8| ((u16::from(a) * (16 - step) + u16::from(z) * step) / 16) as u8;
+        let color = Color::Rgb(mix(r, tr), mix(g, tg), mix(b, tb));
+        if [t.background(), t.surface()]
+            .into_iter()
+            .all(|bg| contrast(color, bg).is_none_or(|ratio| ratio >= 4.5))
+        {
+            return color;
+        }
+    }
+    t.text()
 }
 
 /// 统一的滚动条。
@@ -243,20 +275,26 @@ pub fn scrollbar(orientation: ScrollbarOrientation) -> Scrollbar<'static> {
         .track_symbol(Some(track))
         .begin_symbol(None)
         .end_symbol(None)
-        .thumb_style(Style::reset().patch(Theme::text()))
-        .track_style(Style::reset().patch(Theme::border()))
+        .thumb_style(Style::reset().patch(Theme::base()).patch(Theme::text()))
+        .track_style(Style::reset().patch(Theme::base()).patch(Theme::border()))
 }
 
 /// 给面板标题加焦点标记。
 ///
-/// 光靠边框颜色区分焦点不够：四个框并排时，用户得挨个盯着边框找
-/// 哪条线亮一点。在标题前面加一条竖杠，扫一眼就知道键会落在哪。
-pub fn focus_title(title: impl std::fmt::Display, focused: bool) -> String {
-    if focused {
-        format!("▌{title}")
-    } else {
-        title.to_string()
-    }
+/// 实心/空心圆点同时表达焦点，避免只依赖颜色；不使用需要专门字体的私有区图标。
+/// 两种状态占相同列宽，并统一标题留白，切换焦点时文字不会跳动。
+pub fn focus_title(title: impl std::fmt::Display, focused: bool) -> Line<'static> {
+    let marker = if focused { "●" } else { "○" };
+    Line::from(vec![
+        Span::styled(
+            format!(" {marker} "),
+            if focused { Theme::hotkey() } else { Theme::dim() },
+        ),
+        Span::styled(
+            format!("{} ", title.to_string().trim()),
+            if focused { Theme::title() } else { Theme::dim() },
+        ),
+    ])
 }
 
 /// 居中弹框。
@@ -370,12 +408,8 @@ mod severity_tests {
     }
 
     #[test]
-    fn caution_warning_and_danger_are_never_the_same_color() {
-        let (c, w, d) = (
-            fg(Theme::caution()),
-            fg(Theme::warning()),
-            fg(Theme::danger()),
-        );
+    fn caution_warning_and_danger_are_distinguishable_without_color() {
+        let (c, w, d) = (Theme::caution(), Theme::warning(), Theme::danger());
         assert_ne!(c, w, "注意和警戒撞色，等于少了一档");
         assert_ne!(w, d, "警戒和危险撞色，最要紧的一档看不出来");
         assert_ne!(c, d);
@@ -404,6 +438,193 @@ mod severity_tests {
     /// 冲突两侧必须自带身份：三路对比翻页后靠位置记哪边是谁会搞反。
     #[test]
     fn the_two_conflict_sides_are_distinguishable() {
-        assert_ne!(fg(Theme::danger_bold()), fg(Theme::conflict_theirs()));
+        assert_ne!(Theme::danger_bold(), Theme::conflict_theirs());
+    }
+}
+
+#[cfg(test)]
+mod adaptation_tests {
+    use super::*;
+    use crate::tui::panels::{
+        checkout::CheckoutPanel,
+        confirm::{ConfirmAction, ConfirmPanel},
+        notice::{Level, NoticePanel},
+        preview::PreviewPanel,
+        projects::ProjectsPanel,
+    };
+    use ratatui::{
+        backend::TestBackend,
+        layout::{Constraint, Layout},
+        Terminal,
+    };
+
+    #[test]
+    fn all_builtin_palettes_keep_secondary_text_readable() {
+        for t in ratatui_themekit::BUILTIN_THEMES {
+            let dim = readable_secondary(t);
+            for bg in [t.background(), t.surface()] {
+                if let Some(ratio) = contrast(dim, bg) {
+                    assert!(ratio >= 4.5, "{} 的次要文字对比度不足：{ratio}", t.id());
+                }
+            }
+        }
+        assert_eq!(contrast_text(Color::Rgb(240, 230, 210)), Color::Black);
+        assert_eq!(contrast_text(Color::Rgb(20, 30, 40)), Color::White);
+    }
+
+    #[test]
+    fn all_theme_names_resolve_and_no_color_has_priority() {
+        for id in ratatui_themekit::available_theme_ids() {
+            let (t, notice) = resolve(id, false);
+            assert_eq!(t.id(), id);
+            assert!(notice.is_none());
+            assert_eq!(resolve(id, true).0.id(), "no-color");
+        }
+        assert_eq!(resolve("no-color", false).0.id(), "no-color");
+        let (t, notice) = resolve("typo", false);
+        assert_eq!(t.id(), "catppuccin");
+        assert!(notice.unwrap().contains("typo"));
+    }
+
+    #[test]
+    fn configured_themes_render_panels_and_share_the_palette_with_workers() {
+        const TEST: &str = "tui::theme::adaptation_tests::configured_themes_render_panels_and_share_the_palette_with_workers";
+        if std::env::var_os("SVNUI_THEME_TEST_CHILD").is_none() {
+            // 每个主题独立进程，保持主题只在启动初始化、测试间不修改全局环境。
+            for (id, no_color) in [
+                ("catppuccin", false),
+                ("nord", false),
+                ("terminal", false),
+                ("no-color", false),
+                ("tokyo-night", false),
+                ("typo", false),
+                ("nord", true),
+            ] {
+                let tmp = tempfile::tempdir().unwrap();
+                let config = tmp.path().join("config.toml");
+                std::fs::write(&config, format!("[ui]\ntheme = {id:?}\n")).unwrap();
+                let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+                cmd.args(["--exact", TEST, "--nocapture"])
+                    .env("SVNUI_THEME_TEST_CHILD", id)
+                    .env("SVNUI_CONFIG", config)
+                    .env("SVNR_CACHE_DIR", tmp.path().join("cache"))
+                    .env_remove("NO_COLOR");
+                if no_color {
+                    cmd.env("NO_COLOR", "1");
+                }
+                let out = cmd.output().unwrap();
+                assert!(
+                    out.status.success(),
+                    "{id} / NO_COLOR={no_color}: {}\n{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+            return;
+        }
+        let id = std::env::var("SVNUI_THEME_TEST_CHILD").unwrap();
+        let notice = initialize(&crate::config::Config::load().ui.theme);
+        let expected = if ratatui_themekit::no_color_active() || id == "no-color" {
+            "no-color"
+        } else if id == "typo" {
+            "catppuccin"
+        } else {
+            &id
+        };
+        assert_eq!(palette().id(), expected);
+        assert_eq!(notice.is_some(), id == "typo");
+        assert_ne!(Theme::caution(), Theme::warning());
+        assert_ne!(Theme::warning(), Theme::danger());
+        assert_ne!(Theme::danger_bold(), Theme::conflict_theirs());
+        let worker_style = std::thread::spawn(Theme::added).join().unwrap();
+        assert_eq!(worker_style, Theme::added());
+
+        for (width, height) in [(110, 24), (44, 12)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            let mut projects = ProjectsPanel::new(
+                vec![crate::projects::Project {
+                    path: "/workspace/svnui".into(),
+                    name: "svnui · 当前项目".into(),
+                    source: crate::projects::Source::Registered,
+                    state: crate::projects::State::Ready,
+                }],
+                Some("/workspace/svnui".into()),
+            );
+            let frame = terminal.draw(|f| projects.render(f, f.area())).unwrap();
+            // Ratatui 将双宽字符的占位格重置；真正显示的字形仍覆盖两列。
+            let unexpected: Vec<_> = frame
+                .buffer
+                .content
+                .iter()
+                .enumerate()
+                .filter(|(i, c)| {
+                    let continuation = i % usize::from(width) > 0
+                        && Line::from(frame.buffer.content[i - 1].symbol()).width() > 1;
+                    !continuation
+                        && Some(c.bg) != Theme::base().bg
+                        && Some(c.bg) != Theme::selected().bg
+                })
+                .take(6)
+                .map(|(i, c)| {
+                    (
+                        i % usize::from(width),
+                        i / usize::from(width),
+                        c.symbol(),
+                        c.bg,
+                    )
+                })
+                .collect();
+            assert!(unexpected.is_empty(), "主题背景遗漏：{unexpected:?}");
+            let text: String = frame.buffer.content.iter().flat_map(|c| c.symbol().chars())
+                .filter(|c| !c.is_whitespace()).collect();
+            assert!(text.contains("svnui"));
+            assert!(text.contains("当前"));
+            assert!(text.contains("●项目"));
+            assert!(text.contains("◆"));
+            if expected == "no-color" {
+                assert!(frame
+                    .buffer
+                    .content
+                    .iter()
+                    .all(|c| c.fg == Color::Reset && c.bg == Color::Reset));
+                assert!(frame
+                    .buffer
+                    .content
+                    .iter()
+                    .any(|c| c.modifier.contains(Modifier::REVERSED)));
+            }
+            let checkout = CheckoutPanel::new("/workspace/new-project".into());
+            terminal.draw(|f| checkout.render(f, f.area())).unwrap();
+            let mut confirm = ConfirmPanel::new(
+                "还原修改",
+                "此操作会丢弃本地修改",
+                vec!["src/main.rs".into()],
+                crate::policy::Op::Revert,
+                ConfirmAction::Revert(Vec::new()),
+            )
+            .with_pick()
+            .with_toggles(vec![crate::tui::panels::confirm::Toggle::new(
+                "保留本地文件",
+                true,
+            )]);
+            terminal.draw(|f| confirm.render(f, f.area())).unwrap();
+            let mut notice =
+                NoticePanel::with_level("读取失败：请检查工作副本权限".into(), Level::Error);
+            terminal.draw(|f| notice.render(f, f.area())).unwrap();
+            terminal.draw(|f| notice.render_toast(f, f.area(), "F4")).unwrap();
+            let mut preview = PreviewPanel::diff("src/main.rs", "+新增内容\n-删除内容\n 上下文\n");
+            terminal
+                .draw(|f| {
+                    let [head, body] =
+                        Layout::vertical([Constraint::Length(1), Constraint::Min(0)])
+                            .areas(f.area());
+                    f.render_widget(
+                        Paragraph::new(" SVN · trunk@r128 ").style(Theme::status_bar()),
+                        head,
+                    );
+                    preview.render_pane(f, body, true);
+                })
+                .unwrap();
+        }
     }
 }

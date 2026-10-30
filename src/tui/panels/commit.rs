@@ -27,7 +27,7 @@
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     text::{Line, Span},
-    widgets::{Borders, Clear, List, ListItem, Paragraph},
+    widgets::{Borders, List, ListItem, Paragraph},
     Frame,
 };
 use tui_textarea::TextArea;
@@ -233,7 +233,7 @@ impl CommitPanel {
 
     pub fn render(&mut self, f: &mut Frame, area: Rect) {
         let pop = theme::centered(area, 70, 70, 40, 10);
-        f.render_widget(Clear, pop);
+        theme::clear(f, pop);
 
         let n = self.files.len();
         let block = theme::block()

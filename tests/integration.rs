@@ -275,6 +275,37 @@ fn commit_without_paths_keeps_whole_working_copy_behavior() {
     assert_eq!(run(&exe, &["cat", "-r", "HEAD", "a.txt"], &f.wc).unwrap(), "after\n");
 }
 
+/// 精确撤销不带入未选后代；空清单不执行，CLI 的目录递归语义保持兼容。
+#[test]
+#[ignore = "需要 svn + svnadmin"]
+fn exact_revert_preserves_unselected_descendants_and_recursive_cli_behavior() {
+    let f = Fixture::new();
+    let exe = svn();
+    std::fs::create_dir(f.wc.join("tracked")).unwrap();
+    for file in ["tracked/selected.txt", "tracked/keep.txt"] {
+        std::fs::write(f.wc.join(file), "before\n").unwrap();
+    }
+    run(&exe, &["add", "tracked"], &f.wc).unwrap();
+    run(&exe, &["ci", "-m", "setup"], &f.wc).unwrap();
+    for file in ["tracked/selected.txt", "tracked/keep.txt"] {
+        std::fs::write(f.wc.join(file), "after\n").unwrap();
+    }
+    run(&exe, &["propset", "test:local", "local", "tracked"], &f.wc).unwrap();
+    let client = svnui::svn::Svn::discover(&f.wc, std::time::Duration::from_secs(10), false)
+        .unwrap();
+
+    client.revert_exact(&[]).unwrap();
+    assert_eq!(std::fs::read_to_string(f.wc.join("tracked/selected.txt")).unwrap(), "after\n");
+    client.revert_exact(&[PathBuf::from("tracked"), PathBuf::from("tracked/selected.txt")]).unwrap();
+    assert_eq!(std::fs::read_to_string(f.wc.join("tracked/selected.txt")).unwrap(), "before\n");
+    assert_eq!(std::fs::read_to_string(f.wc.join("tracked/keep.txt")).unwrap(), "after\n");
+    let properties = run(&exe, &["proplist", "tracked"], &f.wc).unwrap();
+    assert!(!properties.contains("test:local"), "目录属性应被精确撤销：{properties}");
+
+    client.revert(&[PathBuf::from("tracked")], false).unwrap();
+    assert_eq!(std::fs::read_to_string(f.wc.join("tracked/keep.txt")).unwrap(), "before\n");
+}
+
 /// 7 列解析在真实输出上不产生幽灵路径。
 ///
 /// 树冲突会多打一行说明（第 7 列 `>`），`Summary of conflicts:` 也有统计块。

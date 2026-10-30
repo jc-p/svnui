@@ -208,6 +208,8 @@ impl Default for SvnConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct UiConfig {
+    /// TUI 主题；旧配置省略时使用 Catppuccin，NO_COLOR 优先。
+    pub theme: String,
     /// 启动时是否捕获鼠标。
     ///
     /// 开了能拖滚动条，代价是**终端的文本选择复制失效** ——
@@ -221,6 +223,7 @@ pub struct UiConfig {
 impl Default for UiConfig {
     fn default() -> Self {
         Self {
+            theme: "catppuccin".to_string(),
             mouse: false,
             sort: "status".to_string(),
         }
@@ -356,6 +359,9 @@ svn_path = ""
 
 # ── 界面 ─────────────────────────────────────────────
 [ui]
+# TUI 主题：catppuccin / nord / tokyo-night / terminal / no-color 等。
+# 修改后重新启动；NO_COLOR 环境变量优先。
+theme = "catppuccin"
 # 启动时是否捕获鼠标。
 # 开了能拖滚动条，代价是终端的文本选择复制失效 ——
 # diff 里复制路径是刚需，所以默认关。TUI 里按 M 可随时切换。
@@ -519,6 +525,17 @@ mod tests {
         assert!(!c.llm.send_diff, "diff 默认不能出网");
         assert_eq!(c.ui.mouse, false, "鼠标默认关闭，否则复制失效");
         assert_eq!(c.log.page_size, 100);
+        assert_eq!(c.ui.theme, "catppuccin");
+    }
+
+    #[test]
+    fn 主题配置兼容旧文件且保留未知名称供界面提示() {
+        let old: Config = toml::from_str("[ui]\nmouse = true\n").unwrap();
+        assert_eq!(old.ui.theme, "catppuccin");
+        let custom: Config = toml::from_str("[ui]\ntheme = \"nord\"\n").unwrap();
+        assert_eq!(custom.ui.theme, "nord");
+        let unknown: Config = toml::from_str("[ui]\ntheme = \"unknown\"\n").unwrap();
+        assert_eq!(unknown.ui.theme, "unknown");
     }
 
     #[test]

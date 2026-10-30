@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     text::{Line, Span},
-    widgets::{Borders, Clear, Paragraph},
+    widgets::{Borders, Paragraph},
     Frame,
 };
 
@@ -147,7 +147,7 @@ impl CheckoutPanel {
     }
 
     pub fn render(&self, f: &mut Frame, area: Rect) {
-        f.render_widget(Clear, area);
+        theme::clear(f, area);
 
         // 外层再包一个边框：字段框自己有边框，外面这一层把它们收成一张
         // "表单卡片"，跟底下的主界面分开。标题放进 Block 的 title，

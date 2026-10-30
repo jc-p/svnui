@@ -16,6 +16,10 @@ use super::{
 use crate::domain::Result;
 
 pub(super) fn run(path: &Path, content: FileContent, state: Arc<TerminalState>) -> Result<()> {
+    let cfg = crate::config::Config::load();
+    if let Some(notice) = super::theme::initialize(&cfg.ui.theme) {
+        eprintln!("{notice}");
+    }
     let mut guard = TerminalGuard::enter(state)?;
     let title = path.display().to_string();
     let mut panel = match content {
@@ -27,10 +31,11 @@ pub(super) fn run(path: &Path, content: FileContent, state: Arc<TerminalState>) 
     };
     loop {
         guard.term.draw(|frame| {
+            frame.render_widget(ratatui::widgets::Block::default().style(super::theme::Theme::base()), frame.area());
             let [body, hint] =
                 Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(frame.area());
             panel.render(frame, body);
-            frame.render_widget(Paragraph::new(" 本地预览 · q / Esc / Ctrl+C 退出"), hint);
+            frame.render_widget(Paragraph::new(" 本地预览 · q / Esc / Ctrl+C 退出").style(super::theme::Theme::dim()), hint);
         })?;
         if event::poll(Duration::from_millis(120))? {
             match event::read()? {

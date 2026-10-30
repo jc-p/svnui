@@ -16,7 +16,7 @@
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, Paragraph, ScrollbarOrientation, ScrollbarState},
+    widgets::{Block, Borders, Paragraph, ScrollbarOrientation, ScrollbarState},
     Frame,
 };
 use ratatui_image::{protocol::StatefulProtocol, StatefulImage};
@@ -364,9 +364,15 @@ impl PreviewPanel {
             Kind::Image => "图片",
             Kind::Blame => "逐行追溯",
         };
+        // 保留焦点图标的独立色阶，不能 format! 成字符串后丢掉 Span 样式。
+        let mut title = theme::focus_title(label, focused);
+        title.spans.push(Span::styled(
+            format!("· {} ", self.title),
+            if focused { theme::Theme::title() } else { theme::Theme::dim() },
+        ));
         let block = theme::block()
             .borders(Borders::ALL)
-            .title(format!(" {} · {} ", theme::focus_title(label, focused), self.title))
+            .title(title)
             .title_bottom(if focused { " 预览操作 · Tab/Esc 返回文件树 " } else { " Tab 激活预览 " })
             .border_style(if focused { theme::Theme::border_active() } else { theme::Theme::border() });
         self.paint(f, area, block);
@@ -374,7 +380,7 @@ impl PreviewPanel {
 
     /// 全屏弹框。
     pub fn render(&mut self, f: &mut Frame, area: Rect) {
-        f.render_widget(Clear, area);
+        theme::clear(f, area);
 
         let block = theme::block()
             .borders(Borders::ALL)
@@ -430,7 +436,7 @@ impl PreviewPanel {
                 self.banner = None;
                 self.lines = vec![Line::from(format!("无法绘制图片：{error}"))];
                 self.max_width = self.lines[0].width().min(u16::MAX as usize) as u16;
-                f.render_widget(Clear, body_area);
+                theme::clear(f, body_area);
                 f.render_widget(Paragraph::new(self.lines.clone()), body_area);
             }
             return;
@@ -500,7 +506,7 @@ impl PreviewPanel {
 #[cfg(test)]
 mod scrollbar_tests {
     use super::*;
-    use ratatui::{backend::TestBackend, buffer::Buffer, style::Color, Terminal};
+    use ratatui::{backend::TestBackend, buffer::Buffer, Terminal};
 
     fn draw(panel: &mut PreviewPanel, width: u16, height: u16) -> Buffer {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
@@ -561,17 +567,17 @@ mod scrollbar_tests {
         for y in panel.v_bar_area.y..panel.v_bar_area.bottom() {
             let cell = &buffer[(panel.v_bar_area.x, y)];
             assert!(matches!(cell.symbol(), "│" | "┃"));
-            assert!(matches!(cell.fg, Color::Gray | Color::DarkGray));
-            assert_eq!(cell.bg, Color::Reset);
+            assert!([theme::Theme::text().fg, theme::Theme::border().fg].contains(&Some(cell.fg)));
+            assert_eq!(Some(cell.bg), theme::Theme::base().bg);
         }
         for x in panel.h_bar_area.x..panel.h_bar_area.right() {
             let cell = &buffer[(x, panel.h_bar_area.y)];
             assert!(matches!(cell.symbol(), "─" | "━"));
-            assert!(matches!(cell.fg, Color::Gray | Color::DarkGray));
-            assert_eq!(cell.bg, Color::Reset);
+            assert!([theme::Theme::text().fg, theme::Theme::border().fg].contains(&Some(cell.fg)));
+            assert_eq!(Some(cell.bg), theme::Theme::base().bg);
         }
         assert_eq!(buffer[(1, 1)].symbol(), "+");
-        assert_eq!(buffer[(1, 1)].fg, Color::Green);
+        assert_eq!(Some(buffer[(1, 1)].fg), theme::Theme::added().fg);
         assert_eq!(buffer[(panel.v_bar_area.x, panel.v_bar_area.y)].symbol(), "┃");
         assert_eq!(buffer[(panel.h_bar_area.x, panel.h_bar_area.y)].symbol(), "━");
         let corner = (panel.v_bar_area.x, panel.h_bar_area.y);
