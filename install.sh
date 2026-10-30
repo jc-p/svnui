@@ -9,7 +9,7 @@ PENDING=""
 RELEASES="https://github.com/jc-p/svnui/releases"
 
 usage() {
-  echo '用法: bash install.sh [--version 0.7.2] [--bin-dir DIR]'
+  echo '用法: bash install.sh [--version 0.7.3] [--bin-dir DIR]'
   echo '默认安装最新正式 Release 到 ~/.local/bin，不安装 SVN、不修改 PATH 配置。'
 }
 fail() { echo "错误: $*" >&2; exit 1; }
@@ -48,7 +48,7 @@ download() {
 }
 if [ "$VERSION" = latest ]; then
   LATEST="$(download --output /dev/null --write-out '%{url_effective}' "$RELEASES/latest")" \
-    || fail '无法查询最新 Release；检查网络，或使用 --version 0.7.2 指定版本'
+    || fail '无法查询最新 Release；检查网络，或使用 --version 0.7.3 指定版本'
   [[ "$LATEST" == "$RELEASES/tag/"* ]] || fail '最新 Release 跳转地址异常'
   VERSION="${LATEST##*/}"
 fi

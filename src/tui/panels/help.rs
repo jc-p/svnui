@@ -3,6 +3,7 @@
 //! 底栏只放得下 4~5 个最常用的键，剩下的都在这里。
 //! 按分组排列，比塞在一行里好找得多。
 
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     layout::{Alignment, Rect},
     text::{Line, Span},
@@ -22,6 +23,8 @@ const GROUPS: &[Group] = &[
     Group {
         title: "按键约定",
         keys: &[
+            ("q / Esc", "主面板只用 q 退出；Esc 关闭当前弹层、返回文件树或清空过滤，无事可取消时不操作"),
+            ("输入优先", "提交、检出和搜索里 q、? 都是文字；F1 查看帮助（分支工作流内 F1 切分支页签）"),
             (
                 "大写 = 同一动作的另一档",
                 "小写管当前项 / 默认档，大写管更大范围或另一种代价（a 当前 · A 全部；u 最新 · U 指定版本；d 连本地一起删 · D 只移出版本控制）",
@@ -64,6 +67,7 @@ const GROUPS: &[Group] = &[
             ("T", "切换「改动」和「全部文件」，保留筛选、有效勾选并尽量定位原路径"),
             ("S", "排序循环：按状态 → 按路径 → 按文件名"),
             ("L", "提交历史（右侧显示每个版本改了什么）"),
+            ("F3", "只读查看本人写过的 SVN 提交说明，首次填写 SVN 用户名；无待提交文件也可使用"),
             ("Ctrl+B", "svn blame：这一行最后是谁改的、在哪一版改的"),
             ("I", "svn info：工作副本根 / URL / 版本 / 仓库 UUID"),
             ("H", "工作副本体检：冲突、锁、缺失"),
@@ -71,7 +75,7 @@ const GROUPS: &[Group] = &[
             ("V", "远端仓库浏览：直接看服务器上的目录树（可复制 URL / 就地检出）"),
             ("B", "分支工作流：F1 创建分支 / F2 标签 / F3 switch / F4 合并预演"),
             ("R / F5", "刷新：主界面重新扫描并保留位置；历史面板重拉提交记录（空闲主界面也会自动刷新）"),
-            ("Esc", "清空文件过滤；无过滤时退出"),
+            ("Esc", "清空文件过滤；无过滤时停留主面板"),
         ],
     },
     Group {
@@ -105,15 +109,16 @@ const GROUPS: &[Group] = &[
             ("i", "反选当前筛选内的文件改动，包含折叠项"),
             ("Ctrl+R", "清空勾选"),
             ("C", "打开提交面板（只写说明，文件清单在上面）"),
+            ("F3（提交框内）", "本人提交说明：填写 SVN 用户名，精确匹配作者；Enter 插入光标处，N 更早，F2 改作者，Esc 返回草稿"),
             ("Ctrl+G", "生成提交信息（配了 llm 走模型，否则本地规则；再按轮换候选）"),
             ("Ctrl+S", "提交"),
-            ("Esc", "退出提交框，写的内容会保留，按 C 回来继续"),
+            ("Esc", "返回文件树并保留草稿，按 C 回来继续"),
         ],
     },
     Group {
         title: "其他",
         keys: &[
-            ("?", "显示/隐藏本帮助"),
+            ("? / F1", "查看帮助；↑↓/j/k 滚动，PgUp/PgDn 翻页，Home/End 首尾；Esc/q/?/F1 关闭"),
             ("F4 / Shift+F4", "查看右上角提示详情（工作流用 Shift+F4）；↑↓/PgUp/PgDn 滚动，Home/End 首尾，y 复制全文，Esc 关闭"),
             ("", ""),
             ("子面板内（只在对应面板里生效）：", ""),
@@ -123,7 +128,7 @@ const GROUPS: &[Group] = &[
             ("确认框内", "Tab 切开关 / Space 切开关或裁剪项 / 版本号可直接键入 / Backspace 删除"),
             ("确认框清单", "j/k 移动光标 / Space 剔除或加回 / Ctrl+A 全选 / Ctrl+R 清空；Y 只执行选中的"),
             ("M", "开关鼠标（开=可拖滚动条；关=可用鼠标选中文本复制）"),
-            ("Q / Esc", "退出"),
+            ("q", "退出主面板；阅读面板内只返回上层，输入框内作为文字"),
             ("", ""),
             ("命令行：", ""),
             ("svnui checkout", "检出工作副本（TUI 里不在副本时会自动进）"),
@@ -135,13 +140,49 @@ const GROUPS: &[Group] = &[
     },
 ];
 
-/// 帮助面板。只是个静态弹框，不需要保存状态。
-pub struct HelpPanel;
+/// 帮助独占按键；记录可视行数，让窄窗口也能读到末尾。
+#[derive(Default)]
+pub struct HelpPanel {
+    scroll: usize,
+    viewport: usize,
+    total: usize,
+}
 
 impl HelpPanel {
-    pub fn render(f: &mut Frame, area: Rect) {
-        theme::clear(f, area);
+    /// 返回 true 仅表示关闭帮助，不向底层继续分发此按键。
+    pub fn handle_key(&mut self, key: KeyEvent) -> bool {
+        let page = self.viewport.saturating_sub(1).max(1);
+        match key.code {
+            KeyCode::Esc | KeyCode::F(1) => return true,
+            KeyCode::Char('q' | '?')
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                return true
+            }
+            KeyCode::Down | KeyCode::Char('j') => self.scroll = self.scroll.saturating_add(1),
+            KeyCode::Up | KeyCode::Char('k') => self.scroll = self.scroll.saturating_sub(1),
+            KeyCode::PageDown => self.scroll = self.scroll.saturating_add(page),
+            KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(page),
+            KeyCode::Home | KeyCode::Char('g') => self.scroll = 0,
+            KeyCode::End | KeyCode::Char('G') => self.scroll = self.max_scroll(),
+            _ => {}
+        }
+        self.scroll = self.scroll.min(self.max_scroll());
+        false
+    }
 
+    fn max_scroll(&self) -> usize {
+        self.total.saturating_sub(self.viewport)
+    }
+
+    pub fn render(&mut self, f: &mut Frame, area: Rect) {
+        theme::clear(f, area);
+        let width = area.width.saturating_sub(2);
+        if width == 0 || area.height <= 2 {
+            return;
+        }
         let mut lines: Vec<Line> = Vec::new();
 
         for (gi, g) in GROUPS.iter().enumerate() {
@@ -153,32 +194,56 @@ impl HelpPanel {
                 theme::Theme::title(),
             )));
 
-            // 按键列左对齐到统一宽度，说明列跟在后面
-            let w = g.keys.iter().map(|(k, _)| k.chars().count()).max().unwrap_or(0);
-
+            // 按键和说明分行，按终端显示宽度折行，避免中文及长说明被裁掉。
             for (k, desc) in g.keys {
-                lines.push(Line::from(vec![
-                    Span::styled(format!("   {:<width$}", k, width = w), theme::Theme::props()),
-                    Span::styled("   ", theme::Theme::dim()),
-                    Span::raw(*desc),
-                ]));
+                for row in super::notice::wrap_text(k, width) {
+                    lines.push(Line::from(Span::styled(row, theme::Theme::props())));
+                }
+                if !desc.is_empty() {
+                    for row in super::notice::wrap_text(desc, width.saturating_sub(2).max(1)) {
+                        lines.push(Line::from(format!("  {row}")));
+                    }
+                }
             }
         }
 
         lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            " 提示：底栏只显示最常用的几个键，完整列表在这里。",
-            theme::Theme::dim(),
-        )));
+        for row in
+            super::notice::wrap_text("提示：底栏只显示最常用的几个键，完整列表在这里。", width)
+        {
+            lines.push(Line::from(Span::styled(row, theme::Theme::dim())));
+        }
 
+        self.total = lines.len();
+        self.viewport = area.height.saturating_sub(2) as usize;
+        self.scroll = self.scroll.min(self.max_scroll());
+        let end = self.scroll.saturating_add(self.viewport).min(self.total);
+        let keys = if width >= 56 {
+            " ↑↓/j/k 滚动 · PgUp/PgDn 翻页 · Esc/q 关闭 "
+        } else if width >= 28 {
+            " ↑↓ 滚动 · Esc/q 关闭 "
+        } else {
+            " Esc 关闭 "
+        };
         let block = theme::block()
             .borders(Borders::ALL)
-            .title(" 快捷键 ")
-            .title_bottom(Line::from(" 按 ? 或 Esc 关闭 ").alignment(Alignment::Right))
+            .title(format!(
+                " 快捷键 · {}–{end}/{} ",
+                self.scroll + 1,
+                self.total
+            ))
+            .title_bottom(Line::from(keys).alignment(Alignment::Right))
             .border_style(theme::Theme::border_active());
 
         f.render_widget(
-            Paragraph::new(ratatui::text::Text::from(lines)).block(block),
+            Paragraph::new(ratatui::text::Text::from(
+                lines
+                    .into_iter()
+                    .skip(self.scroll)
+                    .take(self.viewport)
+                    .collect::<Vec<_>>(),
+            ))
+            .block(block),
             area,
         );
     }
@@ -187,6 +252,65 @@ impl HelpPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn help_scrolls_to_the_end_and_clamps_after_resize() {
+        let mut panel = HelpPanel::default();
+        for (width, height) in [(30, 10), (64, 20), (140, 40)] {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            terminal.draw(|f| panel.render(f, f.area())).unwrap();
+            assert!(panel.total > panel.viewport);
+            assert!(!panel.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE)));
+            let frame = terminal.draw(|f| panel.render(f, f.area())).unwrap();
+            assert_eq!(panel.scroll, panel.max_scroll());
+            let text: String = frame
+                .buffer
+                .content
+                .iter()
+                .flat_map(|c| c.symbol().chars())
+                .filter(|c| !c.is_whitespace())
+                .collect();
+            assert!(
+                text.contains("完整列表在这里"),
+                "{width}×{height} 必须能读到帮助末尾：{text}"
+            );
+            assert!(text.contains("Esc"));
+            let end = panel.scroll;
+            panel.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+            assert!(panel.scroll < end);
+            panel.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+            assert_eq!(panel.scroll, 0);
+        }
+    }
+
+    #[test]
+    fn help_only_closes_on_explicit_close_keys() {
+        let mut panel = HelpPanel::default();
+        for code in [
+            KeyCode::Enter,
+            KeyCode::Char('C'),
+            KeyCode::F(4),
+            KeyCode::Down,
+        ] {
+            assert!(!panel.handle_key(KeyEvent::new(code, KeyModifiers::NONE)));
+        }
+        for code in [
+            KeyCode::Esc,
+            KeyCode::Char('q'),
+            KeyCode::Char('?'),
+            KeyCode::F(1),
+        ] {
+            assert!(panel.handle_key(KeyEvent::new(code, KeyModifiers::NONE)));
+        }
+    }
+
+    #[test]
+    fn help_documents_browse_exit_and_draft_return() {
+        assert!(desc_of("查看", "Esc").contains("停留主面板"));
+        assert!(desc_of("提交", "Esc").contains("保留草稿"));
+        assert!(desc_of("其他", "q").contains("退出主面板"));
+    }
 
     fn group(title: &str) -> &'static Group {
         GROUPS.iter().find(|g| g.title == title).expect(title)

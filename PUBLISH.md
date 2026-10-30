@@ -46,10 +46,10 @@ python3 -B -m unittest discover -s tests -p release_scripts.py
 
 ## 本地发布
 
-先更新并提交更新日志等源码改动，再执行。以下以新版本 `0.7.3` 为例，替换成实际待发布版本；已发布版本（例如 `0.7.2`）不要重复发布：
+先更新并提交更新日志等源码改动，再执行。以下以新版本 `0.7.4` 为例，替换成实际待发布版本；已发布版本（例如 `0.7.3`）不要重复发布：
 
 ```bash
-./scripts/release.sh 0.7.3 --offline --tap-dir /绝对路径/homebrew-svnui
+./scripts/release.sh 0.7.4 --offline --tap-dir /绝对路径/homebrew-svnui
 ```
 
 流程依次为：本地版本提交与 tag → 推源码提交 → 双架构构建和二进制版本检查 → 提升 staging 为版本目录 → 指定准确源码提交创建 Release → 回下载并校验所有附件 → 更新显式 tap 的 formula、提交和推送。
@@ -57,7 +57,7 @@ python3 -B -m unittest discover -s tests -p release_scripts.py
 也可以分步执行：
 
 ```bash
-./scripts/bump.sh 0.7.3
+./scripts/bump.sh 0.7.4
 # bump 仅修改 package/lock 的 svnui 版本，提交并创建本地 tag；不构建、不联网。
 git push origin HEAD
 ./scripts/dist.sh --offline --tap-dir /绝对路径/homebrew-svnui

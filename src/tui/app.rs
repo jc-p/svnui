@@ -25,6 +25,7 @@
 //! 按键无响应，看起来就是"卡死"。
 
 mod history;
+mod commit_history;
 mod workflow;
 
 use std::collections::HashMap;
@@ -44,6 +45,7 @@ use crate::svn::{StatusOpts, Svn};
 use crate::tui::panels::checkout::CheckoutPanel;
 use crate::tui::panels::loading;
 use crate::tui::panels::commit::CommitPanel;
+use crate::tui::panels::commit_history::CommitHistoryPanel;
 use crate::tui::panels::commit_gen::Change;
 use crate::tui::panels::preview::{BarHit, Kind as PreviewKind, PreviewPanel};
 use crate::tui::panels::file_preview::{self, FileContent};
@@ -64,6 +66,8 @@ pub enum Mode {
     Browse,
     /// 提交面板。
     Commit,
+    /// 查阅本人曾经使用的 SVN 提交说明，返回时继续编辑草稿。
+    CommitHistory,
     /// diff 全屏。
     Diff,
     /// 提交历史。
@@ -176,6 +180,7 @@ enum BgDone {
     /// 规则候选一起带回来是为了兜底：模型没配、超时、返回怪东西时，
     /// 按 Ctrl+G 还能轮换到规则给的版本，不会变成"按了没反应"。
     CommitSug(Vec<String>, String),
+    CommitHistory(u64, bool, crate::domain::Result<crate::svn::client::AuthorLogPage>),
     /// 本地状态检查：(用户选择的范围, 固定的操作路径, 最新状态)。
     RevertCheck(
         String,
@@ -214,6 +219,10 @@ pub struct App {
 
     tree: TreePanel,
     commit: Option<CommitPanel>,
+    commit_history: Option<CommitHistoryPanel>,
+    commit_history_authors: HashMap<PathBuf, String>,
+    commit_history_gen: u64,
+    commit_history_from_commit: bool,
     diff: Option<PreviewPanel>,
     /// 右栏内嵌预览。
     preview: Option<PreviewPanel>,
@@ -260,6 +269,7 @@ pub struct App {
     /// 用户需要看到**下一步该干什么**，值得占一整个面板。
     log_error: Option<(String, String)>,
     show_help: bool,
+    help_panel: HelpPanel,
     /// 鼠标滚轮是否接管（对应 crossterm 的 EnableMouseCapture）。
     mouse_on: bool,
     /// 待生效的鼠标捕获开关。
@@ -344,6 +354,10 @@ impl App {
             mode: Mode::Browse,
             tree: TreePanel::new(),
             commit: None,
+            commit_history: None,
+            commit_history_authors: HashMap::new(),
+            commit_history_gen: 0,
+            commit_history_from_commit: false,
             diff: None,
             preview: None,
             preview_visible: false,
@@ -363,6 +377,7 @@ impl App {
             commit_inflight: false,
             log_error: None,
             show_help: false,
+            help_panel: HelpPanel::default(),
             // 默认关闭：开启后终端不再处理鼠标，选中文本复制会失效，
             // 而且鼠标移动会持续产生事件、把键盘事件挤到队列后面（表现为"敲键没反应"）。
             // 需要拖拽滚动条时按 M 打开。
@@ -953,6 +968,19 @@ impl App {
             }
             return;
         }
+        if self.show_help {
+            self.drag = None;
+            match ev.kind {
+                MouseEventKind::ScrollDown => {
+                    self.help_panel.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+                }
+                MouseEventKind::ScrollUp => {
+                    self.help_panel.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+                }
+                _ => {}
+            }
+            return;
+        }
         // 只在这两种模式下响应。
         // 提交框 / 确认框 / 冲突面板里滚预览是错的行为
         // （用户在看的是那块面板，不是背后的预览）。
@@ -1522,6 +1550,16 @@ impl App {
                         p.set_detail(rev, lines);
                     }
                 }
+                BgDone::CommitHistory(generation, append, result) => {
+                    if generation == self.commit_history_gen {
+                        if let Some(panel) = self.commit_history.as_mut() {
+                            match result {
+                                Ok(page) => panel.loaded(page, append),
+                                Err(error) => panel.failed(error.to_string()),
+                            }
+                        }
+                    }
+                }
                 BgDone::CommitSug(cands, source) => {
                     self.busy = None;
                     if let Some(panel) = self.commit.as_mut() {
@@ -1583,7 +1621,7 @@ impl App {
     /// **不**逐字符模拟按键 —— 那样粘贴内容里的 `q` / `Esc` / `/`
     /// 会被当成快捷键触发，界面直接被点掉。
     pub fn handle_paste(&mut self, text: String) {
-        if self.show_notice { return; }
+        if self.show_notice || self.show_help { return; }
         if text.is_empty() {
             return;
         }
@@ -1595,6 +1633,11 @@ impl App {
             return;
         }
         match self.mode {
+            Mode::CommitHistory => {
+                if let Some(panel) = self.commit_history.as_mut() {
+                    panel.insert_author(&text);
+                }
+            }
             // 提交框：插到光标处。TextArea 自己会处理多行粘贴。
             Mode::Commit => {
                 if let Some(p) = self.commit.as_mut() {
@@ -1641,17 +1684,30 @@ impl App {
             }
             return Ok(());
         }
+        if self.show_help {
+            self.drag = None;
+            if self.help_panel.handle_key(key) {
+                self.show_help = false;
+            }
+            return Ok(());
+        }
         // 工作流保留 F4 合并预演，Shift+F4 仍能查看通知。
         if key.code == KeyCode::F(4)
             && (self.mode != Mode::Workflow || key.modifiers.contains(KeyModifiers::SHIFT)) {
             self.show_notice = self.notice_panel.is_some();
             return Ok(());
         }
-        if self.show_help {
-            self.show_help = false;
-            return Ok(());
-        }
-        if self.mode != Mode::Workflow && self.searching.is_none() && matches!(key.code, KeyCode::Char('?') | KeyCode::F(1)) {
+        // 输入时 ? 是正文；F1 仍可查帮助，工作流的 F1 保留给分支页签。
+        let text_input = self.searching.is_some()
+            || matches!(self.mode, Mode::Commit | Mode::Checkout)
+            || (self.mode == Mode::CommitHistory
+                && self.commit_history.as_ref().is_some_and(|p| p.editing_author()))
+            || (self.mode == Mode::Projects
+                && self.projects.as_ref().is_some_and(|p| p.searching()));
+        let help_key = key.code == KeyCode::F(1)
+            || (!text_input && key.code == KeyCode::Char('?'));
+        if self.mode != Mode::Workflow && help_key {
+            self.help_panel = HelpPanel::default();
             self.show_help = true;
             return Ok(());
         }
@@ -1701,6 +1757,7 @@ impl App {
         let result = match self.mode {
             Mode::Browse => self.handle_browse_key(key),
             Mode::Commit => self.handle_commit_key(key),
+            Mode::CommitHistory => self.handle_commit_history_key(key),
             Mode::Diff => self.handle_diff_key(key),
             Mode::Log => self.handle_log_key(key),
             Mode::Confirm => self.handle_confirm_key(key),
@@ -1730,6 +1787,14 @@ impl App {
     }
 
     fn handle_browse_key(&mut self, key: KeyEvent) -> crate::domain::Result<()> {
+        if key.code == KeyCode::F(3) {
+            if self.busy.is_none() {
+                self.open_commit_history();
+            } else {
+                self.notice = Some(Notice::new("后台任务进行中，请稍候再查看本人历史"));
+            }
+            return Ok(());
+        }
         if key.code == KeyCode::Char('o') {
             self.request_open();
             return Ok(());
@@ -1751,7 +1816,7 @@ impl App {
                 self.preview_focused = false;
                 return Ok(());
             }
-            if key.code == KeyCode::Char('q') {
+            if key.code == KeyCode::Char('q') && key.modifiers.is_empty() {
                 self.should_quit = true;
                 return Ok(());
             }
@@ -1803,12 +1868,15 @@ impl App {
             return Ok(());
         }
         match key.code {
-            KeyCode::Esc if self.tree.filter().is_some() => {
-                self.tree.set_filter(None);
-                self.query.clear();
-                self.spawn_preview();
+            // Esc 只逐层取消；回到主面板后继续按也不会退出。
+            KeyCode::Esc => {
+                if self.tree.filter().is_some() {
+                    self.tree.set_filter(None);
+                    self.query.clear();
+                    self.spawn_preview();
+                }
             }
-            KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
+            KeyCode::Char('q') if key.modifiers.is_empty() => self.should_quit = true,
 
             KeyCode::Char('j') | KeyCode::Down => {
                 if self.tree.move_down() {
@@ -2030,6 +2098,10 @@ impl App {
     fn handle_commit_key(&mut self, key: KeyEvent) -> crate::domain::Result<()> {
         if self.commit.is_none() {
             self.mode = Mode::Browse;
+            return Ok(());
+        }
+        if key.code == KeyCode::F(3) {
+            self.open_commit_history();
             return Ok(());
         }
 
@@ -3840,8 +3912,13 @@ impl App {
             }
         }
 
+        if self.mode == Mode::CommitHistory {
+            if let Some(panel) = self.commit_history.as_mut() {
+                panel.render(f, theme::centered(area, 92, 88, 30, 10));
+            }
+        }
         if self.show_help {
-            HelpPanel::render(f, theme::centered(area, 70, 80, 30, 8));
+            self.help_panel.render(f, theme::centered(area, 70, 80, 30, 8));
         }
         if self.show_notice {
             if let Some(panel) = self.notice_panel.as_mut() {
@@ -4032,31 +4109,31 @@ impl App {
         }
         if self.preview_focused {
             if self.preview.as_ref().is_some_and(|p| p.kind() == PreviewKind::Image) {
-                return "图片 · 自动适应窗口   Enter 全屏   o 系统打开   Tab/Esc 文件树   ? 帮助";
+                return "图片 · 自动适应窗口   Enter 全屏   o 系统打开   Tab 切焦点   Esc 返回   ? 帮助   q 退出";
             }
-            return "预览 · ↑↓/j/k 滚动   PgUp/PgDn 翻页   ←→ 左右   Home/End 首尾   0 最左   Tab/Esc 文件树   ? 帮助";
+            return "预览 · ↑↓/j/k 滚动   PgUp/PgDn 翻页   ←→ 左右   Home/End 首尾   0 最左   Tab 切焦点   Esc 返回   ? 帮助   q 退出";
         }
         if self.busy.is_some() {
             return "后台任务中   ↑↓ 选择   Space 勾选   q 退出   其他操作请稍候";
         }
         match self.tree.selected() {
             Some(n) if n.sign == '?' => {
-                "a 添加当前   A 批量添加   Enter 打开   R 刷新   ? 帮助   q 退出"
+                "a 添加当前   F3 本人历史   A 批量添加   Enter 打开   R 刷新   ? 帮助   q 退出"
             }
             Some(n) if n.is_dir => {
-                "Space 批选目录改动   Enter 展开/折叠   Ctrl+A 全选   T 切换视图   a 添加新增   ? 帮助   q 退出"
+                "Space 批选目录改动   F3 本人历史   Enter 展开/折叠   Ctrl+A 全选   T 切换视图   a 添加新增   ? 帮助   q 退出"
             }
             Some(n) if matches!(n.sign, 'C' | 'T') => {
-                "冲突 · X 处理冲突   Space 勾选   Enter 查看   R 刷新   ? 帮助"
+                "冲突 · X 处理冲突   F3 本人历史   Space 勾选   Enter 查看   R 刷新   ? 帮助   q 退出"
             }
             Some(n) if crate::tui::panels::tree::is_committable_sign(n.sign) => {
-                "Space 勾选   C 提交   r 撤销改动   Enter 改动   E 编辑   R 刷新   ? 帮助   q 退出"
+                "Space 勾选   C 提交   F3 本人历史   r 撤销改动   Enter 改动   E 编辑   R 刷新   ? 帮助   q 退出"
             }
-            Some(_) => "Enter 查看   E 编辑   T 变更视图   R 刷新   / 搜索   ? 帮助   q 退出",
+            Some(_) => "Enter 查看   F3 本人历史   E 编辑   T 变更视图   R 刷新   / 搜索   ? 帮助   q 退出",
             None if self.tree.filter().is_some() => {
-                "无匹配项 · / 修改过滤词   Esc 清空过滤   R 刷新   ? 帮助"
+                "F3 本人历史   无匹配项 · / 修改过滤词   Esc 清空过滤   R 刷新   ? 帮助   q 退出"
             }
-            None => "暂无变更 · T 全部文件   R 刷新   V 浏览仓库   ? 帮助   q 退出",
+            None => "F3 本人历史   暂无变更 · T 全部文件   R 刷新   V 浏览仓库   ? 帮助   q 退出",
         }
     }
 
@@ -4075,13 +4152,12 @@ impl App {
                 " 仓库 ",
                 "↑↓ 选择   Enter 进入   ←/退格 返回   o 检出   Y 复制路径   R 刷新   Esc 返回",
             ),
-            // "Esc 取消" 改成 "Esc 退出"：
-            // 有内容时 Esc 会先弹确认框问一句，但**退出永远是可达的**
-            // （确认框里按 Y 就走）。写"取消"会让人以为按了没反应。
             Mode::Commit => (
                 " 提交 ",
-                "Ctrl+S 提交   Esc 退出   范围：文件树上用 Space 勾",
+                "Ctrl+S/F2 提交   F3 本人历史   Ctrl+G 生成   Esc 返回   F1 帮助",
             ),
+            Mode::CommitHistory if !self.commit_history_from_commit => (" 本人提交说明 ", "F2 修改作者   ↑↓ 选择   N 更早   Esc 返回   F1 帮助"),
+            Mode::CommitHistory => (" 本人提交说明 ", "Enter 查询/插入   F2 修改作者   N 更早   Esc 返回   F1 帮助"),
             Mode::Diff => {
                 if self.diff.as_ref().is_some_and(|p| p.kind() == PreviewKind::Image) {
                     return (" 图片 ", "自动适应窗口   o 系统打开   Esc 返回文件树");
@@ -4228,7 +4304,7 @@ fn truncate_spans<'a>(spans: &[Span<'a>], width: usize) -> Vec<Span<'a>> {
 
 /// 底栏一行放得下哪些按键；第二个返回值表示有没有被裁掉。
 ///
-/// 规则：**逃生键优先**。`? 帮助` 和 `q 退出` 永远保留 ——
+/// 规则：**逃生键优先**。帮助、返回和退出优先保留 ——
 /// 放不下的中间项可以按 ? 查，但"怎么退出"不能靠猜。
 /// 裁掉了就在底栏标题上标一句，否则用户以为这就是全部键位。
 fn fit_hints(keys: &str, width: usize) -> (String, bool) {
@@ -4239,7 +4315,7 @@ fn fit_hints(keys: &str, width: usize) -> (String, bool) {
     // 尾部的逃生键预留出来，先不参与填充。
     let mut tail: Vec<&str> = Vec::new();
     while let Some(last) = groups.last() {
-        if last.trim() == "? 帮助" || last.trim() == "q 退出" || last.trim() == "Esc 返回" {
+        if matches!(last.trim(), "? 帮助" | "F1 帮助" | "q 退出" | "Esc 返回") {
             tail.insert(0, groups.pop().unwrap());
         } else {
             break;
@@ -4733,6 +4809,339 @@ mod refresh_tests {
     use ratatui::style::Color;
     use std::path::Path;
     use std::process::Command;
+
+    #[test]
+    #[ignore = "需要 svn + svnadmin；验证关闭重开、未填写作者时的迟到结果隔离"]
+    fn personal_history_reopen_before_author_input_rejects_previous_request() {
+        let (_tmp, mut app) = temporary_app();
+        app.commit_history_gen = 5;
+        app.open_commit_history();
+        let opened = app.commit_history_gen;
+        for generation in [5, opened] {
+            if generation == opened {
+                app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+                    .unwrap();
+                app.open_commit_history();
+            }
+            app.tx
+                .send(BgDone::CommitHistory(
+                    generation,
+                    false,
+                    Err(crate::domain::Error::Parse("STALE_QUERY_ERROR".into())),
+                ))
+                .unwrap();
+            app.tick();
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+            let frame = terminal
+                .draw(|frame| app.render(frame, frame.area()))
+                .unwrap();
+            let text: String = frame
+                .buffer
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(
+                !text.contains("STALE_QUERY_ERROR"),
+                "旧会话结果不能改写重新打开的输入界面"
+            );
+            assert!(app.commit_history.as_ref().unwrap().editing_author());
+        }
+    }
+
+    #[test]
+    #[ignore = "需要 svn + svnadmin；验证本人说明查询、取消和插入草稿，不执行提交"]
+    fn personal_commit_history_reads_only_self_and_preserves_manual_draft() {
+        let (_tmp, mut app) = temporary_app();
+        std::fs::write(app.root.join("a.txt"), "self change\n").unwrap();
+        run(
+            "svn",
+            &[
+                "commit",
+                "--non-interactive",
+                "--username",
+                "alice",
+                "-m",
+                "SELF_MESSAGE\n自己以前写的说明",
+            ],
+            &app.root,
+        );
+        std::fs::write(app.root.join("a.txt"), "other change\n").unwrap();
+        run(
+            "svn",
+            &[
+                "commit",
+                "--non-interactive",
+                "--username",
+                "bob",
+                "-m",
+                "OTHER_MESSAGE mentions alice",
+            ],
+            &app.root,
+        );
+        app.mode = Mode::Commit;
+        app.commit = Some(CommitPanel::new(
+            vec!["a.txt".into()],
+            Some("原草稿\n".into()),
+            vec![],
+        ));
+        let original = app.commit.as_ref().unwrap().message();
+        app.handle_key(KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.mode, Mode::CommitHistory);
+        app.handle_paste("alice".into());
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        wait_until(&mut app, |a| {
+            a.commit_history
+                .as_ref()
+                .is_some_and(|panel| !panel.is_loading())
+        });
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+        let frame = terminal
+            .draw(|frame| app.render(frame, frame.area()))
+            .unwrap();
+        let text: String = frame
+            .buffer
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("SELF_MESSAGE"));
+        assert!(!text.contains("OTHER_MESSAGE"));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.mode, Mode::Commit);
+        assert_eq!(app.commit.as_ref().unwrap().message(), original);
+        let previous_generation = app.commit_history_gen;
+        app.handle_key(KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE))
+            .unwrap();
+        // 取消后重开会产生新请求；旧结果即使迟到，也不能替换本次记录。
+        app.tx
+            .send(BgDone::CommitHistory(
+                previous_generation,
+                false,
+                Ok(crate::svn::client::AuthorLogPage {
+                    entries: vec![],
+                    next_before: None,
+                    scanned: 0,
+                }),
+            ))
+            .unwrap();
+        wait_until(&mut app, |a| {
+            a.commit_history
+                .as_ref()
+                .is_some_and(|panel| !panel.is_loading())
+        });
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.mode, Mode::Commit);
+        let message = app.commit.as_ref().unwrap().message();
+        assert!(message.contains("原草稿"));
+        assert!(message.contains("SELF_MESSAGE"));
+        assert!(!message.contains("OTHER_MESSAGE"));
+        assert!(!app.commit_inflight, "插入历史说明不能执行提交");
+        assert!(!app.should_quit());
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        let draft = app.commit_drafts.get(&app.svn.root).cloned();
+        app.handle_key(KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE))
+            .unwrap();
+        assert!(!app.commit_history_from_commit);
+        wait_until(&mut app, |a| {
+            a.commit_history
+                .as_ref()
+                .is_some_and(|panel| !panel.is_loading())
+        });
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(
+            app.mode,
+            Mode::CommitHistory,
+            "主面板入口只读，不能插入或提交"
+        );
+        assert_eq!(app.commit_drafts.get(&app.svn.root).cloned(), draft);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.mode, Mode::Browse);
+        assert!(!app.should_quit());
+    }
+
+    #[test]
+    fn keyboard_narrow_footer_keeps_return_and_help() {
+        for (keys, help) in [
+            (
+                "Ctrl+S/F2 提交   Ctrl+G 生成   Esc 返回   F1 帮助",
+                "F1 帮助",
+            ),
+            (
+                "↑↓ 滚动   Tab 切焦点   Esc 返回   ? 帮助   q 退出",
+                "? 帮助",
+            ),
+        ] {
+            for width in [26, 36, 76] {
+                let (row, _) = fit_hints(keys, width);
+                assert!(theme::display_width(&row) <= width);
+                assert!(row.contains("Esc 返回"));
+                assert!(row.contains(help));
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "需要 svn + svnadmin；验证主面板退出与逐层返回"]
+    fn keyboard_escape_never_quits_browse() {
+        let (_tmp, mut app) = temporary_app();
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        app.tree.set_filter(Some("a.txt".into()));
+        app.query = "a.txt".into();
+        app.preview_focused = true;
+        app.handle_key(esc).unwrap();
+        assert!(!app.preview_focused);
+        assert!(app.tree.filter().is_some(), "第一次 Esc 只退预览焦点");
+        app.handle_key(esc).unwrap();
+        assert!(app.tree.filter().is_none());
+        assert!(app.query.is_empty());
+        for _ in 0..3 {
+            app.handle_key(esc).unwrap();
+        }
+        assert!(!app.should_quit());
+        for modifiers in [
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+            KeyModifiers::SHIFT,
+        ] {
+            app.handle_key(KeyEvent::new(KeyCode::Char('q'), modifiers))
+                .unwrap();
+            assert!(!app.should_quit(), "带修饰键的 q 不能退出");
+        }
+        app.busy = Some("测试后台任务".into());
+        app.handle_key(esc).unwrap();
+        assert!(!app.should_quit());
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.should_quit());
+    }
+
+    #[test]
+    #[ignore = "需要 svn + svnadmin；验证关闭阅读面板后连续 Esc 不退出"]
+    fn keyboard_escape_after_diff_stays_in_browse() {
+        let (_tmp, mut app) = temporary_app();
+        app.diff = Some(PreviewPanel::file("a.txt", "内容"));
+        app.mode = Mode::Diff;
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.mode, Mode::Browse);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        assert!(!app.should_quit());
+    }
+
+    #[test]
+    #[ignore = "需要 svn + svnadmin；验证帮助消费按键、粘贴及鼠标"]
+    fn keyboard_help_is_modal_and_q_only_closes_help() {
+        let (_tmp, mut app) = temporary_app();
+        app.mode = Mode::Commit;
+        app.commit = Some(CommitPanel::new(vec![], Some("草稿".into()), vec![]));
+        app.handle_key(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.show_help);
+        for code in [KeyCode::Char('C'), KeyCode::Enter, KeyCode::F(4)] {
+            app.handle_key(KeyEvent::new(code, KeyModifiers::NONE))
+                .unwrap();
+            assert!(app.show_help, "非关闭键不能关帮助或触发底层操作");
+        }
+        app.handle_paste("不可穿透".into());
+        app.handle_mouse(MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 1,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.commit.as_ref().unwrap().message(), "草稿");
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
+            .unwrap();
+        assert!(!app.show_help);
+        assert!(!app.should_quit());
+        assert_eq!(app.mode, Mode::Commit);
+    }
+
+    #[test]
+    #[ignore = "需要 svn + svnadmin；验证输入正文和返回草稿"]
+    fn keyboard_text_input_keeps_question_mark_and_q() {
+        let (_tmp, mut app) = temporary_app();
+        app.mode = Mode::Commit;
+        app.commit = Some(CommitPanel::new(vec![], None, vec![]));
+        for code in [
+            KeyCode::Char('?'),
+            KeyCode::Char('q'),
+            KeyCode::Enter,
+            KeyCode::Char('x'),
+        ] {
+            app.handle_key(KeyEvent::new(code, KeyModifiers::NONE))
+                .unwrap();
+        }
+        assert!(!app.show_help);
+        assert!(!app.should_quit());
+        assert_eq!(app.commit.as_ref().unwrap().message(), "?q\nx");
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(
+            app.commit_drafts.get(&app.root).map(String::as_str),
+            Some("?q\nx")
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        assert!(!app.should_quit());
+
+        app.mode = Mode::Checkout;
+        app.checkout = Some(CheckoutPanel::new(String::new()));
+        for c in ['?', 'q'] {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+                .unwrap();
+        }
+        assert_eq!(app.checkout.as_ref().unwrap().url(), "?q");
+        assert!(!app.show_help);
+        assert!(!app.should_quit());
+    }
+
+    #[test]
+    #[ignore = "需要 svn + svnadmin；验证文件和项目搜索中输入及帮助恢复"]
+    fn keyboard_search_keeps_input_and_f1_restores_search() {
+        let (_tmp, mut app) = temporary_app();
+        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))
+            .unwrap();
+        for c in ['?', 'q'] {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+                .unwrap();
+        }
+        assert_eq!(app.query, "?q");
+        assert!(!app.show_help);
+        app.handle_key(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.show_help);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.searching.is_some());
+        assert_eq!(app.query, "?q");
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        assert!(!app.should_quit());
+
+        app.open_projects();
+        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))
+            .unwrap();
+        for c in ['?', 'q'] {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+                .unwrap();
+        }
+        assert!(app.projects.as_ref().unwrap().searching());
+        assert!(!app.show_help);
+        assert_eq!(app.mode, Mode::Projects);
+    }
 
     fn run(exe: &str, args: &[&str], cwd: &Path) {
         let out = Command::new(exe).args(args).current_dir(cwd).output().unwrap();
@@ -5234,7 +5643,7 @@ mod refresh_tests {
         assert!(app.tree.is_checked("a.txt"));
         assert_eq!(
             app.browse_hint(),
-            "Space 勾选   C 提交   r 撤销改动   Enter 改动   E 编辑   R 刷新   ? 帮助   q 退出"
+            "Space 勾选   C 提交   F3 本人历史   r 撤销改动   Enter 改动   E 编辑   R 刷新   ? 帮助   q 退出"
         );
         run("svn", &["add", "新增说明.txt"], &root);
         wait_until(&mut app, |a| {

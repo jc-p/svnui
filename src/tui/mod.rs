@@ -200,7 +200,7 @@ impl Drop for TerminalGuard {
 /// 排查"敲键没反应"时用：
 ///
 /// ```sh
-/// SVNUI_DEBUG_KEY=1 svnui tui    # 进去敲几下、动动鼠标、按 Esc 退出
+/// SVNUI_DEBUG_KEY=1 svnui tui    # 进去敲几下、动动鼠标、按 q 退出
 /// cat /tmp/svnui-key.log
 /// ```
 ///

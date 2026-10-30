@@ -20,7 +20,7 @@
 //! │ ┌───────────────────────────────────┐ │
 //! │ │ 修复状态同步                        │ │
 //! │ └───────────────────────────────────┘ │
-//! │ Ctrl+S 提交   Esc 退出                  │
+//! │ Ctrl+S 提交   Esc 返回并保留草稿        │
 //! └───────────────────────────────────────┘
 //! ```
 
@@ -304,8 +304,10 @@ impl CommitPanel {
                     Span::styled("提交    ", theme::Theme::dim()),
                     Span::styled(" Ctrl+G ", theme::Theme::title()),
                     Span::styled("生成    ", theme::Theme::dim()),
+                    Span::styled(" F3 ", theme::Theme::title()),
+                    Span::styled("本人历史    ", theme::Theme::dim()),
                     Span::styled(" Esc ", theme::Theme::title()),
-                    Span::styled("退出", theme::Theme::dim()),
+                    Span::styled("返回·保留草稿", theme::Theme::dim()),
                 ]),
             },
         };

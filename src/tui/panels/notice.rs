@@ -376,7 +376,7 @@ fn padded_body(inner: Rect) -> Rect {
 }
 
 /// 按终端列宽硬换行，保留多行、空格和长路径；不使用 Paragraph 的 u16 滚动偏移。
-fn wrap_text(text: &str, width: u16) -> Vec<String> {
+pub(super) fn wrap_text(text: &str, width: u16) -> Vec<String> {
     if width == 0 {
         return Vec::new();
     }

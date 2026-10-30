@@ -20,7 +20,7 @@ Subversion 的 TUI 客户端。用 Rust + [ratatui](https://github.com/ratatui/r
 
 ## 下载与安装
 
-当前正式版 **[0.7.2](https://github.com/jc-p/svnui/releases/tag/0.7.2)**，提供 macOS 11+ 的双架构安装包。
+当前正式版 **[0.7.3](https://github.com/jc-p/svnui/releases/tag/0.7.3)**，提供 macOS 11+ 的双架构安装包。
 下载二进制无需 Rust；使用 SVN 功能需要本机有 `svn`，可先运行 `svn --version --quiet` 检查。
 Linux 等其他系统请[从源码构建](#从源码构建)。
 
@@ -45,7 +45,7 @@ svnui --version
 指定版本或安装目录：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/jc-p/svnui/main/install.sh | bash -s -- --version 0.7.2 --bin-dir "$HOME/.local/bin"
+curl -fsSL https://raw.githubusercontent.com/jc-p/svnui/main/install.sh | bash -s -- --version 0.7.3 --bin-dir "$HOME/.local/bin"
 ```
 
 不想执行在线脚本，可以使用下面的官方安装包，按 [Q&A 的手动安装步骤](docs/qa.md#manual-install) 校验并安装。
@@ -53,13 +53,13 @@ GitHub 网页或脚本域名连接失败时，Q&A 也提供已验证的 GitHub C
 
 ### 直接下载安装包
 
-| Mac 类型 | `uname -m` | 0.7.2 安装包 |
+| Mac 类型 | `uname -m` | 0.7.3 安装包 |
 |---|---|---|
-| Apple Silicon（M 系列） | `arm64` | [下载 ARM64](https://github.com/jc-p/svnui/releases/download/0.7.2/svnui-0.7.2-aarch64-apple-darwin.tar.gz) |
-| Intel，或运行在 Rosetta 下的终端 | `x86_64` | [下载 x86_64](https://github.com/jc-p/svnui/releases/download/0.7.2/svnui-0.7.2-x86_64-apple-darwin.tar.gz) |
+| Apple Silicon（M 系列） | `arm64` | [下载 ARM64](https://github.com/jc-p/svnui/releases/download/0.7.3/svnui-0.7.3-aarch64-apple-darwin.tar.gz) |
+| Intel，或运行在 Rosetta 下的终端 | `x86_64` | [下载 x86_64](https://github.com/jc-p/svnui/releases/download/0.7.3/svnui-0.7.3-x86_64-apple-darwin.tar.gz) |
 
-[SHA256SUMS](https://github.com/jc-p/svnui/releases/download/0.7.2/SHA256SUMS) ·
-[源码提交与产物清单](https://github.com/jc-p/svnui/releases/download/0.7.2/manifest.json) ·
+[SHA256SUMS](https://github.com/jc-p/svnui/releases/download/0.7.3/SHA256SUMS) ·
+[源码提交与产物清单](https://github.com/jc-p/svnui/releases/download/0.7.3/manifest.json) ·
 [查看最新 Release](https://github.com/jc-p/svnui/releases/latest)
 
 选择 `svnui-版本-架构.tar.gz`，Release 页面里的 **Source code** 是源码，不是可直接运行的程序。
@@ -96,7 +96,7 @@ mkdir -p "$HOME/.local/bin"
 ./install-local.sh --no-build --bin-dir "$HOME/.local/bin"
 ```
 
-这会构建 `main` 的当前源码；复现特定发布版本时，在构建前先 `git checkout 0.7.2`。
+这会构建 `main` 的当前源码；复现特定发布版本时，在构建前先 `git checkout 0.7.3`。
 首次构建可能下载依赖；使用 `--locked` 保持依赖版本一致。
 
 ### 本地源码更新
@@ -161,6 +161,11 @@ svnui --trust-cert preview "https://svn.example.com/repo/trunk/project/"
 
 ## TUI 键位
 
+主面板只用 `q` 退出。`Esc` 逐层关闭当前面板、返回文件树或清空过滤；没有可取消内容时停留原处，连续按也不会退出主面板。
+提交、检出和搜索中，`q`、`?` 都作为文字输入。`F1` 查看帮助（分支工作流内仍用于切换分支页签）；其他界面也可按 `?`。
+帮助内用 `↑↓` / `j/k` 滚动、`PgUp/PgDn` 翻页、`Home/End` 跳到首尾，`Esc` / `q` / `?` / `F1` 关闭。
+独立的仓库浏览（CLI URL）和检出入口保留原有退出方式，见对应说明。
+
 ### 文件树（主界面）
 
 | 键 | 作用 |
@@ -176,7 +181,9 @@ svnui --trust-cert preview "https://svn.example.com/repo/trunk/project/"
 | `S` | 切换排序 |
 | `/` | 搜索文件 |
 | `R` / `F5` | 立即重新扫描；保留光标、折叠、过滤和有效勾选 |
-| `Esc` | 清空已确认的文件过滤；无过滤时退出 |
+| `F3` | 只读查看本人在当前项目中已提交的说明，无待提交文件时也可使用 |
+| `Esc` | 清空已确认的文件过滤；无过滤时停留主面板 |
+| `q` | 退出主面板（文件树或内嵌预览焦点均可） |
 
 面板和弹窗统一使用终端原生圆角边框（`╭ ╮ ╰ ╯`），显示效果取决于终端字体。
 
@@ -264,10 +271,15 @@ svnui --trust-cert preview "https://svn.example.com/repo/trunk/project/"
 |---|---|
 | `Enter` | **换行**（不是提交） |
 | `Ctrl+S` / `F2` | 提交 |
-| `Esc` | 退出，内容存草稿 |
+| `F3` | 查看本人在当前项目中已提交的说明，可选中一条插入当前光标位置 |
+| `Esc` | 返回文件树，内容存草稿 |
 
 退出提交框不会丢内容——再按 `C` 会恢复上次的草稿。
 提交失败时草稿和勾选都会保留，按 `C` 继续即可。
+
+主面板 `F3` 只读查看；提交框 `F3` 可插入说明。首次输入 **SVN 用户名**并按 `Enter` 查询，从 SVN 精确匹配作者，不会把别人说明里提到你的名字当作本人记录。
+用户名在本次会话中按工作副本记住，`F2` 可修改。`↑↓` / `j/k` 选择，`J/K` / `PgUp/PgDn` 阅读全文，`Home/End` 到首尾，`N` 查找更早记录。
+选中后按 `Enter` 将原说明插入当前光标位置，不清空已有草稿、不自动提交；`Esc` 返回草稿。
 
 ### 确认框
 

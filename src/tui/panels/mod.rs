@@ -5,6 +5,7 @@
 
 pub mod checkout;
 pub mod commit;
+pub mod commit_history;
 pub mod commit_gen;
 pub mod confirm;
 pub mod conflict;

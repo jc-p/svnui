@@ -40,6 +40,13 @@ pub struct Svn {
     pub trust_cert: bool,
 }
 
+/// 本人提交说明的一批结果；游标按扫描过的版本推进，避免误匹配占满一页后漏掉更早记录。
+pub struct AuthorLogPage {
+    pub entries: Vec<LogEntry>,
+    pub next_before: Option<u64>,
+    pub scanned: usize,
+}
+
 /// `status` 的查询选项。
 ///
 /// `Default` 必须手写：派生的默认值会把 `include_unversioned` 设成 false，
@@ -425,6 +432,54 @@ impl Svn {
 
     pub fn log(&self, limit: usize, paths: &[PathBuf]) -> Result<Vec<LogEntry>> {
         self.log_search(limit, paths, None)
+    }
+
+    /// 读取当前工作副本路径下某个作者的已提交说明，不请求改动文件或 diff。
+    pub fn log_by_author(
+        &self,
+        author: &str,
+        before: Option<u64>,
+        limit: usize,
+    ) -> Result<AuthorLogPage> {
+        let author = author.trim();
+        if author.is_empty() {
+            return Err(Error::Parse("请填写 SVN 用户名".into()));
+        }
+        let limit = limit.clamp(1, 200);
+        let range = format!(
+            "{}:0",
+            before.map_or_else(|| "HEAD".into(), |rev| rev.to_string())
+        );
+        let args = vec![
+            "log".to_string(),
+            "--xml".into(),
+            "-r".into(),
+            range,
+            "-l".into(),
+            limit.to_string(),
+        ];
+        // SVN 先应用 --limit 再应用 --search；混用会丢失被过滤批次的修订号，
+        // 无法继续分页。只取有限批次，按最旧修订号推进，再在本地精确匹配作者。
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let out = run(&self.exe, &args, &self.root, &self.opts(true))?;
+        let rows = super::parser::parse_log_xml(&out.stdout)?;
+        let scanned = rows.len();
+        let next_before = if scanned == limit {
+            rows.last()
+                .and_then(|entry| entry.revision.checked_sub(1))
+                .filter(|rev| *rev > 0)
+        } else {
+            None
+        };
+        let entries = rows
+            .into_iter()
+            .filter(|entry| entry.author == author)
+            .collect();
+        Ok(AuthorLogPage {
+            entries,
+            next_before,
+            scanned,
+        })
     }
 
     /// `svn log`，可选服务端搜索。

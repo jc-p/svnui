@@ -1,6 +1,6 @@
 # Q&A
 
-适用于 svnui 0.7.2；历史修复的起始版本在对应章节说明。先运行 `svnui --version`、`command -v svnui`，确认正在使用哪个程序。
+适用于 svnui 0.7.3；历史修复的起始版本在对应章节说明。先运行 `svnui --version`、`command -v svnui`，确认正在使用哪个程序。
 本文集中记录实际遇到的问题；发布与源码步骤另见 [PUBLISH.md](../PUBLISH.md)，配色选项见 [主题配置](theme.md)。
 
 [下载与安装](#manual-install) · [认证与证书](#authentication) · [AI 提交信息](#ai-commit) · [外观与输入](#appearance) ·
@@ -21,26 +21,26 @@
 
 ### Q：不用在线安装脚本，怎样手动安装？
 
-以 Apple Silicon 的 0.7.2 为例：将 [安装包](https://github.com/jc-p/svnui/releases/download/0.7.2/svnui-0.7.2-aarch64-apple-darwin.tar.gz)
-和 [SHA256SUMS](https://github.com/jc-p/svnui/releases/download/0.7.2/SHA256SUMS) 下载到 `~/Downloads`。
+以 Apple Silicon 的 0.7.3 为例：将 [安装包](https://github.com/jc-p/svnui/releases/download/0.7.3/svnui-0.7.3-aarch64-apple-darwin.tar.gz)
+和 [SHA256SUMS](https://github.com/jc-p/svnui/releases/download/0.7.3/SHA256SUMS) 下载到 `~/Downloads`。
 
 先校验实际下载的那一个包，预期显示文件名与 `OK`：
 
 ```bash
 cd "$HOME/Downloads"
-awk '$2 == "svnui-0.7.2-aarch64-apple-darwin.tar.gz"' SHA256SUMS | shasum -a 256 -c -
+awk '$2 == "svnui-0.7.3-aarch64-apple-darwin.tar.gz"' SHA256SUMS | shasum -a 256 -c -
 ```
 
 只在校验通过后安装；Intel 用户将文件名中的 `aarch64` 换成 `x86_64`：
 
 ```bash
 mkdir -p "$HOME/.local/bin"
-tar -xzf svnui-0.7.2-aarch64-apple-darwin.tar.gz -C "$HOME/.local/bin" svnui
+tar -xzf svnui-0.7.3-aarch64-apple-darwin.tar.gz -C "$HOME/.local/bin" svnui
 chmod 755 "$HOME/.local/bin/svnui"
 "$HOME/.local/bin/svnui" --version
 ```
 
-预期版本为 `svnui 0.7.2`。校验失败或下载内容不是 tar.gz 时，停止安装并重新下载官方附件。
+预期版本为 `svnui 0.7.3`。校验失败或下载内容不是 tar.gz 时，停止安装并重新下载官方附件。
 不要把 `shasum -c SHA256SUMS` 对“未下载的另一架构包”的缺失提示误认为当前包损坏。
 
 ### Q：GitHub 下载失败，或者下载回来的是 HTML？
@@ -54,11 +54,11 @@ chmod 755 "$HOME/.local/bin/svnui"
 以下 Apple Silicon 命令已验证；Intel 用户将 `aarch64` 替换为 `x86_64`：
 
 ```bash
-mkdir -p "$HOME/Downloads/svnui-0.7.2"
-gh release download 0.7.2 --repo jc-p/svnui \
-  --pattern 'svnui-0.7.2-aarch64-apple-darwin.tar.gz' \
-  --pattern SHA256SUMS --dir "$HOME/Downloads/svnui-0.7.2"
-cd "$HOME/Downloads/svnui-0.7.2"
+mkdir -p "$HOME/Downloads/svnui-0.7.3"
+gh release download 0.7.3 --repo jc-p/svnui \
+  --pattern 'svnui-0.7.3-aarch64-apple-darwin.tar.gz' \
+  --pattern SHA256SUMS --dir "$HOME/Downloads/svnui-0.7.3"
+cd "$HOME/Downloads/svnui-0.7.3"
 ```
 
 此时手动校验命令从当前目录执行，无需再切回 `~/Downloads`。
@@ -217,6 +217,21 @@ svn list --xml --non-interactive "https://svn.example.com/repo/trunk/project/"
 ```
 
 如果这里也失败，先处理底层 SVN 的认证、证书或授权；更换主题和字体不会改变访问权限。
+
+## 本人写过的提交说明
+
+### Q：怎么找回我以前写过、已经提交到 SVN 的说明？
+
+主面板按 `F3` 可以只读查看，无需先选择待提交文件；提交框按 `F3` 还可以插入说明。
+首次填写 **SVN 用户名**，`Enter` 查询当前项目中该作者已提交的说明。
+这里按作者精确匹配，区分大小写；其他人的说明中提到你的名字不会被当作本人记录。
+用户名会在本次会话中按工作副本记住，按 `F2` 可修改。
+
+`↑↓` / `j/k` 选择，`J/K` 或 `PgUp/PgDn` 阅读全文，`Home/End` 到首尾，`N` 继续查找更早记录。
+从提交框进入时，选中后按 `Enter` 将说明插入草稿光标位置，已有内容保留，不会直接提交；`Esc` 返回原面板。
+
+没有匹配项时先检查 SVN 用户名和当前仓库路径的历史读取权限。有“更早”提示时可按 `N` 继续，当前批次未命中不代表所有历史都不存在。
+SVN 将 `--limit` 应用在 `--search` 之前，最近一批没有本人记录时会返回空结果。因此本人历史按修订号分批读取，再精确筛选作者，保留继续查找更早记录的游标。
 
 <a id="ai-commit"></a>
 ## Codex 生成提交信息
